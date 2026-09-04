@@ -3,10 +3,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import robust
 
 RES = "data/ups_results.json"; DB = "data/shipments.json"; UM = "data/users_map.json"
-BOT = "vbot_EIBezUGncpO8v0QJ"
+BOT = (os.environ.get("BOT_APP_ID") or "vbot_EIBezUGncpO8v0QJ")
 res = robust.load_json_guarded(RES, {})
 db = robust.load_json_guarded(DB, {})
-um = robust.load_json_guarded(UM, {})
+# 缓存 -> 组织树快照 兜底(与 tracking-pipeline.resolve_user 同序)
+um = {**robust.load_json_guarded("data/org_people.json", {}), **robust.load_json_guarded(UM, {})}
 
 sent, skipped, failed = [], [], []
 for order, r in res.items():

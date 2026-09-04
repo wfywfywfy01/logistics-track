@@ -8,7 +8,7 @@ import argparse, json, re, subprocess, sys, os, time
 from pathlib import Path
 import openpyxl
 
-DATA = Path(os.environ.get("LOGIBOT_DATA_DIR", "data")); DATA.mkdir(parents=True, exist_ok=True)
+DATA = Path((os.environ.get("LOGIBOT_DATA_DIR") or "data")); DATA.mkdir(parents=True, exist_ok=True)
 DB = DATA / "shipments.json"; SALES_MAP = DATA / "sales_map.json"; USERS_MAP = DATA / "users_map.json"; ORG_PEOPLE = DATA / "org_people.json"
 
 import robust
@@ -28,10 +28,12 @@ def save_json(p, obj):
         robust.atomic_write_json(str(p), obj)
 
 def cli(args):
-    """headless vertu-cli；返回 stdout 文本或 None"""
-    r = subprocess.run("vertu-cli " + " ".join(f'"{a}"' for a in args), shell=True, capture_output=True)
-    if r.returncode != 0: return None
-    return r.stdout.decode("utf-8", errors="replace")
+    """headless vertu-cli；返回 stdout 文本或 None(Linux 参数列表防注入, Windows 回退 shell)"""
+    try:
+        rc, out, _ = robust.cli_run(args)
+    except Exception:
+        return None
+    return out if rc == 0 else None
 
 def cli_json(args):
     out = cli(args)
@@ -47,8 +49,7 @@ def parse_forecast(xlsx):
     header = [trim(c) for c in data[0]]
     items, current = [], None
     for cells in data[1:]:
-        m = {header[i]: trim(v) for i, v in enumerate(cells)}
-        import re
+        m = {header[i]: trim(v) for i, v in enumerate(cells) if i < len(header)}
         order = next((v for v in m.values() if re.match(r"^(XSD|CKD)[-\w]+$", v or "")), "")
         if order:
             if current: items.append(current)
@@ -119,7 +120,8 @@ def _ingest_forecast(xlsx):
     db = load_json(DB)
     items = parse_forecast(xlsx)
     for it in items:
-        sales = match_sales(it["orderNo"]) or {}
+        # CKD 出库单号销售系统查不到, 必须带国内顺丰号反查
+        sales = match_sales(it["orderNo"], domestic=it.get("domestic")) or {}
         order = it["orderNo"]
         prev = db.get(order)
         it["salesperson"] = sales.get("salesperson") or it.get("salesperson") or (prev or {}).get("salesperson") or ""
@@ -160,7 +162,7 @@ def _ingest_pair(order, intl):
     db = load_json(DB)
     it = db.get(order, {"orderNo": order, "status": "已预报", "history": [], "notified_status": None, "products": []})
     it["intl"] = intl
-    sales = match_sales(order)
+    sales = match_sales(order, domestic=it.get("domestic"))
     for k in ("salesperson", "domestic"):
         if sales.get(k): it[k] = sales[k]
     if sales.get("products"): it["products"] = [sales["products"]]
@@ -200,7 +202,7 @@ def _track_update(order, status, detail=""):
     def idx(x): return STAGES.index(x) if x in STAGES else -1
     changed = (ns in EXCEPTIONS and ns != cur) or (idx(ns) > idx(cur))
     if changed:
-        it["history"].append({"from": cur, "to": ns, "at": time.strftime("%Y-%m-%d %H:%M"), "detail": detail[:200]})
+        it.setdefault("history", []).append({"from": cur, "to": ns, "at": time.strftime("%Y-%m-%d %H:%M"), "detail": detail[:200]})
         it["status"] = ns; it["needs_notify"] = True
     db[order] = it; save_json(DB, db)
     return {"order": order, "status": it["status"], "changed": changed}
@@ -237,27 +239,27 @@ def notify(channel_id, bot_app_id=None, dry=False):
                 it.get("intl") or "-", it.get("domestic") or "-", prod[:24], it.get("salesperson") or "未匹配")
             dm = "你的订单 %s 物流更新：%s（国际单 %s）" % (order, it.get("status", "-"), it.get("intl") or "-")
             pending.append((order, it, line, dm))
-        # 群消息洪泛控制: >3 条合并成一条
+        # 群消息洪泛控制: >3 条合并成一条, 否则逐条发
         group_lines = [x[2] for x in pending]
         ok_group = None
         if not dry and group_lines:
-            if len(group_lines) > 3:
-                body = "\n".join(group_lines)
-            else:
-                body = group_lines[0]
-            out = cli(["im", "+agent-notify", "--target", "im", "--agent-slug", "logistics-track",
-                       "--agent-name", "物流小助手", "--bot-name", "物流小助手",
-                       "--channel-id", channel_id, "--body", body, "--no-json"])
-            ok_group = out is not None
+            bodies = ["\n".join(group_lines)] if len(group_lines) > 3 else group_lines
+            ok_group = all(cli(["im", "+agent-notify", "--target", "im", "--agent-slug", "logistics-track",
+                                "--agent-name", "物流小助手", "--bot-name", "物流小助手",
+                                "--channel-id", channel_id, "--body", body, "--no-json"]) is not None
+                           for body in bodies)
         for order, it, line, dm in pending:
             ok_dm = None
             if not dry:
                 uid = resolve_user(it.get("salesperson") or "")
-                if uid:
-                    args = (["im", "+bot-send-user", "--app-id", bot_app_id, "--user-id", uid, "--body", dm]
-                            if bot_app_id else ["im", "+send-user", "--user-id", uid, "--body", dm])
+                if uid and it.get("dm_notified_status") != it.get("status"):
+                    args = (["im", "+bot-send-user", "--app-id", bot_app_id, "--user-id", str(uid), "--body", dm]
+                            if bot_app_id else ["im", "+send-user", "--user-id", str(uid), "--body", dm])
                     ok_dm = cli(args) is not None
-                it["needs_notify"] = False
+                if ok_dm:
+                    it["dm_notified_status"] = it.get("status")  # send_dms.py 靠这个去重, 不设会重复私聊
+                # 群发失败保留 needs_notify, 下轮重试
+                it["needs_notify"] = ok_group is False
                 it["notified_status"] = it.get("status")
             sent.append({"order": order, "line": line, "group": ok_group, "dm": ok_dm})
         save_json(DB, db)

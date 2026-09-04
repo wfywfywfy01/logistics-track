@@ -15,8 +15,8 @@ def main():
     ap.add_argument("--subject", required=True)
     ap.add_argument("--body", required=True)
     a = ap.parse_args()
-    host = os.environ.get("SMTP_HOST", "smtp.exmail.qq.com")
-    port = int(os.environ.get("SMTP_PORT", "465"))
+    host = (os.environ.get("SMTP_HOST") or "smtp.exmail.qq.com")
+    port = int((os.environ.get("SMTP_PORT") or "465"))
     user = os.environ.get("SMTP_USER", "")
     pwd = os.environ.get("SMTP_PASS", "")
     if not user or not pwd:

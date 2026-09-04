@@ -7,6 +7,7 @@
 """
 import argparse, os, subprocess, sys, time, json
 from pathlib import Path
+import robust
 
 DATA = Path("data")
 
@@ -22,7 +23,6 @@ def run(args, desc):
     return ok
 
 def main():
-    import os
     lock = Path("data") / "auto_track.lock"
     if lock.exists():
         try:
@@ -41,10 +41,7 @@ def main():
         a = p.parse_args()
 
         # 收件箱里的面单图重试 OCR(上次失败/服务器抖动), 成功即移除
-        try:
-            inbox = json.load(open("data/inbox.json", encoding="utf-8"))
-        except Exception:
-            inbox = []
+        inbox = robust.load_json_guarded("data/inbox.json", [])
         still = []
         for item in inbox:
             item["tries"] = (item.get("tries") or 0) + 1
@@ -71,7 +68,7 @@ def main():
                 print("inbox OCR gave up:", item.get("name"), flush=True)
             else:
                 still.append(item)
-        json.dump(still, open("data/inbox.json", "w", encoding="utf-8"), ensure_ascii=False)
+        robust.atomic_write_json("data/inbox.json", still)
         if not a.skip_track:
             mode = getattr(a, "mode", "full") or "full"
             run(["track_all_ups.py", "--mode", mode], "抓官网")

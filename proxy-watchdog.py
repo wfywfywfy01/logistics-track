@@ -1,7 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """出口节点看门狗: 每5分钟测代理; s1 挂 -> 切 s2; 都挂超过1小时 -> 私信付汪阳"""
-import os, subprocess, sys, time
+import os, shutil, subprocess, sys, time
+import robust
+
+ADMIN_UID = (os.environ.get("ADMIN_USER_ID") or "13365")
+EMAIL_TO = (os.environ.get("EMAIL_TO") or "frank.fu@vertu.cn")
 
 BASE = "/app/deploy/xray"
 MARK = "/app/data/.active_node"
@@ -38,8 +42,13 @@ def restart_xray():
 
 
 def switch_to(node):
-    subprocess.run("cp %s/config-%s.json %s/config.json" % (BASE, node, BASE), shell=True)
-    open(MARK, "w").write(node)
+    """切到指定节点; 该节点配置不存在(未配 XRAY2_*)则只重启当前 xray"""
+    src = "%s/config-%s.json" % (BASE, node)
+    if os.path.exists(src):
+        shutil.copyfile(src, BASE + "/config.json")
+        open(MARK, "w").write(node)
+    else:
+        print("no config for %s, restart current" % node, flush=True)
     restart_xray()
 
 
@@ -75,13 +84,12 @@ def main():
             switch_to(back)
             time.sleep(20)
         if fails >= 12:
-            subprocess.run('vertu-cli im +bot-send-user --app-id "vbot_EIBezUGncpO8v0QJ" --user-id "13365" '
-                           '--body "物流追踪出口代理两个节点全部不可用, 官网追踪已中断。"',
-                           shell=True, capture_output=True)
-            subprocess.run('python sendmail.py --to "%s" '
-                           '--subject "物流追踪出口代理全部不可用" '
-                           '--body "物流追踪出口代理(s1/s2)超过1小时不可用, 官网追踪已中断, 请检查订阅节点。"' % os.environ.get("EMAIL_TO", "frank.fu@vertu.cn"),
-                           shell=True, capture_output=True)
+            robust.cli_run(["im", "+bot-send-user", "--app-id", "vbot_EIBezUGncpO8v0QJ", "--user-id", ADMIN_UID,
+                            "--body", "物流追踪出口代理两个节点全部不可用, 官网追踪已中断。"])
+            subprocess.run([sys.executable, "sendmail.py", "--to", EMAIL_TO,
+                            "--subject", "物流追踪出口代理全部不可用",
+                            "--body", "物流追踪出口代理(s1/s2)超过1小时不可用, 官网追踪已中断, 请检查订阅节点。"],
+                           capture_output=True)
             open(FAIL_LOG, "w").write("0")
             print("alert sent", flush=True)
 

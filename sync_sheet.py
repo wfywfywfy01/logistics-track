@@ -4,9 +4,10 @@
 用法: python sync_sheet.py
 环境: SHEET_DOC_ID (默认物流追踪表), 表格列 A-I
 """
-import json, os, re, subprocess, tempfile, time
+import json, os, re, tempfile, time
+import robust
 
-DOC_ID = os.environ.get("SHEET_DOC_ID", "3e553a37-880d-4c72-873a-fa7caa3aef9c")
+DOC_ID = (os.environ.get("SHEET_DOC_ID") or "3e553a37-880d-4c72-873a-fa7caa3aef9c")
 HEADERS = ["订单号", "录单人", "国际单号", "承运商", "顺丰单号", "产品", "状态", "最新节点", "签收时间", "更新时间"]
 
 
@@ -20,11 +21,8 @@ def col_letter(i):
 
 
 def main():
-    db = json.load(open("data/shipments.json", encoding="utf-8"))
-    try:
-        res = json.load(open("data/ups_results.json", encoding="utf-8"))
-    except Exception:
-        res = {}
+    db = robust.load_json_guarded("data/shipments.json", {})
+    res = robust.load_json_guarded("data/ups_results.json", {})
     rows = sorted(db.values(), key=lambda x: x.get("orderNo", ""))
     cells = []
     for ci, h in enumerate(HEADERS):
@@ -77,10 +75,8 @@ def main():
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(cells, f, ensure_ascii=False)
     try:
-        cmd = "vertu-cli docs +sheet-set-cells --doc-id \"%s\" --updates-file \"%s\" --no-json" % (DOC_ID, path)
-        r = subprocess.run(cmd, shell=True, capture_output=True)
-        out = r.stdout.decode("utf-8", errors="replace")
-        print("sheet sync rc=%d %s" % (r.returncode, out[:150]))
+        rc, out, _ = robust.cli_run(["docs", "+sheet-set-cells", "--doc-id", DOC_ID, "--updates-file", path, "--no-json"])
+        print("sheet sync rc=%d %s" % (rc, out[:150]))
     finally:
         try:
             os.unlink(path)

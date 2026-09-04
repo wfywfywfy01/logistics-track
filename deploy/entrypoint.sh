@@ -11,20 +11,26 @@ export DISPLAY=:99
 export PYTHONIOENCODING=utf-8
 
 # xray 本地代理(SS 节点 -> 海外出口): 密码从环境变量注入, 不落仓库
-export XRAY_ADDR="${XRAY_ADDR:-c57s1.portablesubmarines.com}"
-export XRAY_PORT="${XRAY_PORT:-15615}"
-export XRAY_METHOD="${XRAY_METHOD:-aes-256-gcm}"
+# s1 = XRAY_*, s2(备用, 可选) = XRAY2_*; 看门狗按 config-s1/config-s2 切换
+write_xray_cfg() {  # $1=输出文件 $2=addr $3=port $4=method $5=pass
+  cat > "$1" <<EOF
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [{"port": 10809, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
+  "outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "$2", "port": $3, "method": "$4", "password": "$5"}]}}]}
+EOF
+}
 if [ -z "$XRAY_PASS" ]; then
   echo "[entrypoint] XRAY_PASS missing, proxy disabled (直接抓取会失败)"
 else
   mkdir -p /app/deploy/xray
-  cat > /app/deploy/xray/config.json <<EOF
-{
-  "log": {"loglevel": "warning"},
-  "inbounds": [{"port": 10809, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
-  "outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "$XRAY_ADDR", "port": $XRAY_PORT, "method": "$XRAY_METHOD", "password": "$XRAY_PASS"}]}}]}
-EOF
-  echo "[entrypoint] starting xray proxy on 127.0.0.1:10809"
+  write_xray_cfg /app/deploy/xray/config-s1.json "${XRAY_ADDR:-c57s1.portablesubmarines.com}" "${XRAY_PORT:-15615}" "${XRAY_METHOD:-aes-256-gcm}" "$XRAY_PASS"
+  rm -f /app/deploy/xray/config-s2.json
+  [ -n "$XRAY2_PASS" ] && write_xray_cfg /app/deploy/xray/config-s2.json "${XRAY2_ADDR:?XRAY2_ADDR required}" "${XRAY2_PORT:?XRAY2_PORT required}" "${XRAY2_METHOD:-aes-256-gcm}" "$XRAY2_PASS"
+  NODE=$(cat /app/data/.active_node 2>/dev/null || echo s1)
+  [ -f "/app/deploy/xray/config-$NODE.json" ] || NODE=s1
+  cp "/app/deploy/xray/config-$NODE.json" /app/deploy/xray/config.json
+  echo "[entrypoint] starting xray proxy on 127.0.0.1:10809 (node=$NODE)"
   xray run -c /app/deploy/xray/config.json >/var/log/xray.log 2>&1 &
 fi
 sleep 2
@@ -33,9 +39,9 @@ export UPS_DISABLE_HTTP2=1
 echo "[entrypoint] UPS_PROXY=$UPS_PROXY"
 
 # 出口节点看门狗: 5分钟测一次, s1 挂自动切 s2, 双挂超过1小时私信告警
-python proxy-watchdog.py >/var/log/watchdog.log 2>&1 &
-# 初始化活动节点标记
+mkdir -p /app/data
 [ -f /app/data/.active_node ] || echo s1 > /app/data/.active_node
+python proxy-watchdog.py >/var/log/watchdog.log 2>&1 &
 
 
 # 首次启动: 宿主挂载空 data 目录时, 用镜像内种子数据初始化(台账/人员映射)

@@ -3,8 +3,11 @@
 """每日物流对账报告: 缺面单/在途/异常/签收/未匹配录单人 -> 推群。
 用法: python reconcile.py --channel-id <群> [--dry]
 """
-import argparse, json, os, subprocess, sys, time
-from collections import Counter
+import argparse, json, os, re, subprocess, sys, time
+import robust
+
+ADMIN_UID = (os.environ.get("ADMIN_USER_ID") or "13365")
+BOT = (os.environ.get("BOT_APP_ID") or "vbot_EIBezUGncpO8v0QJ")
 
 
 def main():
@@ -12,25 +15,20 @@ def main():
     ap.add_argument("--channel-id", required=True)
     ap.add_argument("--dry", action="store_true")
     a = ap.parse_args()
-    db = json.load(open("data/shipments.json", encoding="utf-8"))
-    try:
-        res = json.load(open("data/ups_results.json", encoding="utf-8"))
-    except Exception:
-        res = {}
-    missing_intl, in_transit, abnormal, delivered, unmatched, awaiting = [], [], [], [], [], []
-    import re as _re
-    import subprocess as _sp
+    db = robust.load_json_guarded("data/shipments.json", {})
+    res = robust.load_json_guarded("data/ups_results.json", {})
+    missing_intl, in_transit, abnormal, delivered, unmatched = [], [], [], [], []
     # 未匹配的非子单: 每日自动重新匹配(新单销售系统同步后即可命中)
-    for _o in [k for k, v in db.items() if not v.get("salesperson") and not _re.search(r"-\d+$", k)]:
+    for _o in [k for k, v in db.items() if not v.get("salesperson") and not re.search(r"-\d+$", k)]:
         try:
-            _sp.run("python tracking-pipeline.py rematch --order %s" % _o,
-                    shell=True, capture_output=True, timeout=60)
+            subprocess.run([sys.executable, "tracking-pipeline.py", "rematch", "--order", _o],
+                           capture_output=True, timeout=60)
         except Exception:
             pass
-    db = json.load(open("data/shipments.json", encoding="utf-8"))
+    db = robust.load_json_guarded("data/shipments.json", {})
     for it in db.values():
         order = it.get("orderNo", "")
-        is_sub = bool(_re.search(r"-\d+$", order))  # 子单(XSD-1)不参与缺面单/未匹配统计
+        is_sub = bool(re.search(r"-\d+$", order))  # 子单(XSD-1)不参与缺面单/未匹配统计
         intl = it.get("intl") or ""
         status = it.get("status") or "已预报"
         sp = it.get("salesperson") or ""
@@ -59,10 +57,7 @@ def main():
         lines.append("连续抓取失败 %d 单(请核对单号)：%s" % (len(fail_orders), "、".join(fail_orders[:12])))
     if unmatched:
         lines.append("未匹配录单人 %d 单：%s" % (len(unmatched), "、".join(unmatched[:12])))
-    try:
-        inbox = json.load(open("data/inbox.json", encoding="utf-8"))
-    except Exception:
-        inbox = []
+    inbox = robust.load_json_guarded("data/inbox.json", [])
     if inbox:
         lines.append("待识别面单 %d 张(OCR 重试中, 已留存文件)" % len(inbox))
     if not abnormal and not missing_intl and not unmatched and not inbox:
@@ -71,21 +66,16 @@ def main():
     if a.dry:
         print(body)
         return
-    # 有问题时额外私信付汪阳(13365)
+    # 有问题时额外私信管理员(ADMIN_USER_ID)
     if abnormal or inbox:
         dm = "物流对账待处理：异常 %d 单；待识别面单 %d 张。" % (len(abnormal), len(inbox))
-        subprocess.run('vertu-cli im +bot-send-user --app-id "vbot_EIBezUGncpO8v0QJ" --user-id "13365" --body "%s"' % dm,
-                       shell=True, capture_output=True)
-        email_to = os.environ.get("EMAIL_TO", "frank.fu@vertu.cn")
-        subprocess.run('python sendmail.py --to "%s" --subject "物流对账待处理" --body "%s"' %
-                       (email_to, body.replace('"', "'")),
-                       shell=True, capture_output=True)
-    r = subprocess.run("vertu-cli im +agent-notify --target im --agent-slug logistics-track "
-                       "--agent-name 物流小助手 --bot-name 物流小助手 "
-                       "--channel-id \"%s\" --body \"%s\"" % (a.channel_id, body.replace('"', "'")),
-                       shell=True, capture_output=True)
-    out = r.stdout.decode("utf-8", errors="replace")
-    print("reconcile rc=%d %s" % (r.returncode, out[:120]))
+        robust.cli_run(["im", "+bot-send-user", "--app-id", BOT, "--user-id", ADMIN_UID, "--body", dm])
+        subprocess.run([sys.executable, "sendmail.py", "--to", (os.environ.get("EMAIL_TO") or "frank.fu@vertu.cn"),
+                        "--subject", "物流对账待处理", "--body", body], capture_output=True)
+    rc, out, _ = robust.cli_run(["im", "+agent-notify", "--target", "im", "--agent-slug", "logistics-track",
+                                 "--agent-name", "物流小助手", "--bot-name", "物流小助手",
+                                 "--channel-id", a.channel_id, "--body", body, "--no-json"])
+    print("reconcile rc=%d %s" % (rc, out[:120]))
 
 
 if __name__ == "__main__":

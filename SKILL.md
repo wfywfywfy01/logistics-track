@@ -20,7 +20,7 @@ description: >-
 - `logi-watcher.py` — 群监听长驻：轮询群消息 → xlsx 走管线 / 图片入 inbox / 文字 `XSD==1Z` 自动配对；有新料后台拉起 `auto-track.py`。
 - `auto-track.py` — 自动闭环编排：`track_all_ups.py` → `wire_results.py` → `notify` → `send_dms.py`；`--skip-track` 跳过抓取。
 - `track_all_ups.py` — 批量抓 `data/sales_map.json` 里所有 `1Z` 开头单号 → `data/ups_results.json`。
-- `track_retry.py` — 只重抓 `ups_results.json` 里 `ok:false` 的单（漏抓/超时补抓）。
+- `track_retry.py` — 只重抓 `ups_results.json` 里 `ok:false` 的单（漏抓/超时补抓），单号取台账，`1Z` 走 UPS 其余走 DHL。
 - `send_dms.py` — 只补发私聊（`notify` 已发过的会跳过，靠 `dm_notified_status` 去重）。
 - `wire_results.py` — 读 `ups_results.json` 自动 ingest 缺失订单 + track-update 回填台账。
 
@@ -59,8 +59,8 @@ UPS 状态映射（ups_track.py 内置）：`D→签收 I→运输中 P/M→已�
 服务跑在 `tcp://10.100.0.176:2375`（Docker API，无认证裸连——网段内即 root，**务必尽快加 TLS/防火墙**）的容器 `logistics-track` 里，`--restart unless-stopped`。
 
 - 镜像：`deploy/Dockerfile`（python:3.12-slim via daocloud 镜像站 + xray-core via ghfast.top 镜像 + Chromium；apt/pip 走清华源）
-- 入口：`deploy/entrypoint.sh` = Xvfb :99 → xray(SS 节点 c57s1:15615 出口) → watcher + 每 60 分钟定时巡检
-- 凭据：`deploy/.env`（`vertu-cli agent env` 生成，**值带单引号要剥掉**；只在本机，别提交）
+- 入口：`deploy/entrypoint.sh` = Xvfb :99 → xray(SS 出口，主节点 `XRAY_*`、备用节点 `XRAY2_*` 可选，看门狗 `proxy-watchdog.py` 主挂自动切备) → watcher + 定时巡检/对账/组织刷新
+- 凭据：`deploy/.env`（模板 `deploy/.env.example` 列全了所有变量；`vertu-cli agent env` 生成认证项，**值带单引号要剥掉**；只在本机，别提交）
 - 数据卷：`logistics-data:/app/data`；空卷由镜像内 `/app/seed` 自动初始化
 - 容器内环境：`UPS_PROXY=socks5://127.0.0.1:10809` + `UPS_DISABLE_HTTP2=1`（**关键**：Linux 容器经 SS 代理时 Akamai 杀 HTTP2，禁用后 8/8 通过；本地 Windows 却要 HTTP2，故做成环境变量开关）
 - 运维：`docker -H tcp://10.100.0.176:2375 logs -f logistics-track`；重建 = 改代码后 `docker build -f deploy/Dockerfile -t logistics-track:latest . && docker rm -f logistics-track && docker run ...`（compose 文件 `deploy/docker-compose.yml` 备用）

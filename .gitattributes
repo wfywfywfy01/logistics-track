@@ -1,0 +1,2 @@
+# shell 脚本进容器必须 LF, 防 Windows 检出成 CRLF 导致 bash 语法错误
+*.sh text eol=lf

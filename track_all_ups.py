@@ -9,7 +9,7 @@ from dhl_track import track_dhl
 
 MODE = sys.argv[2] if len(sys.argv) > 2 and sys.argv[1] == "--mode" else "full"
 
-db = json.load(open("data/shipments.json", encoding="utf-8"))
+db = robust.load_json_guarded("data/shipments.json", {})
 pairs = []
 for k, v in db.items():
     if v.get("intl"):
@@ -27,10 +27,7 @@ print("mode=%s total=%d" % (MODE, len(pairs)), flush=True)
 results = {}
 # 增量模式保留上一次的完整结果(被跳过的签收单不丢, 表格/台账不受影响)
 if MODE == "incremental":
-    try:
-        results = json.load(open("data/ups_results.json", encoding="utf-8"))
-    except Exception:
-        results = {}
+    results = robust.load_json_guarded("data/ups_results.json", {})
 lock = threading.Lock()
 done_count = [0]
 

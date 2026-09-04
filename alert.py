@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """异常单(海关扣关/退回)推群警告, ⚠️ 标; customs_alerted 去重"""
-import json, os, subprocess, sys
+import os
 import robust
 
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "e02a0a05-7997-4d50-b0b9-cad9754c0bdc")
+CHANNEL_ID = (os.environ.get("CHANNEL_ID") or "e02a0a05-7997-4d50-b0b9-cad9754c0bdc")
 
 
 def main():
@@ -23,13 +23,13 @@ def _alert_loop(db, p):
             line = ("⚠️【物流异常警告】%s %s｜国际单 %s｜录单人 %s，请跟进处理" % (
                 it.get("orderNo"), status, it.get("intl") or "-",
                 it.get("salesperson") or "未匹配"))
-            cmd = ('vertu-cli im +agent-notify --target im --agent-slug logistics-track '
-                   '--agent-name 物流小助手 --bot-name 物流小助手 '
-                   '--channel-id "%s" --body "%s"' % (CHANNEL_ID, line.replace('"', "'")))
-            r = subprocess.run(cmd, shell=True, capture_output=True)
-            print("alert rc=%d %s" % (r.returncode, r.stdout.decode("utf-8", errors="replace")[:120]))
-            it["customs_alerted"] = True
-            sent += 1
+            rc, out, _ = robust.cli_run(["im", "+agent-notify", "--target", "im", "--agent-slug", "logistics-track",
+                                         "--agent-name", "物流小助手", "--bot-name", "物流小助手",
+                                         "--channel-id", CHANNEL_ID, "--body", line, "--no-json"])
+            print("alert rc=%d %s" % (rc, out[:120]))
+            if rc == 0:  # 发失败下轮再发
+                it["customs_alerted"] = True
+                sent += 1
     if sent:
         robust.save_json_guarded(p, db)
     return sent

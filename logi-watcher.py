@@ -6,11 +6,12 @@
 """
 import argparse, json, os, re, subprocess, sys, time
 from pathlib import Path
+import robust
 
 DATA = Path("data"); DATA.mkdir(exist_ok=True)
 STATE = DATA / "watcher_state.json"; INBOX = DATA / "inbox.json"
 TMP = Path("tmp"); TMP.mkdir(exist_ok=True)
-AGENT_BOT_ID = os.environ.get("AGENT_BOT_ID", "886e0664-78dd-4e58-af82-17b35ebe85c2")  # 专家 bot, @ 它时引导回复
+AGENT_BOT_ID = (os.environ.get("AGENT_BOT_ID") or "886e0664-78dd-4e58-af82-17b35ebe85c2")  # 专家 bot, @ 它时引导回复
 
 ORDER_RE = re.compile(r"\b((?:XSD|CKD)[-\w]+)\b", re.I)
 INTL_RE = re.compile(r"\b(1Z[A-Z0-9]{10,18}|[A-Z]{2}\d{8,14}|\d{9,14})\b", re.I)
@@ -18,8 +19,11 @@ INTL_RE = re.compile(r"\b(1Z[A-Z0-9]{10,18}|[A-Z]{2}\d{8,14}|\d{9,14})\b", re.I)
 PAIR_RE = re.compile(r"((?:XSD|CKD)[-\w]+)\s*(?:==|=|｜|\||\s)\s*(1Z[A-Z0-9]{10,18}|[A-Z]{2}\d{8,14}|\d{9,14})", re.I)
 
 def cli(args):
-    r = subprocess.run("vertu-cli " + " ".join(f'"{a}"' for a in args), shell=True, capture_output=True)
-    return r.stdout.decode("utf-8", errors="replace") if r.returncode == 0 else None
+    try:
+        rc, out, _ = robust.cli_run(args)
+    except Exception:
+        return None
+    return out if rc == 0 else None
 
 def cli_json(args):
     out = cli(args)
@@ -31,7 +35,7 @@ def load(p, d):
         try: return json.loads(p.read_text(encoding="utf-8-sig"))
         except Exception: pass
     return d
-def save(p, o): p.write_text(json.dumps(o, ensure_ascii=False, indent=2), encoding="utf-8")
+def save(p, o): robust.atomic_write_json(p, o)
 
 def process_attachment(att, channel_id, bot_app_id):
     name = att.get("name", "file")
@@ -42,7 +46,7 @@ def process_attachment(att, channel_id, bot_app_id):
     target = TMP / (uid + "_" + name)
     # 已下载过(文件存在且非空)就直接复用, +attachment-download 对已存在文件会报错
     if not (target.exists() and target.stat().st_size > 0):
-        out = cli(["im", "+attachment-download", "--url", f'"{url}"', "--output", str(target).replace("\\", "/"), "--no-json"])
+        out = cli(["im", "+attachment-download", "--url", url, "--output", str(target).replace("\\", "/"), "--no-json"])
         if out is None or not target.exists(): return {"name": name, "ok": False}
     lower = name.lower()
     if lower.endswith((".xlsx", ".xls")):
@@ -157,7 +161,7 @@ def watch_once(channel_id, bot_app_id, since_ts):
              "--body", "【物流小助手】已处理本批：" + "；".join(parts) + "。正在抓取官网轨迹…"])
     if done:
         # 崩溃安全: 写脏标记, 入口的接管循环会保证抓取一定被执行
-        open(str(DATA / ".dirty"), "w").write(str(time.time()))
+        (DATA / ".dirty").write_text(str(time.time()))
         if not os.environ.get("LOGI_NO_AUTOTRACK"):
             spawn_auto_track(channel_id, bot_app_id)
     return results, latest

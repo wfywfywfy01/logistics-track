@@ -34,9 +34,9 @@ def image_as_data_url(path):
 
 def ocr_image(path):
     import urllib.request
-    base = os.environ.get("OCR_BASE_URL", "https://qwen3.vertu.cn:8443")
+    base = (os.environ.get("OCR_BASE_URL") or "https://qwen3.vertu.cn:8443")
     key = os.environ.get("OCR_API_KEY", "")
-    model = os.environ.get("OCR_MODEL", "/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf")
+    model = (os.environ.get("OCR_MODEL") or "/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf")
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
