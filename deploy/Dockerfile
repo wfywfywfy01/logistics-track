@@ -23,6 +23,8 @@ COPY deploy/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt
 
 # 浏览器: 代码只用 patchright(playwright 反检测分支, CLI 相同), 只装一份 chromium
+# 官方 cdn.playwright.dev 在国内 ~50KB/s(177MB 要 1 小时), 走 npmmirror
+ENV PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
 RUN python -m patchright install --with-deps chromium
 
 # xray-core: 容器内本地代理(SS 节点 -> 美国出口), 供 UPS 抓取走海外线路
