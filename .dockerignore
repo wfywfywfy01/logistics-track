@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.git/
+tmp/
+dist/
+extension/
+_skill-publish/
+.dsh-uploads/
+deploy/.env
+autostart-watcher.vbs
+run-watcher.bat
+SKILL.md

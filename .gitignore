@@ -1,0 +1,24 @@
+# 凭据与密钥 —— 绝不入库
+deploy/.env
+.env
+*.key
+*.pem
+
+# 业务数据
+data/
+tmp/
+
+# 本地上传缓存
+.dsh-uploads/
+
+# 构建产物与运行时
+__pycache__/
+*.pyc
+_skill-publish/
+
+# 无关文件
+autostart-watcher.vbs
+run-watcher.bat
+logistics-track-deploy.tar.gz
+dist/
+extension/

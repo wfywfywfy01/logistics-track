@@ -1,0 +1,24 @@
+services:
+  logistics:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: logistics-track:latest
+    container_name: logistics-track
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CHANNEL_ID: ${CHANNEL_ID}
+      BOT_APP_ID: ${BOT_APP_ID:-vbot_EIBezUGncpO8v0QJ}
+      INTERVAL: ${INTERVAL:-30}
+      POLL_MINUTES: ${POLL_MINUTES:-60}
+      TZ: Asia/Shanghai
+      # 服务容器内 xray 代理自动由 entrypoint 拉起并注入 UPS_PROXY
+    volumes:
+      - ./data:/app/data
+      - ./tmp:/app/tmp
+    shm_size: 1g
+    # 内存硬限制: 宿主机仅 3.7GB 且跑着生产容器, 必须限死
+    mem_limit: 1536m
+    memswap_limit: 2048m
+    stop_grace_period: 30s
