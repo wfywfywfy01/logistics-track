@@ -38,18 +38,7 @@ RUN curl -sL --retry 3 --max-time 300 -o /tmp/xray.zip \
 COPY . /app
 WORKDIR /app
 
-# vertu-cli: 公司内部工具, 构建时从私有仓库用 --secret 注入(不落公开仓库/不落镜像层外)
-RUN mkdir -p /app/bin && \
-    --mount=type=secret,id=gh_token \
-    TOK=\$(cat /run/secrets/gh_token 2>/dev/null || echo "") && \
-    curl -sL --fail --retry 3 \
-      -H "Authorization: token \$TOK" \
-      -H "Accept: application/vnd.github.v3.raw" \
-      https://api.github.com/repos/wfywfywfy01/vertu-cli-bin/contents/vertu-cli.cjs \
-      -o /app/bin/vertu-cli.cjs && \
-    ls -la /app/bin/vertu-cli.cjs
-
-# vertu-cli 入口: 代码里 shell 调用 "vertu-cli ...", 这里做 shim 指向 node 包
+# vertu-cli 入口: 代码里 shell 调用 "vertu-cli ...", 这里做 shim 指向 node 包(鉴权靠 APP_KEY, 二进制本身无敏感信息)
 RUN printf "#!/bin/sh\nexec node /app/bin/vertu-cli.cjs \"\$@\"\n" > /usr/local/bin/vertu-cli \
     && chmod +x /usr/local/bin/vertu-cli \
     && chmod +x /app/deploy/entrypoint.sh
