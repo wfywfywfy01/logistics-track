@@ -16,6 +16,9 @@ tmp/
  deploy/xray/config.json
 deploy/xray/config-s1.json
 deploy/xray/config-s2.json
+# 公司内部 CLI(私有仓库 vertu-cli-bin 提供, 构建时注入)
+bin/
+
 # 构建产物与运行时
 __pycache__/
 *.pyc
