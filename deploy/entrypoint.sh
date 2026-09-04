@@ -10,9 +10,22 @@ sleep 2
 export DISPLAY=:99
 export PYTHONIOENCODING=utf-8
 
-# xray 本地代理(SS 节点 -> 海外出口): UPS 抓取必须走海外线路, 阿里云直连被 Akamai 杀 HTTP2
-echo "[entrypoint] starting xray proxy on 127.0.0.1:10809"
-xray run -c /app/deploy/xray/config.json >/var/log/xray.log 2>&1 &
+# xray 本地代理(SS 节点 -> 海外出口): 密码从环境变量注入, 不落仓库
+export XRAY_ADDR="${XRAY_ADDR:-c57s1.portablesubmarines.com}"
+export XRAY_PORT="${XRAY_PORT:-15615}"
+export XRAY_METHOD="${XRAY_METHOD:-aes-256-gcm}"
+if [ -z "$XRAY_PASS" ]; then
+  echo "[entrypoint] XRAY_PASS missing, proxy disabled (直接抓取会失败)"
+else
+  cat > /app/deploy/xray/config.json <<EOF
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [{"port": 10809, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
+  "outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "$XRAY_ADDR", "port": $XRAY_PORT, "method": "$XRAY_METHOD", "password": "$XRAY_PASS"}]}}]}
+EOF
+  echo "[entrypoint] starting xray proxy on 127.0.0.1:10809"
+  xray run -c /app/deploy/xray/config.json >/var/log/xray.log 2>&1 &
+fi
 sleep 2
 export UPS_PROXY="socks5://127.0.0.1:10809"
 export UPS_DISABLE_HTTP2=1

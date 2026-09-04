@@ -11,6 +11,11 @@ tmp/
 # 本地上传缓存
 .dsh-uploads/
 
+
+# xray 配置含节点密码, 运行时由 env 生成
+ deploy/xray/config.json
+deploy/xray/config-s1.json
+deploy/xray/config-s2.json
 # 构建产物与运行时
 __pycache__/
 *.pyc
