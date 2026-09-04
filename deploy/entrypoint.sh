@@ -17,6 +17,7 @@ export XRAY_METHOD="${XRAY_METHOD:-aes-256-gcm}"
 if [ -z "$XRAY_PASS" ]; then
   echo "[entrypoint] XRAY_PASS missing, proxy disabled (直接抓取会失败)"
 else
+  mkdir -p /app/deploy/xray
   cat > /app/deploy/xray/config.json <<EOF
 {
   "log": {"loglevel": "warning"},
