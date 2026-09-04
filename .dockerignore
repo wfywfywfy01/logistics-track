@@ -10,3 +10,4 @@ deploy/.env
 autostart-watcher.vbs
 run-watcher.bat
 SKILL.md
+README.md

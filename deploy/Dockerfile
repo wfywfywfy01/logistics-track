@@ -22,9 +22,8 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources \
 COPY deploy/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple -r /tmp/requirements.txt
 
-# 浏览器(playwright 与 patchright 共用 chromium)
-RUN playwright install --with-deps chromium
-RUN python -m patchright install chromium
+# 浏览器: 代码只用 patchright(playwright 反检测分支, CLI 相同), 只装一份 chromium
+RUN python -m patchright install --with-deps chromium
 
 # xray-core: 容器内本地代理(SS 节点 -> 美国出口), 供 UPS 抓取走海外线路
 # 云端直连 GitHub 慢/断, 走 ghfast.top 镜像(实测 21MB/17s)
