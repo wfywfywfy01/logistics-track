@@ -60,6 +60,8 @@ UPS 状态映射（ups_track.py 内置）：`D→签收 I→运输中 P/M→已�
 
 - 镜像：`deploy/Dockerfile`（python:3.12-slim via daocloud 镜像站 + xray-core via ghfast.top 镜像 + Chromium；apt/pip 走清华源）
 - 入口：`deploy/entrypoint.sh` = Xvfb :99 → xray(SS 出口，主节点 `XRAY_*`、备用节点 `XRAY2_*` 可选，看门狗 `proxy-watchdog.py` 主挂自动切备) → watcher + 定时巡检/对账/组织刷新
+  线上已配 s1=`c57s1` / s2=`c57s2`（同端口同密码，`c57s3` 也可解析），切换双向实测通过；UPS 经 s2 抓取正常
+- 存活监督：bash 留作 PID 1，`watcher_state.json` 超过 `WATCHER_STALE_MIN`(10) 分钟未更新即杀 watcher 退出，靠 `--restart unless-stopped` 拉起（`kill 1` 对 python 无效，已踩坑）
 - 凭据：`deploy/.env`（模板 `deploy/.env.example` 列全了所有变量；`vertu-cli agent env` 生成认证项，**值带单引号要剥掉**；只在本机，别提交）
 - 数据卷：`logistics-data:/app/data`；空卷由镜像内 `/app/seed` 自动初始化
 - 容器内环境：`UPS_PROXY=socks5://127.0.0.1:10809` + `UPS_DISABLE_HTTP2=1`（**关键**：Linux 容器经 SS 代理时 Akamai 杀 HTTP2，禁用后 8/8 通过；本地 Windows 却要 HTTP2，故做成环境变量开关）
