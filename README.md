@@ -60,8 +60,11 @@ cp deploy/.env.example deploy/.env   # 填 Vertu 认证 / XRAY_* 出口节点 / 
 docker build -f deploy/Dockerfile -t logistics-track:latest .
 docker run -d --name logistics-track --restart unless-stopped \
   --shm-size=1g --memory=1536m --memory-swap=2048m --env-file deploy/.env \
+  --log-opt max-size=20m --log-opt max-file=3 \
   -v logistics-data:/app/data -v logistics-tmp:/app/tmp logistics-track:latest
 ```
+
+自愈：watcher 每轮轮询重写 `data/watcher_state.json`，超过 `WATCHER_STALE_MIN`（默认 10）分钟没更新，入口脚本结束主进程，由 Docker 重启整个容器；`docker ps` 的 HEALTHCHECK 同一判据。
 
 或 `cd deploy && docker compose up -d`。容器入口自动：Xvfb → xray 代理 → 看门狗 → 定时巡检（`TRACK_TIMES`）/ 每日对账（`RECONCILE_HOUR`）/ 每周日组织刷新 → 前台 watcher。
 

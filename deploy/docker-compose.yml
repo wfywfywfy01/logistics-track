@@ -22,3 +22,9 @@ services:
     mem_limit: 1536m
     memswap_limit: 2048m
     stop_grace_period: 30s
+    # 日志轮转, 防 docker json 日志吃满磁盘
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"

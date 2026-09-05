@@ -128,6 +128,23 @@ TRACK_TIMES="${TRACK_TIMES:-09:05,15:05}"
   done
 ) &
 
+# watcher 假死自愈: 每轮轮询都会重写 watcher_state.json, 超过 WATCHER_STALE_MIN 分钟没动 -> 结束 PID 1(watcher),
+# 容器退出后由 --restart unless-stopped 整体拉起(xray/看门狗/定时循环一起重来)
+WATCHER_STALE_MIN="${WATCHER_STALE_MIN:-10}"
+(
+  sleep 300
+  while true; do
+    if [ -f /app/data/watcher_state.json ] && [ -n "$(find /app/data/watcher_state.json -mmin +"$WATCHER_STALE_MIN")" ]; then
+      echo "[liveness] watcher_state.json stale > ${WATCHER_STALE_MIN}min, exit for restart"
+      kill 1
+    fi
+    sleep 60
+  done
+) &
+
+# 下载附件缓存清理: 超过 30 天的 tmp 文件删掉, 防止 logistics-tmp 卷无限涨
+( while true; do find /app/tmp -type f -mtime +30 -delete 2>/dev/null; sleep 86400; done ) &
+
 # 群监听(前台)
 echo "[entrypoint] starting watcher"
 exec python logi-watcher.py --channel-id "$CHANNEL_ID" --bot-app-id "$BOT_APP_ID" --interval "$INTERVAL"
