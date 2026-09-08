@@ -14,7 +14,8 @@
 #      docker -H tcp://10.100.0.176:2375 run -d --name logistics-track --restart unless-stopped \
 #        --shm-size=1g --memory=1536m --memory-swap=2048m --env-file deploy/.env \
 #        --log-opt max-size=20m --log-opt max-file=3 \
-#        -v logistics-data:/app/data -v logistics-tmp:/app/tmp logistics-track:latest
+#        -e BACKUP_DIR=/app/backups -v logistics-data:/app/data -v logistics-tmp:/app/tmp \
+#        -v logistics-backups:/app/backups logistics-track:latest
 #   回滚: rm -f 后用 logistics-track:prev 跑同一条 run
 #
 # 要点:

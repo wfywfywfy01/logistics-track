@@ -12,7 +12,9 @@ BACKUP_PARENT = os.environ.get("BACKUP_PARENT_ID", "")
 def create_backup(output=None, data_dir=None):
     store = Storage(data_dir)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    output = Path(output or (Path(tempfile.gettempdir()) / f"logistics-backup-{stamp}.zip"))
+    backup_dir = Path(os.environ.get("BACKUP_DIR") or tempfile.gettempdir())
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    output = Path(output or (backup_dir / f"logistics-backup-{stamp}.zip"))
     with tempfile.TemporaryDirectory() as temp_dir:
         snapshot = Path(temp_dir) / "shipments.db"
         source = store.connect()
@@ -39,9 +41,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output")
     parser.add_argument("--no-upload", action="store_true")
+    parser.add_argument("--upload", action="store_true")
     options = parser.parse_args()
     zpath = create_backup(options.output)
-    if options.no_upload:
+    should_upload = options.upload or os.environ.get("BACKUP_UPLOAD") == "1"
+    if options.no_upload or not should_upload:
         print(zpath)
         return 0
     args = ["drive", "+upload", "--source", str(zpath)]
@@ -52,7 +56,6 @@ def main():
         print("backup upload failed: %s" % out[:150])
         return 1
     print("backup uploaded:", zpath.name)
-    zpath.unlink(missing_ok=True)
     return 0
 
 
