@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import json, sys, threading
 import robust
+from storage import Storage, iso
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, ".")
 from ups_track import track_ups
@@ -9,7 +10,9 @@ from dhl_track import track_dhl
 
 MODE = sys.argv[2] if len(sys.argv) > 2 and sys.argv[1] == "--mode" else "full"
 
-db = robust.load_json_guarded("data/shipments.json", {})
+store = Storage()
+store.migrate_legacy_json()
+db = store.get_shipments()
 pairs = []
 for k, v in db.items():
     if v.get("intl"):
@@ -27,9 +30,27 @@ print("mode=%s total=%d" % (MODE, len(pairs)), flush=True)
 results = {}
 # 增量模式保留上一次的完整结果(被跳过的签收单不丢, 表格/台账不受影响)
 if MODE == "incremental":
-    results = robust.load_json_guarded("data/ups_results.json", {})
+    results = store.get_document("ups_results", {})
 lock = threading.Lock()
 done_count = [0]
+
+def merge_result(previous, current, is_alt=False):
+    previous = previous or {}
+    if is_alt:
+        if current.get("ok") and not previous.get("ok"):
+            return {**current, "primary_result": previous, "alt_result": current,
+                    "alt_stage": current.get("stage"), "alt_detail": current.get("detail")}
+        return {**previous, "alt_result": current, "alt_stage": current.get("stage"),
+                "alt_detail": current.get("detail"), "alt_tracking": current.get("tracking")}
+    alt = previous.get("alt_result")
+    if not current.get("ok") and alt and alt.get("ok"):
+        return {**alt, "primary_result": current, "alt_result": alt,
+                "alt_stage": alt.get("stage"), "alt_detail": alt.get("detail")}
+    result = dict(current)
+    if alt:
+        result.update({"alt_result": alt, "alt_stage": alt.get("stage"),
+                       "alt_detail": alt.get("detail"), "alt_tracking": alt.get("tracking")})
+    return result
 
 
 def one(order, tn, tag=""):
@@ -43,30 +64,19 @@ def one(order, tn, tag=""):
     except Exception as e:
         r = {"tracking": tn, "ok": False, "error": str(e)[:150]}
     r["order"] = order
+    r["observed_at"] = iso()
+    r["binding_version"] = int(db[order].get("binding_version") or 0)
     r["salesperson"] = db[order].get("salesperson", "")
     if tag:
         r["alt_tracking"] = tn
     else:
         r["alt_tracking"] = ""
-    try:
-        prev = results.get(order) or {}
-        r["fails"] = (prev.get("fails") or 0) + (0 if r.get("ok") else 1)
-    except Exception:
-        pass
     with lock:
         prev = results.get(order) or {}
-        if tag:
-            if not prev.get("ok"):
-                results[order] = r
-            else:
-                prev["alt_stage"] = r.get("stage")
-                prev["alt_detail"] = r.get("detail")
-                prev["alt_tracking"] = tn
-                results[order] = prev
-        else:
-            results[order] = r
+        r["fails"] = 0 if r.get("ok") else (prev.get("fails") or 0) + 1
+        results[order] = merge_result(prev, r, bool(tag))
         done_count[0] += 1
-        robust.atomic_write_json("data/ups_results.json", results)
+        store.put_document("ups_results", results)
         print("[%d/%d] %s %s -> %s" % (done_count[0], len(pairs), order, tn,
                                        r.get("stage") or ("ERR:" + r.get("error", "")[:40])), flush=True)
 

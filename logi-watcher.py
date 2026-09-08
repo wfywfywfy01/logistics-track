@@ -4,13 +4,16 @@
 轮询群历史：@物流小帮手 + 附件 → xlsx 直接走管线；图片面单入 inbox 待 Agent 视觉处理。
 用法: python logi-watcher.py --channel-id e02a0a05-... [--bot-app-id vbot_...] [--interval 30] [--once]
 """
-import argparse, json, os, re, subprocess, sys, time
+import argparse, hashlib, json, os, re, subprocess, sys, time
 from pathlib import Path
 import robust
+from storage import Storage
 
 DATA = Path("data"); DATA.mkdir(exist_ok=True)
 STATE = DATA / "watcher_state.json"; INBOX = DATA / "inbox.json"
 TMP = Path("tmp"); TMP.mkdir(exist_ok=True)
+STORE = Storage(DATA)
+STORE.migrate_legacy_json()
 AGENT_BOT_ID = (os.environ.get("AGENT_BOT_ID") or "886e0664-78dd-4e58-af82-17b35ebe85c2")  # 专家 bot, @ 它时引导回复
 
 ORDER_RE = re.compile(r"\b((?:XSD|CKD)[-\w]+)\b", re.I)
@@ -30,15 +33,11 @@ def cli_json(args):
     try: return json.loads(out) if out else None
     except Exception: return None
 
-def load(p, d):
-    if p.exists():
-        try: return json.loads(p.read_text(encoding="utf-8-sig"))
-        except Exception: pass
-    return d
-def save(p, o): robust.atomic_write_json(p, o)
+def load(p, d): return STORE.get_document(p.stem.lstrip("."), d)
+def save(p, o): STORE.put_document(p.stem.lstrip("."), o)
 
-def process_attachment(att, channel_id, bot_app_id):
-    name = att.get("name", "file")
+def process_attachment(att, channel_id, bot_app_id, item_id=None):
+    name = Path(att.get("name", "file")).name
     url = att.get("url")
     if not url: return None
     # 同名字附件防撞车: 用 URL 尾部 uuid 段做前缀
@@ -48,18 +47,34 @@ def process_attachment(att, channel_id, bot_app_id):
     if not (target.exists() and target.stat().st_size > 0):
         out = cli(["im", "+attachment-download", "--url", url, "--output", str(target).replace("\\", "/"), "--no-json"])
         if out is None or not target.exists(): return {"name": name, "ok": False}
+    max_bytes = int(os.environ.get("ATTACHMENT_MAX_BYTES") or str(20 * 1024 * 1024))
+    if target.stat().st_size > max_bytes:
+        target.unlink(missing_ok=True)
+        return {"name": name, "ok": False, "error": "attachment exceeds size limit"}
     lower = name.lower()
-    if lower.endswith((".xlsx", ".xls")):
+    signature = target.read_bytes()[:12]
+    if lower.endswith(".xlsx"):
+        if not signature.startswith(b"PK"):
+            return {"name": name, "ok": False, "error": "invalid xlsx content"}
         r = subprocess.run([sys.executable, "tracking-pipeline.py", "ingest-forecast", "--file", str(target)],
                            capture_output=True)
+        if r.returncode != 0:
+            return {"name": name, "ok": False, "kind": "forecast",
+                    "error": r.stderr.decode("utf-8", errors="replace")[:200]}
         try: res = json.loads(r.stdout.decode("utf-8", errors="replace"))
         except Exception: res = {"raw": r.stdout.decode("utf-8", errors="replace")[:200]}
-        return {"name": name, "ok": True, "kind": "forecast", "result": res}
+        ok = bool(res.get("ingested"))
+        return {"name": name, "ok": ok, "kind": "forecast", "result": res,
+                **({} if ok else {"error": "forecast contains no valid orders"})}
     if lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        # OCR 不阻塞消息队列: 图片一律先进收件箱, 由 auto-track 的收件箱重试(带超时)处理
-        inbox = load(INBOX, [])
-        inbox.append({"url": url, "name": name, "path": str(target), "at": time.strftime("%Y-%m-%d %H:%M")})
-        save(INBOX, inbox)
+        is_image = (signature.startswith(b"\x89PNG\r\n\x1a\n") or
+                    signature.startswith(b"\xff\xd8\xff") or
+                    (signature.startswith(b"RIFF") and signature[8:12] == b"WEBP"))
+        if not is_image:
+            return {"name": name, "ok": False, "error": "invalid image content"}
+        # 图片先持久入队，OCR worker 用租约领取；重启和并发新到件都不会覆盖。
+        item_id = item_id or hashlib.sha256(url.encode()).hexdigest()
+        STORE.enqueue_inbox(item_id, {"url": url, "name": name, "path": str(target)})
         return {"name": name, "ok": True, "kind": "label"}
     return {"name": name, "ok": True, "kind": "ignored"}
 
@@ -108,46 +123,74 @@ def spawn_auto_track(channel_id, bot_app_id, skip_track=False):
         kwargs["creationflags"] = 0x00000008  # DETACHED_PROCESS
     subprocess.Popen(args, **kwargs)
     print("spawned auto-track", flush=True)
+
+
+def fetch_history(channel_id, since_ts):
+    """Fetch every page since the persisted high-water time; IDs provide overlap dedupe."""
+    page_size = 50
+    max_pages = int(os.environ.get("HISTORY_MAX_PAGES") or "100")
+    latest = since_ts
+    for page in range(max_pages):
+        args = ["im", "+history", "--channel-id", channel_id,
+                "--date-from", since_ts, "--limit", str(page_size),
+                "--offset", str(page * page_size)]
+        data = cli_json(args)
+        if data is None:
+            raise RuntimeError("history query failed")
+        messages = (data or {}).get("messages", [])
+        for message in messages:
+            message_id = message.get("id") or "sha256:" + hashlib.sha256(
+                json.dumps(message, ensure_ascii=False, sort_keys=True).encode()
+            ).hexdigest()
+            message["id"] = message_id
+            STORE.record_message(channel_id, message_id,
+                                 message.get("created_at") or since_ts, message)
+            latest = max(latest, message.get("created_at") or since_ts)
+        if len(messages) < page_size:
+            return latest
+    raise RuntimeError("history pagination limit reached; increase HISTORY_MAX_PAGES")
+
+
 def watch_once(channel_id, bot_app_id, since_ts):
-    data = cli_json(["im", "+history", "--channel-id", channel_id, "--limit", "50"])
-    msgs = (data or {}).get("messages", [])
-    results, latest = [], since_ts
-    for m in sorted(msgs, key=lambda x: x.get("created_at", "")):
-        ts = m.get("created_at", "")
-        if ts <= since_ts: continue
+    latest = fetch_history(channel_id, since_ts)
+    results, should_run = [], False
+    for stored in STORE.pending_messages(channel_id):
+        m = stored["payload"]
+        message_id = stored["id"]
         # 不处理机器人自己发的消息(通知/ack/警告), 防止自循环
         if m.get("sender_type") == "bot" or m.get("sender_bot_id"):
-            latest = max(latest, ts)
+            STORE.complete_message(channel_id, message_id)
             continue
         msg_items = []
-        for att in m.get("attachments", []):
+        for index, att in enumerate(m.get("attachments", [])):
             if att.get("attachment_type") in ("file", "image"):
-                msg_items.append(process_attachment(att, channel_id, bot_app_id))
+                msg_items.append(process_attachment(
+                    att, channel_id, bot_app_id, f"{message_id}:{index}"
+                ))
         msg_items.extend(process_text(m.get('body') or '', channel_id))
         results.extend(msg_items)
         # @ 了专家 bot 但没有任何可执行内容 -> 引导回复
         body_low = (m.get("body") or "").lower()
         mentions = ((m.get("metadata") or {}).get("mentions") or [])
         mentioned = any(x.get("type") == "bot" and x.get("bot_id") == AGENT_BOT_ID for x in mentions) or any(k in body_low for k in ("@物流小助手", "@hermes logistics-track", "@物流追踪机器人"))
-        # 有附件但下载失败: 重试计数, 超过3次放弃并推进游标(不堵后面的消息)
         failed = [r for r in msg_items if r and not r.get("ok")]
         if failed:
-            mid = m.get("id", "")
-            dl_fails = load(DATA / ".dl_fails.json", {})
-            n = dl_fails.get(mid, 0) + 1
-            if n < 3:
-                dl_fails[mid] = n
-                save(DATA / ".dl_fails.json", dl_fails)
-                break
-            dl_fails.pop(mid, None)
-            save(DATA / ".dl_fails.json", dl_fails)
-            print("give up on attachment:", [r.get("name") for r in failed], flush=True)
-        latest = max(latest, ts)
+            state = STORE.fail_message(channel_id, message_id,
+                                       json.dumps(failed, ensure_ascii=False))
+            print("message failed:", message_id, state, flush=True)
+            continue
+        STORE.complete_message(channel_id, message_id)
         if mentioned and not [r for r in msg_items if r]:
             cli(["im", "+agent-notify", "--target", "im", "--agent-slug", "logistics-track",
                  "--agent-name", "物流小助手", "--bot-name", "物流小助手",
                  "--channel-id", channel_id, "--no-json",
                  "--body", "【物流小助手】在的！把预报 xlsx、面单图片发到群里，或直接发文字配对（XSD…==1Z…），我就会自动查官网轨迹、通知录单人。"])
+        actionable = [r for r in msg_items if r and r.get("ok") and
+                      r.get("kind") in ("forecast", "label", "pair")]
+        if actionable:
+            STORE.enqueue_task("pipeline", f"pipeline:{message_id}",
+                               {"channel_id": channel_id, "bot_app_id": bot_app_id})
+            should_run = True
     done = [r for r in results if r and r.get("ok")]
     if done:
         n_x = sum(1 for r in done if r.get("kind") == "forecast")
@@ -159,11 +202,8 @@ def watch_once(channel_id, bot_app_id, since_ts):
              "--agent-name", "物流小助手", "--bot-name", "物流小助手",
              "--channel-id", channel_id, "--no-json",
              "--body", "【物流小助手】已处理本批：" + "；".join(parts) + "。正在抓取官网轨迹…"])
-    if done:
-        # 崩溃安全: 写脏标记, 入口的接管循环会保证抓取一定被执行
-        (DATA / ".dirty").write_text(str(time.time()))
-        if not os.environ.get("LOGI_NO_AUTOTRACK"):
-            spawn_auto_track(channel_id, bot_app_id)
+    if should_run and not os.environ.get("LOGI_NO_AUTOTRACK"):
+        spawn_auto_track(channel_id, bot_app_id)
     return results, latest
 
 def main():
@@ -179,6 +219,7 @@ def main():
         try:
             results, since = watch_once(args.channel_id, args.bot_app_id, since)
             save(STATE, {"since": since})
+            (DATA / ".watcher-heartbeat").touch()
             for r in results:
                 if r: print(json.dumps(r, ensure_ascii=False), flush=True)
         except Exception as e:

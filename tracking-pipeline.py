@@ -4,28 +4,30 @@
 子命令: ingest-forecast | ingest-pair | track-update | list | notify
 台账 data/shipments.json；录单人缓存 data/sales_map.json；定人缓存 data/users_map.json
 """
-import argparse, json, re, subprocess, sys, os, time
+import argparse, json, re, subprocess, sys, os
+from datetime import datetime
 from pathlib import Path
 import openpyxl
+from storage import Storage, iso
 
 DATA = Path((os.environ.get("LOGIBOT_DATA_DIR") or "data")); DATA.mkdir(parents=True, exist_ok=True)
 DB = DATA / "shipments.json"; SALES_MAP = DATA / "sales_map.json"; USERS_MAP = DATA / "users_map.json"; ORG_PEOPLE = DATA / "org_people.json"
 
 import robust
+STORE = Storage(DATA)
+STORE.migrate_legacy_json()
 LEDGER_LOCK = robust.FileLock(str(DATA / ".ledger.lock"))
 
 def load_json(p, d=None):
-    if p.exists():
-        try: return json.loads(p.read_text(encoding="utf-8"))
-        except Exception: pass
-    return {} if d is None else d
+    if p == DB:
+        return STORE.get_shipments()
+    return STORE.get_document(p.stem, {} if d is None else d)
 
 def save_json(p, obj):
-    # 台账类文件原子写 + .bak 兜底; 小缓存直接原子写
-    if p.name in ("shipments.json", "sales_map.json", "users_map.json", "org_people.json"):
-        robust.save_json_guarded(str(p), obj)
+    if p == DB:
+        STORE.put_shipments(obj)
     else:
-        robust.atomic_write_json(str(p), obj)
+        STORE.put_document(p.stem, obj)
 
 def cli(args):
     """headless vertu-cli；返回 stdout 文本或 None(Linux 参数列表防注入, Windows 回退 shell)"""
@@ -77,11 +79,13 @@ def match_sales(order_no, domestic=None):
     sm = load_json(SALES_MAP)
     if order_no in sm and sm[order_no].get("salesperson"):
         return sm[order_no]
-    data = cli_json(["sales", "+orders", "--order-no", order_no, "--period", "this_year", "--limit", "1", "--no-json"])
-    row = ((data or {}).get("rows") or [{}])[0] if data else {}
+    data = cli_json(["sales", "+orders", "--order-no", order_no, "--period", "this_year", "--limit", "10", "--no-json"])
+    exact = [r for r in ((data or {}).get("rows") or []) if trim(r.get("订单号")) == order_no]
+    row = exact[0] if len(exact) == 1 else {}
     if not row.get("销售人员") and domestic:
-        d2 = cli_json(["sales", "+orders", "--logistics-no", domestic, "--period", "this_year", "--limit", "1", "--no-json"])
-        row = ((d2 or {}).get("rows") or [{}])[0] if d2 else {}
+        d2 = cli_json(["sales", "+orders", "--logistics-no", domestic, "--period", "this_year", "--limit", "10", "--no-json"])
+        exact = [r for r in ((d2 or {}).get("rows") or []) if trim(r.get("物流单号")) == domestic]
+        row = exact[0] if len(exact) == 1 else {}
     rec = _row_to_rec(row)
     if rec["salesperson"]:
         sm[order_no] = {**sm.get(order_no, {}), **rec}
@@ -154,21 +158,48 @@ def inherit_parent(it, db):
             it[k] = parent[k]
 
 
-def ingest_pair(order, intl):
+def ingest_pair(order, intl, force=False):
     with LEDGER_LOCK:
-        return _ingest_pair(order, intl)
+        return _ingest_pair(order, intl, force)
 
-def _ingest_pair(order, intl):
+def _ingest_pair(order, intl, force=False):
     db = load_json(DB)
-    it = db.get(order, {"orderNo": order, "status": "已预报", "history": [], "notified_status": None, "products": []})
+    it = db.get(order)
+    if not it:
+        STORE.enqueue_task("review", f"pair-review:{order}:{intl}",
+                           {"reason": "unknown order", "order": order, "intl": intl})
+        return {"paired": False, "needs_review": True, "reason": "unknown order",
+                "order": order, "intl": intl}
+    previous = it.get("intl") or ""
+    if previous and previous != intl and not force:
+        STORE.enqueue_task("review", f"pair-review:{order}:{intl}",
+                           {"reason": "tracking conflict", "order": order,
+                            "current": previous, "candidate": intl})
+        return {"paired": False, "needs_review": True, "reason": "tracking conflict",
+                "order": order, "intl": intl}
+    if previous != intl:
+        it.setdefault("binding_history", []).append(
+            {"from": previous or None, "to": intl, "at": iso(), "forced": bool(force)}
+        )
+        it["binding_version"] = int(it.get("binding_version") or 0) + 1
     it["intl"] = intl
     sales = match_sales(order, domestic=it.get("domestic"))
     for k in ("salesperson", "domestic"):
         if sales.get(k): it[k] = sales[k]
     if sales.get("products"): it["products"] = [sales["products"]]
     inherit_parent(it, db)
+    if it.get("status", "已预报") == "已预报":
+        observed_at = iso()
+        it.setdefault("history", []).append(
+            {"from": "已预报", "to": "已出国际单", "at": observed_at,
+             "observed_at": observed_at, "detail": "tracking number paired"}
+        )
+        it["status"] = "已出国际单"
+        it["status_observed_at"] = observed_at
+        it["needs_notify"] = True
     db[order] = it; save_json(DB, db)
-    return {"paired": order, "intl": intl, "salesperson": it.get("salesperson", "")}
+    return {"paired": order, "intl": intl, "salesperson": it.get("salesperson", ""),
+            "binding_version": it.get("binding_version", 0)}
 
 # ---------- 轨迹落台 ----------
 STAGES = ["已预报", "已出国际单", "运输中", "清关中", "签收"]
@@ -187,25 +218,59 @@ def norm_status(s):
     low = s.lower()
     for k, v in ALIASES.items():
         if k in low: return v
-    return s
+    return None
 
-def track_update(order, status, detail=""):
+def parse_observed_at(value):
+    if not value:
+        return iso()
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return iso(parsed)
+
+
+def track_update(order, status, detail="", observed_at=None, tracking=None,
+                 binding_version=None):
     with LEDGER_LOCK:
-        return _track_update(order, status, detail)
+        return _track_update(order, status, detail, observed_at, tracking, binding_version)
 
-def _track_update(order, status, detail=""):
+def _track_update(order, status, detail="", observed_at=None, tracking=None,
+                  binding_version=None):
     db = load_json(DB)
     it = db.get(order)
     if not it: return {"error": "unknown order", "order": order}
     ns = norm_status(status)
     cur = it.get("status", "已预报")
+    if ns is None:
+        return {"order": order, "status": cur, "changed": False,
+                "reason": "unknown status"}
+    if binding_version is not None and int(binding_version) != int(it.get("binding_version") or 0):
+        return {"order": order, "status": cur, "changed": False,
+                "reason": "stale binding"}
+    if tracking and tracking not in (it.get("intl"), it.get("alt_intl")):
+        return {"order": order, "status": cur, "changed": False,
+                "reason": "stale binding"}
+    observed_at = parse_observed_at(observed_at)
+    previous_observed = it.get("status_observed_at")
+    if previous_observed and observed_at < parse_observed_at(previous_observed):
+        return {"order": order, "status": cur, "changed": False,
+                "reason": "stale observation"}
+    if cur in ("签收", "退回") and ns != cur:
+        return {"order": order, "status": cur, "changed": False,
+                "reason": "terminal status"}
     def idx(x): return STAGES.index(x) if x in STAGES else -1
     changed = (ns in EXCEPTIONS and ns != cur) or (idx(ns) > idx(cur))
     if changed:
-        it.setdefault("history", []).append({"from": cur, "to": ns, "at": time.strftime("%Y-%m-%d %H:%M"), "detail": detail[:200]})
+        it.setdefault("history", []).append(
+            {"from": cur, "to": ns, "at": iso(), "observed_at": observed_at,
+             "tracking": tracking, "binding_version": binding_version,
+             "detail": detail[:200]}
+        )
         it["status"] = ns; it["needs_notify"] = True
+        it["status_observed_at"] = observed_at
+    it["last_observation"] = {"status": ns, "observed_at": observed_at,
+                              "tracking": tracking, "detail": detail[:200]}
     db[order] = it; save_json(DB, db)
-    return {"order": order, "status": it["status"], "changed": changed}
+    return {"order": order, "status": it["status"], "changed": changed,
+            **({} if changed else {"reason": "no forward transition"})}
 
 def resolve_user(name):
     # 三级兜底: 缓存 -> 组织树全量快照 -> 实时查询(im +users --query 索引常返回空)
@@ -213,8 +278,11 @@ def resolve_user(name):
     if name in um: return um[name]
     org = load_json(ORG_PEOPLE)
     if name in org:
-        um[name] = org[name]; save_json(USERS_MAP, um)
-        return um[name]
+        candidates = org[name] if isinstance(org[name], list) else [org[name]]
+        candidates = list(dict.fromkeys(x for x in candidates if x))
+        if len(candidates) == 1:
+            um[name] = candidates[0]; save_json(USERS_MAP, um)
+            return um[name]
     data = cli_json(["im", "+users", "--query", name, "--limit", "10"])
     rows = (data or {}).get("rows") or (data or {}).get("users") or []
     exact = [r for r in rows if (r.get("employee_name") or r.get("name")) == name]
@@ -225,45 +293,70 @@ def resolve_user(name):
     return None
 
 # ---------- 通知 ----------
+def _queue_notifications(channel_id, bot_app_id=None, enqueue=True):
+    queued = []
+    for order, it in STORE.get_shipments().items():
+        if not it.get("needs_notify"):
+            continue
+        status = it.get("status", "-")
+        version = int(it.get("binding_version") or 0)
+        h = (it.get("history") or [{}])[-1]
+        event_key = h.get("at") or h.get("observed_at") or f"legacy:{status}:{version}"
+        product = (it.get("products") or [""])[0]
+        line = "【物流小助手】%s %s→%s｜国际单 %s｜顺丰 %s｜%s｜录单人 %s" % (
+            order, h.get("from", "-"), h.get("to", status), it.get("intl") or "-",
+            it.get("domestic") or "-", product[:24], it.get("salesperson") or "未匹配")
+        if enqueue:
+            STORE.enqueue_task("notify_group", f"group:{order}:{event_key}",
+                               {"order": order, "status": status, "channel_id": channel_id, "body": line})
+        if enqueue and it.get("salesperson") and it.get("dm_notified_event") != event_key:
+            dm = "你的订单 %s 物流更新：%s（国际单 %s）" % (order, status, it.get("intl") or "-")
+            STORE.enqueue_task("notify_dm", f"dm:{order}:{event_key}",
+                               {"order": order, "status": status, "name": it["salesperson"],
+                                "event_key": event_key, "bot_app_id": bot_app_id, "body": dm})
+        queued.append({"order": order, "line": line})
+    return queued
+
+def _drain_notification_kind(kind, worker):
+    results = []
+    while True:
+        task = STORE.claim_task(worker, lease_seconds=120, kind=kind)
+        if not task:
+            break
+        payload = task["payload"]
+        try:
+            if kind == "notify_group":
+                out = cli(["im", "+agent-notify", "--target", "im", "--agent-slug", "logistics-track",
+                           "--agent-name", "物流小助手", "--bot-name", "物流小助手",
+                           "--channel-id", payload["channel_id"], "--body", payload["body"], "--no-json"])
+                if out is None: raise RuntimeError("group notification failed")
+                STORE.patch_shipment(payload["order"], {"needs_notify": False,
+                                     "notified_status": payload["status"]})
+            else:
+                uid = resolve_user(payload["name"])
+                if not uid: raise RuntimeError("recipient is missing or ambiguous")
+                app_id = payload.get("bot_app_id")
+                args = (["im", "+bot-send-user", "--app-id", app_id, "--user-id", str(uid), "--body", payload["body"]]
+                        if app_id else ["im", "+send-user", "--user-id", str(uid), "--body", payload["body"]])
+                if cli(args) is None: raise RuntimeError("direct notification failed")
+                STORE.patch_shipment(payload["order"], {"dm_notified_status": payload["status"],
+                                     "dm_notified_event": payload["event_key"]})
+            STORE.complete_task(task["id"])
+            results.append({"order": payload["order"], "kind": kind, "ok": True})
+        except Exception as error:
+            STORE.fail_task(task["id"], str(error), max_attempts=10)
+            results.append({"order": payload.get("order"), "kind": kind, "ok": False})
+    return results
+
 def notify(channel_id, bot_app_id=None, dry=False):
-    with LEDGER_LOCK:
-        db = load_json(DB)
-        sent = []
-        pending = []
-        for order, it in db.items():
-            if not it.get("needs_notify"): continue
-            h = it["history"][-1] if it.get("history") else {}
-            prod = (it.get("products") or [""])[0]
-            line = "【物流小助手】%s %s→%s｜国际单 %s｜顺丰 %s｜%s｜录单人 %s" % (
-                order, h.get("from", "-"), h.get("to", it.get("status", "-")),
-                it.get("intl") or "-", it.get("domestic") or "-", prod[:24], it.get("salesperson") or "未匹配")
-            dm = "你的订单 %s 物流更新：%s（国际单 %s）" % (order, it.get("status", "-"), it.get("intl") or "-")
-            pending.append((order, it, line, dm))
-        # 群消息洪泛控制: >3 条合并成一条, 否则逐条发
-        group_lines = [x[2] for x in pending]
-        ok_group = None
-        if not dry and group_lines:
-            bodies = ["\n".join(group_lines)] if len(group_lines) > 3 else group_lines
-            ok_group = all(cli(["im", "+agent-notify", "--target", "im", "--agent-slug", "logistics-track",
-                                "--agent-name", "物流小助手", "--bot-name", "物流小助手",
-                                "--channel-id", channel_id, "--body", body, "--no-json"]) is not None
-                           for body in bodies)
-        for order, it, line, dm in pending:
-            ok_dm = None
-            if not dry:
-                uid = resolve_user(it.get("salesperson") or "")
-                if uid and it.get("dm_notified_status") != it.get("status"):
-                    args = (["im", "+bot-send-user", "--app-id", bot_app_id, "--user-id", str(uid), "--body", dm]
-                            if bot_app_id else ["im", "+send-user", "--user-id", str(uid), "--body", dm])
-                    ok_dm = cli(args) is not None
-                if ok_dm:
-                    it["dm_notified_status"] = it.get("status")  # send_dms.py 靠这个去重, 不设会重复私聊
-                # 群发失败保留 needs_notify, 下轮重试
-                it["needs_notify"] = ok_group is False
-                it["notified_status"] = it.get("status")
-            sent.append({"order": order, "line": line, "group": ok_group, "dm": ok_dm})
-        save_json(DB, db)
-        return {"notified": len(sent), "items": sent, "dry": dry}
+    queued = _queue_notifications(channel_id, bot_app_id, enqueue=not dry)
+    if dry:
+        return {"notified": 0, "items": queued, "dry": True}
+    worker = f"notify:{os.getpid()}"
+    results = _drain_notification_kind("notify_group", worker)
+    results.extend(_drain_notification_kind("notify_dm", worker))
+    return {"notified": sum(1 for row in results if row["ok"]), "items": results,
+            "failed": sum(1 for row in results if not row["ok"]), "dry": False}
 
 def list_cmd(need_review=False):
     db = load_json(DB)
@@ -282,20 +375,33 @@ def main():
     p = argparse.ArgumentParser()
     sp = p.add_subparsers(dest="cmd", required=True)
     a = sp.add_parser("ingest-forecast"); a.add_argument("--file", required=True)
-    b = sp.add_parser("ingest-pair"); b.add_argument("--order", required=True); b.add_argument("--intl", required=True)
-    c = sp.add_parser("track-update"); c.add_argument("--order", required=True); c.add_argument("--status", required=True); c.add_argument("--detail", default="")
+    b = sp.add_parser("ingest-pair"); b.add_argument("--order", required=True); b.add_argument("--intl", required=True); b.add_argument("--force", action="store_true")
+    c = sp.add_parser("track-update"); c.add_argument("--order", required=True); c.add_argument("--status", required=True); c.add_argument("--detail", default=""); c.add_argument("--observed-at"); c.add_argument("--tracking"); c.add_argument("--binding-version", type=int)
     c = sp.add_parser("rematch"); c.add_argument("--order", required=True)
     d = sp.add_parser("list"); d.add_argument("--need-review", action="store_true")
     e = sp.add_parser("notify"); e.add_argument("--channel-id", required=True); e.add_argument("--bot-app-id"); e.add_argument("--dry", action="store_true")
     args = p.parse_args()
-    if args.cmd == "ingest-forecast": print(json.dumps(ingest_forecast(args.file), ensure_ascii=False))
-    elif args.cmd == "ingest-pair": print(json.dumps(ingest_pair(args.order, args.intl), ensure_ascii=False))
-    elif args.cmd == "track-update": print(json.dumps(track_update(args.order, args.status, args.detail), ensure_ascii=False))
-    elif args.cmd == "rematch": print(json.dumps(rematch(args.order), ensure_ascii=False))
+    rc = 0
+    if args.cmd == "ingest-forecast":
+        result = ingest_forecast(args.file); rc = 0 if result.get("ingested") else 2
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.cmd == "ingest-pair":
+        result = ingest_pair(args.order, args.intl, args.force); rc = 0 if result.get("paired") else 2
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.cmd == "track-update":
+        result = track_update(args.order, args.status, args.detail, args.observed_at, args.tracking, args.binding_version)
+        rc = 2 if result.get("error") or result.get("reason") in ("unknown status", "stale binding") else 0
+        print(json.dumps(result, ensure_ascii=False))
+    elif args.cmd == "rematch":
+        result = rematch(args.order); rc = 0 if result.get("matched") else 2
+        print(json.dumps(result, ensure_ascii=False))
     elif args.cmd == "list": print(json.dumps(list_cmd(args.need_review), ensure_ascii=False))
-    elif args.cmd == "notify": print(json.dumps(notify(args.channel_id, args.bot_app_id, args.dry), ensure_ascii=False))
+    elif args.cmd == "notify":
+        result = notify(args.channel_id, args.bot_app_id, args.dry); rc = 1 if result.get("failed") else 0
+        print(json.dumps(result, ensure_ascii=False))
+    return rc
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
 
 

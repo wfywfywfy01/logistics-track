@@ -11,8 +11,8 @@
                                           │
                                           ▼ 有新料即拉起
                               auto-track.py
-                                ├─ track_all_ups.py   官网抓取(1Z→UPS, 其余→DHL) → data/ups_results.json
-                                ├─ wire_results.py    回填台账 data/shipments.json
+                                ├─ track_all_ups.py   官网抓取(1Z→UPS, 其余→DHL) → SQLite 文档
+                                ├─ wire_results.py    按运单版本回填台账
                                 ├─ alert.py           海关扣关/退回/异常 推群警告
                                 ├─ sync_sheet.py      同步云文档表格
                                 ├─ backup.py          台账 zip 上传 V盘
@@ -20,9 +20,9 @@
                                 └─ send_dms.py        补发私聊(去重)
 ```
 
-- 台账唯一：`data/shipments.json`。生命周期只向前：已预报 → 已出国际单 → 运输中 → 清关中 → 签收/退回；海关扣关是异常。
+- 台账唯一：`data/shipments.db`。旧 JSON 在首次启动时幂等迁移。消息、OCR、工作任务和通知均使用持久队列与租约。
 - 官网抓取用 `patchright` 有头 Chromium（窗口移出屏幕 / 容器内 Xvfb）拦截内部 JSON 接口；UPS/DHL 封 TLS 指纹不封 IP，容器内需海外 SS 出口 + `UPS_DISABLE_HTTP2=1`。
-- 所有写台账的进程共用 `data/.ledger.lock`，JSON 原子写 + `.bak` 兜底（`robust.py`）。
+- 运单绑定带版本，旧运单结果不得覆盖新绑定；承运商未知状态保持未知，不猜测为运输中。
 
 ## 文件
 
@@ -35,9 +35,10 @@
 | `track_all_ups.py` / `track_retry.py` | 批量抓取 / 只补抓失败单 |
 | `ocr_label.py` | 面单 OCR → 配对入库 |
 | `reconcile.py` | 每日对账报告，未匹配单自动重新匹配录单人 |
-| `org_refresh.py` | 刷新组织人员快照 `data/org_people.json`（姓名→user_id） |
+| `org_refresh.py` | 刷新组织人员快照；同名人员不自动私聊 |
 | `proxy-watchdog.py` | 出口代理看门狗，主节点挂自动切备节点，双挂告警 |
-| `robust.py` | 原子写 / 损坏兜底 / 文件锁 / 防注入子进程 |
+| `storage.py` / `robust.py` | SQLite 事务、任务租约、系统级文件锁与安全子进程 |
+| `backup.py` / `restore_backup.py` | 一致性备份、SHA-256 校验与恢复演练 |
 | `deploy/` | Dockerfile、entrypoint、compose、`.env.example` |
 | `SKILL.md` | 面向 Agent 的操作手册与踩坑记录 |
 
@@ -61,10 +62,15 @@ docker build -f deploy/Dockerfile -t logistics-track:latest .
 docker run -d --name logistics-track --restart unless-stopped \
   --shm-size=1g --memory=1536m --memory-swap=2048m --env-file deploy/.env \
   --log-opt max-size=20m --log-opt max-file=3 \
-  -v logistics-data:/app/data -v logistics-tmp:/app/tmp logistics-track:latest
+  -e BACKUP_DIR=/app/backups -v logistics-data:/app/data -v logistics-tmp:/app/tmp \
+  -v logistics-backups:/app/backups logistics-track:latest
 ```
 
-自愈：watcher 每轮轮询重写 `data/watcher_state.json`，超过 `WATCHER_STALE_MIN`（默认 10）分钟没更新，入口脚本结束主进程，由 Docker 重启整个容器；`docker ps` 的 HEALTHCHECK 同一判据。
+自愈：watcher 每轮成功轮询刷新 `data/.watcher-heartbeat`。超过 `WATCHER_STALE_MIN`（默认 10）分钟未更新，入口脚本结束主进程，由 Docker 重启容器；`docker ps` 的 HEALTHCHECK 使用同一判据。
+
+恢复演练必须先停止服务，再运行 `python restore_backup.py <backup.zip> --data-dir data --force`，随后执行 SQLite `PRAGMA integrity_check` 并核对订单计数。
+
+默认备份写入持久卷 `/app/backups`。配置 `BACKUP_UPLOAD=1` 才额外上传 V 盘；远端身份不可用时本地备份仍会保留，任务返回失败并重试。
 
 或 `cd deploy && docker compose up -d`。容器入口自动：Xvfb → xray 代理 → 看门狗 → 定时巡检（`TRACK_TIMES`）/ 每日对账（`RECONCILE_HOUR`）/ 每周日组织刷新 → 前台 watcher。
 

@@ -2,12 +2,7 @@
 # -*- coding: utf-8 -*-
 """UPS 官网真实抓取通道 (patchright headed + GetStatus API 拦截)。
 后台执行：窗口移出屏幕，无前台弹窗。"""
-import sys, io, json, os, time
-if sys.stdout is not None and hasattr(sys.stdout, "buffer"):
-    try:
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+import sys, json, os, time
 
 STAGE_MAP = {
     "D": "签收", "I": "运输中", "P": "已出国际单", "M": "已出国际单", "O": "运输中",
@@ -17,6 +12,25 @@ MILESTONE_CN = {
     "cms.stapp.orderReceived": "已出国际单",
     "cms.stapp.weHaveYourPkg": "运输中",
 }
+
+def classify_status(status_type, description):
+    st_type = (status_type or "").upper()
+    en = (description or "").lower()
+    if st_type == "X":
+        if any(k in en for k in ("clearance", "customs", "seized", "held by customs")):
+            return "海关扣关"
+        if any(k in en for k in ("on the way", "transit", "out for delivery")):
+            return "运输中"
+        return "异常"
+    stage = STAGE_MAP.get(st_type)
+    if stage:
+        return stage
+    if "delivered" in en: return "签收"
+    if any(k in en for k in ("on the way", "transit", "out for delivery")): return "运输中"
+    if "label created" in en or "order received" in en: return "已出国际单"
+    if "customs" in en or "clearance" in en: return "清关中"
+    if "void" in en: return "退回"
+    return None
 
 def track_ups(tn, timeout_nav=60000, wait_ms=25000, proxy=None):
     """proxy: SOCKS5 代理 URL, 形如 socks5://user:pass@host:port。
@@ -74,23 +88,10 @@ def track_ups(tn, timeout_nav=60000, wait_ms=25000, proxy=None):
         return {"tracking": tn, "ok": False, "error": "no GetStatus data"}
     st_type = (td.get("packageStatusType") or "").upper()
     en = (td.get("packageStatus") or "").lower()
-    # X = UPS 通用 Exception, 不是海关扣关! 按文本细分
-    if st_type == "X":
-        if any(k in en for k in ("clearance", "customs", "seized", "held by customs")):
-            stage = "海关扣关"
-        elif any(k in en for k in ("on the way", "transit", "out for delivery")):
-            stage = "运输中"
-        else:
-            stage = "异常"  # 如 Address Information Required 等需人工关注
-    else:
-        stage = STAGE_MAP.get(st_type)
+    stage = classify_status(st_type, en)
     if not stage:
-        if "delivered" in en: stage = "签收"
-        elif any(k in en for k in ["on the way", "transit", "out for delivery"]): stage = "运输中"
-        elif "label created" in en or "order received" in en: stage = "已出国际单"
-        elif "customs" in en or "clearance" in en: stage = "清关中"
-        elif "void" in en: stage = "退回"  # 作废/取消
-        else: stage = "运输中"
+        return {"tracking": tn, "ok": False, "error": "unknown UPS status",
+                "status_en": td.get("packageStatus", "")}
     milestones = td.get("milestones") or []
     latest = ""
     for m in milestones:

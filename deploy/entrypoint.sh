@@ -55,6 +55,7 @@ BOT_APP_ID="${BOT_APP_ID:-vbot_EIBezUGncpO8v0QJ}"
 INTERVAL="${INTERVAL:-30}"
 POLL_MINUTES="${POLL_MINUTES:-60}"
 RECONCILE_HOUR="${RECONCILE_HOUR:-9}"
+RECONCILE_HOUR=$(printf '%02d' "$((10#$RECONCILE_HOUR))")
 
 echo "[entrypoint] channel=$CHANNEL_ID bot=$BOT_APP_ID interval=${INTERVAL}s poll=${POLL_MINUTES}min"
 
@@ -70,8 +71,11 @@ TRACK_TIMES="${TRACK_TIMES:-09:05,15:05}"
         if [ "$(cat "$MARK" 2>/dev/null)" != "$TODAY" ]; then
           echo "[scheduler] $T periodic track run"
           MODE=incremental; [ "$T" = "09:05" ] && MODE=full
-          python auto-track.py --mode "$MODE" --channel-id "$CHANNEL_ID" --bot-app-id "$BOT_APP_ID" || echo "[scheduler] run failed"
-          echo "$TODAY" > "$MARK"
+          if python auto-track.py --mode "$MODE" --channel-id "$CHANNEL_ID" --bot-app-id "$BOT_APP_ID"; then
+            echo "$TODAY" > "$MARK"
+          else
+            echo "[scheduler] run failed"
+          fi
         fi
       fi
     done
@@ -88,27 +92,21 @@ TRACK_TIMES="${TRACK_TIMES:-09:05,15:05}"
     if [ "$HM" = "10:00" ] && [ "$DOW" = "7" ]; then
       if [ "$(cat /app/data/.org_refreshed 2>/dev/null)" != "$TODAY" ]; then
         echo "[org] weekly refresh"
-        python /app/org_refresh.py || echo "[org] refresh failed"
-        echo "$TODAY" > /app/data/.org_refreshed
+        if python /app/org_refresh.py; then
+          echo "$TODAY" > /app/data/.org_refreshed
+        else
+          echo "[org] refresh failed"
+        fi
       fi
     fi
     sleep 60
   done
 ) &
 
-# 接管循环(崩溃安全): 有新料(dirty)且上次没跑完, 由这个循环兜底执行抓取
+# 接管循环：消费持久任务，租约超时后可由下一轮恢复。
 (
   while true; do
-    if [ -f /app/data/.dirty ]; then
-      DIRTY=$(cat /app/data/.dirty)
-      LAST=$(cat /app/data/.tracked_dirty 2>/dev/null || echo 0)
-      if [ "$DIRTY" != "$LAST" ]; then
-        echo "[takeover] dirty material, incremental track"
-        if python auto-track.py --mode incremental --channel-id "$CHANNEL_ID" --bot-app-id "$BOT_APP_ID"; then
-          echo "$DIRTY" > /app/data/.tracked_dirty
-        fi
-      fi
-    fi
+    python auto-track.py --queued-only --mode incremental --channel-id "$CHANNEL_ID" --bot-app-id "$BOT_APP_ID" || echo "[takeover] queued run failed"
     sleep 120
   done
 ) &
@@ -121,8 +119,11 @@ TRACK_TIMES="${TRACK_TIMES:-09:05,15:05}"
     MARK=/app/data/.reconciled_date
     if [ "$NOW_H" = "$RECONCILE_HOUR" ] && [ "$(cat "$MARK" 2>/dev/null)" != "$TODAY" ]; then
       echo "[reconcile] daily report"
-      python reconcile.py --channel-id "$CHANNEL_ID" || echo "[reconcile] failed"
-      echo "$TODAY" > "$MARK"
+      if python reconcile.py --channel-id "$CHANNEL_ID"; then
+        echo "$TODAY" > "$MARK"
+      else
+        echo "[reconcile] failed"
+      fi
     fi
     sleep 900
   done
@@ -134,17 +135,18 @@ TRACK_TIMES="${TRACK_TIMES:-09:05,15:05}"
 # 群监听(后台子进程, 本脚本留作 PID 1 做存活监督)
 # 注意: 不能 exec python 再 kill 1 —— PID 1 对无 handler 的信号一律忽略, 容器内 kill 不动它
 echo "[entrypoint] starting watcher"
+touch /app/data/.watcher-heartbeat
 python logi-watcher.py --channel-id "$CHANNEL_ID" --bot-app-id "$BOT_APP_ID" --interval "$INTERVAL" &
 WATCHER_PID=$!
 trap 'echo "[entrypoint] SIGTERM, stopping watcher"; kill "$WATCHER_PID" 2>/dev/null; wait "$WATCHER_PID"; exit 0' TERM INT
 
-# watcher 假死自愈: 每轮轮询都会重写 watcher_state.json, 超过 WATCHER_STALE_MIN 分钟没动 -> 杀 watcher 并退出,
+# watcher 假死自愈: 每轮成功轮询都会刷新 heartbeat。
 # 容器由 --restart unless-stopped 整体拉起(xray/看门狗/定时循环一起重来)
 WATCHER_STALE_MIN="${WATCHER_STALE_MIN:-10}"
 while kill -0 "$WATCHER_PID" 2>/dev/null; do
   sleep 60 & wait $!   # 用 wait 让 SIGTERM 能立刻打断 sleep 进 trap
-  if [ -f /app/data/watcher_state.json ] && [ -n "$(find /app/data/watcher_state.json -mmin +"$WATCHER_STALE_MIN")" ]; then
-    echo "[liveness] watcher_state.json stale > ${WATCHER_STALE_MIN}min, restarting container"
+  if [ -f /app/data/.watcher-heartbeat ] && [ -n "$(find /app/data/.watcher-heartbeat -mmin +"$WATCHER_STALE_MIN")" ]; then
+    echo "[liveness] watcher heartbeat stale > ${WATCHER_STALE_MIN}min, restarting container"
     kill "$WATCHER_PID" 2>/dev/null; sleep 5; kill -9 "$WATCHER_PID" 2>/dev/null
     exit 1
   fi

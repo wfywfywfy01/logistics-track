@@ -5,6 +5,7 @@
 """
 import argparse, json, os, re, subprocess, sys, time
 import robust
+from storage import Storage
 
 ADMIN_UID = (os.environ.get("ADMIN_USER_ID") or "13365")
 BOT = (os.environ.get("BOT_APP_ID") or "vbot_EIBezUGncpO8v0QJ")
@@ -15,17 +16,19 @@ def main():
     ap.add_argument("--channel-id", required=True)
     ap.add_argument("--dry", action="store_true")
     a = ap.parse_args()
-    db = robust.load_json_guarded("data/shipments.json", {})
-    res = robust.load_json_guarded("data/ups_results.json", {})
+    store = Storage()
+    store.migrate_legacy_json()
+    db = store.get_shipments()
+    res = store.get_document("ups_results", {})
     missing_intl, in_transit, abnormal, delivered, unmatched = [], [], [], [], []
     # 未匹配的非子单: 每日自动重新匹配(新单销售系统同步后即可命中)
-    for _o in [k for k, v in db.items() if not v.get("salesperson") and not re.search(r"-\d+$", k)]:
+    for _o in ([] if a.dry else [k for k, v in db.items() if not v.get("salesperson") and not re.search(r"-\d+$", k)]):
         try:
             subprocess.run([sys.executable, "tracking-pipeline.py", "rematch", "--order", _o],
                            capture_output=True, timeout=60)
         except Exception:
             pass
-    db = robust.load_json_guarded("data/shipments.json", {})
+    db = store.get_shipments()
     for it in db.values():
         order = it.get("orderNo", "")
         is_sub = bool(re.search(r"-\d+$", order))  # 子单(XSD-1)不参与缺面单/未匹配统计
@@ -46,7 +49,7 @@ def main():
         else:
             in_transit.append(order)
     lines = ["【物流小助手·每日对账】"]
-    lines.append("今日签收 %d 单；在途 %d 单；异常 %d 单。" % (len(delivered), len(in_transit), len(abnormal)))
+    lines.append("累计已签收 %d 单；在途 %d 单；异常 %d 单。" % (len(delivered), len(in_transit), len(abnormal)))
     if abnormal:
         lines.append("异常：%s" % "、".join(abnormal[:10]))
     if missing_intl:
@@ -57,7 +60,7 @@ def main():
         lines.append("连续抓取失败 %d 单(请核对单号)：%s" % (len(fail_orders), "、".join(fail_orders[:12])))
     if unmatched:
         lines.append("未匹配录单人 %d 单：%s" % (len(unmatched), "、".join(unmatched[:12])))
-    inbox = robust.load_json_guarded("data/inbox.json", [])
+    inbox = store.get_inbox(("pending", "retry", "running", "dead"))
     if inbox:
         lines.append("待识别面单 %d 张(OCR 重试中, 已留存文件)" % len(inbox))
     if not abnormal and not missing_intl and not unmatched and not inbox:
@@ -65,7 +68,7 @@ def main():
     body = "\n".join(lines)
     if a.dry:
         print(body)
-        return
+        return 0
     # 有问题时额外私信管理员(ADMIN_USER_ID)
     if abnormal or inbox:
         dm = "物流对账待处理：异常 %d 单；待识别面单 %d 张。" % (len(abnormal), len(inbox))
@@ -76,7 +79,8 @@ def main():
                                  "--agent-name", "物流小助手", "--bot-name", "物流小助手",
                                  "--channel-id", a.channel_id, "--body", body, "--no-json"])
     print("reconcile rc=%d %s" % (rc, out[:120]))
+    return 0 if rc == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

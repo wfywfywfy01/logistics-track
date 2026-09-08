@@ -1,15 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """面单 OCR: 调 Qwen 多模态接口提取 XSD==1Z 配对并 ingest-pair。
-环境变量: OCR_BASE_URL / OCR_API_KEY / OCR_MODEL
+环境变量: OCR_BASE_URL / OCR_API_KEY / OCR_MODEL / OCR_CA_FILE(可选)
 用法: python ocr_label.py --image <图片路径>
 """
 import argparse, base64, json, os, re, ssl, subprocess, sys
 from time import sleep as time_sleep
 from pathlib import Path
+from storage import Storage
 
-ORDER_RE = re.compile(r"((?:XSD|CKD)[-\w]+)", re.I)
-INTL_RE = re.compile(r"(1Z[A-Z0-9]{10,18}|[A-Z]{2}\d{8,14}|\d{9,14})", re.I)
+ORDER_RE = re.compile(r"\b((?:XSD|CKD)[-\w]+)\b", re.I)
+INTL_RE = re.compile(r"\b(1Z[A-Z0-9]{10,18}|[A-Z]{2}\d{8,14}|\d{9,14})\b", re.I)
 PAIR_RE = re.compile(r"((?:XSD|CKD)[-\w]+)\s*(?:==|=|｜|\||\s)\s*(1Z[A-Z0-9]{10,18}|[A-Z]{2}\d{8,14}|\d{9,14})", re.I)
 
 
@@ -37,9 +38,7 @@ def ocr_image(path):
     base = (os.environ.get("OCR_BASE_URL") or "https://qwen3.vertu.cn:8443")
     key = os.environ.get("OCR_API_KEY", "")
     model = (os.environ.get("OCR_MODEL") or "/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf")
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx = ssl.create_default_context(cafile=os.environ.get("OCR_CA_FILE") or None)
     mime, img = image_as_data_url(path)
     prompt = ("Read the shipping label image. Output the order number (XSD... or CKD...) and the waybill/tracking number. One line per pair, format: order==tracking. If nothing, output NONE."
               "每行只输出一个配对，格式严格为: 订单号==国际单号。"
@@ -114,10 +113,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", required=True)
     a = ap.parse_args()
-    try:
-        led = json.load(open("data/shipments.json", encoding="utf-8"))
-    except Exception:
-        led = None
+    led = Storage().get_shipments()
     txt = ""
     pairs = []
     for attempt in range(3):
@@ -136,9 +132,11 @@ def main():
                            capture_output=True)
         ingested.append({"order": order, "intl": intl, "ok": r.returncode == 0,
                          "detail": r.stdout.decode("utf-8", errors="replace")[:150]})
-    print(json.dumps({"ok": True, "text": txt, "pairs": pairs, "ingested": ingested},
+    ok = bool(pairs) and all(item["ok"] for item in ingested)
+    print(json.dumps({"ok": ok, "text": txt, "pairs": pairs, "ingested": ingested},
                      ensure_ascii=False))
+    return 0 if ok else 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
