@@ -6,6 +6,7 @@
 """
 import json, os, re, tempfile, time
 import robust
+from storage import Storage
 
 DOC_ID = (os.environ.get("SHEET_DOC_ID") or "3e553a37-880d-4c72-873a-fa7caa3aef9c")
 HEADERS = ["订单号", "录单人", "国际单号", "承运商", "顺丰单号", "产品", "状态", "最新节点", "签收时间", "更新时间"]
@@ -21,8 +22,10 @@ def col_letter(i):
 
 
 def main():
-    db = robust.load_json_guarded("data/shipments.json", {})
-    res = robust.load_json_guarded("data/ups_results.json", {})
+    store = Storage()
+    store.migrate_legacy_json()
+    db = store.get_shipments()
+    res = store.get_document("ups_results", {})
     rows = sorted(db.values(), key=lambda x: x.get("orderNo", ""))
     cells = []
     for ci, h in enumerate(HEADERS):
@@ -77,6 +80,7 @@ def main():
     try:
         rc, out, _ = robust.cli_run(["docs", "+sheet-set-cells", "--doc-id", DOC_ID, "--updates-file", path, "--no-json"])
         print("sheet sync rc=%d %s" % (rc, out[:150]))
+        return 0 if rc == 0 else 1
     finally:
         try:
             os.unlink(path)
@@ -85,4 +89,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -5,7 +5,8 @@ FROM docker.m.daocloud.io/library/python:3.12-slim
 ENV PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
-    DISPLAY=:99
+    DISPLAY=:99 \
+    TZ=Asia/Shanghai
 
 # 国内镜像: apt -> 清华, pip -> 清华, playwright 浏览器 -> npmmirror
 # Debian 13 用 DEB822 (/etc/apt/sources.list.d/debian.sources), 必须一起换掉, 否则仍在打 deb.debian.org
@@ -29,8 +30,9 @@ RUN python -m patchright install --with-deps chromium
 
 # xray-core: 容器内本地代理(SS 节点 -> 美国出口), 供 UPS 抓取走海外线路
 # 云端直连 GitHub 慢/断, 走 ghfast.top 镜像(实测 21MB/17s)
-RUN curl -sL --retry 3 --max-time 300 -o /tmp/xray.zip \
-        "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" \
+ARG XRAY_VERSION=v26.3.27
+RUN curl -fsSL --retry 3 --max-time 300 -o /tmp/xray.zip \
+        "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
     && python -c "import zipfile; zipfile.ZipFile('/tmp/xray.zip').extract('xray', '/usr/local/bin')" \
     && chmod +x /usr/local/bin/xray && rm /tmp/xray.zip \
     && xray version | head -1
@@ -47,8 +49,8 @@ RUN printf "#!/bin/sh\nexec node /app/bin/vertu-cli.cjs \"\$@\"\n" > /usr/local/
 # 种子数据: 宿主挂载空 data 目录时会遮住镜像内 data, 故另存一份供入口脚本初始化
 RUN mkdir -p /app/seed && (cp -r /app/data/. /app/seed/ 2>/dev/null || true)
 
-# 健康状态(docker ps 可见): watcher 状态文件 10 分钟内有更新
+# 健康状态(docker ps 可见): watcher 心跳 10 分钟内有更新
 HEALTHCHECK --interval=60s --timeout=5s --start-period=180s --retries=3 \
-  CMD test -f /app/data/watcher_state.json && test -z "$(find /app/data/watcher_state.json -mmin +10)"
+  CMD test -f /app/data/.watcher-heartbeat && test -z "$(find /app/data/.watcher-heartbeat -mmin +10)"
 
 ENTRYPOINT ["/app/deploy/entrypoint.sh"]

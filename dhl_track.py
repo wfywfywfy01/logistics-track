@@ -6,6 +6,17 @@
 """
 import json, os, sys, time
 
+def classify_status(code, description):
+    code = (code or "").lower()
+    low = (description or "").lower()
+    if "delivered" in code or "delivered" in low: return "签收"
+    if any(k in low for k in ("returned", "return to", "returning")) or "return" in code: return "退回"
+    if any(k in low for k in ("exception", "on hold", "held")) or "exception" in code: return "异常"
+    if "clearance" in low or "custom" in low: return "清关中"
+    if "transit" in code or any(k in low for k in ("processed", "departed", "arrived")): return "运输中"
+    if "picked" in code or "pickup" in low or "received" in low: return "已出国际单"
+    return None
+
 def track_dhl(tn, timeout_nav=60000, wait_ms=25000, proxy=None):
     if proxy is None:
         proxy = os.environ.get("UPS_PROXY") or None
@@ -76,21 +87,10 @@ def track_dhl(tn, timeout_nav=60000, wait_ms=25000, proxy=None):
     code = (st.get("statusCode") or "").lower()
     desc = st.get("description") or ""
     loc = ((st.get("location") or {}).get("address") or {}).get("addressLocality") or ""
-    low = desc.lower()
-    if "delivered" in code or "delivered" in low:
-        stage = "签收"
-    elif any(k in low for k in ("returned", "return to", "returning")) or "return" in code:
-        stage = "退回"
-    elif any(k in low for k in ("exception", "on hold", "held")) or "exception" in code:
-        stage = "异常"
-    elif "clearance" in low or "custom" in low:
-        stage = "清关中"
-    elif "transit" in code or any(k in low for k in ("processed", "departed", "arrived")):
-        stage = "运输中"
-    elif "picked" in code or "pickup" in low or "received" in low:
-        stage = "已出国际单"
-    else:
-        stage = "运输中"
+    stage = classify_status(code, desc)
+    if not stage:
+        return {"tracking": tn, "ok": False, "error": "unknown DHL status",
+                "status_en": desc}
     detail = "%s %s %s" % ((st.get("timestamp") or "")[:10], loc, desc)
     return {"tracking": tn, "ok": True, "stage": stage,
             "status_en": desc, "detail": detail.strip()}

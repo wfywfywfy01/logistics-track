@@ -56,37 +56,47 @@ class FileLock:
     def __init__(self, path, timeout=60):
         self.path = str(path)
         self.timeout = timeout
+        self.handle = None
 
     def acquire(self):
         deadline = time.time() + self.timeout
         while True:
             try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(fd, str(os.getpid()).encode())
-                os.close(fd)
+                self.handle = open(self.path, "a+b")
+                self.handle.seek(0, os.SEEK_END)
+                if self.handle.tell() == 0:
+                    self.handle.write(b"0")
+                    self.handle.flush()
+                self.handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return True
-            except FileExistsError:
-                # 锁持有者死了就清掉(pid 校验)
-                try:
-                    pid = int(open(self.path).read().strip() or "0")
-                    alive = _pid_alive(pid)
-                except Exception:
-                    alive = False
-                if not alive:
-                    try:
-                        os.unlink(self.path)
-                    except Exception:
-                        pass
-                    continue
+            except (OSError, BlockingIOError):
+                if self.handle:
+                    self.handle.close()
+                    self.handle = None
                 if time.time() > deadline:
                     return False
                 time.sleep(0.5)
 
     def release(self):
+        if not self.handle:
+            return
         try:
-            os.unlink(self.path)
-        except Exception:
-            pass
+            self.handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.handle.close()
+            self.handle = None
 
     def __enter__(self):
         if not self.acquire():

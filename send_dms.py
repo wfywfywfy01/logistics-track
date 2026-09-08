@@ -1,13 +1,16 @@
 import io, json, os, re, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import robust
+from storage import Storage
 
 RES = "data/ups_results.json"; DB = "data/shipments.json"; UM = "data/users_map.json"
 BOT = (os.environ.get("BOT_APP_ID") or "vbot_EIBezUGncpO8v0QJ")
-res = robust.load_json_guarded(RES, {})
-db = robust.load_json_guarded(DB, {})
+store = Storage()
+store.migrate_legacy_json()
+res = store.get_document("ups_results", {})
+db = store.get_shipments()
 # 缓存 -> 组织树快照 兜底(与 tracking-pipeline.resolve_user 同序)
-um = {**robust.load_json_guarded("data/org_people.json", {}), **robust.load_json_guarded(UM, {})}
+um = {**store.get_document("org_people", {}), **store.get_document("users_map", {})}
 
 sent, skipped, failed = [], [], []
 for order, r in res.items():
@@ -21,6 +24,8 @@ for order, r in res.items():
     if it.get("dm_notified_status") == it.get("status"):
         skipped.append(order); continue
     uid = um.get(name)
+    if isinstance(uid, list):
+        uid = uid[0] if len(set(uid)) == 1 else None
     if not uid:
         failed.append((order, name, "no uid")); continue
     stage = it.get("status")
@@ -32,18 +37,10 @@ for order, r in res.items():
     print(("OK  " if ok else "FAIL"), order, name, uid)
     if ok:
         it["dm_notified_status"] = stage
-        it["dm_log"].append({"status": stage, "uid": uid, "at": time.strftime("%Y-%m-%d %H:%M")})
+        entry = {"status": stage, "uid": uid, "at": time.strftime("%Y-%m-%d %H:%M")}
+        it["dm_log"].append(entry)
+        store.patch_shipment(order, {"dm_notified_status": stage}, {"dm_log": [entry]})
         sent.append(order)
     else:
         failed.append((order, name, out[:80]))
-    db[order] = it
-if sent:
-    with robust.FileLock("data/.ledger.lock"):
-        latest = robust.load_json_guarded(DB, {})
-        for order in sent:
-            if order not in latest:
-                continue
-            latest[order]["dm_notified_status"] = db[order]["dm_notified_status"]
-            latest[order].setdefault("dm_log", []).append(db[order]["dm_log"][-1])
-        robust.save_json_guarded(DB, latest)
 print("sent: %d skipped: %d failed: %d" % (len(sent), len(skipped), len(failed)))

@@ -7,9 +7,10 @@
 import argparse, base64, json, os, re, ssl, subprocess, sys
 from time import sleep as time_sleep
 from pathlib import Path
+from storage import Storage
 
-ORDER_RE = re.compile(r"((?:XSD|CKD)[-\w]+)", re.I)
-INTL_RE = re.compile(r"(1Z[A-Z0-9]{10,18}|[A-Z]{2}\d{8,14}|\d{9,14})", re.I)
+ORDER_RE = re.compile(r"\b((?:XSD|CKD)[-\w]+)\b", re.I)
+INTL_RE = re.compile(r"\b(1Z[A-Z0-9]{10,18}|[A-Z]{2}\d{8,14}|\d{9,14})\b", re.I)
 PAIR_RE = re.compile(r"((?:XSD|CKD)[-\w]+)\s*(?:==|=|｜|\||\s)\s*(1Z[A-Z0-9]{10,18}|[A-Z]{2}\d{8,14}|\d{9,14})", re.I)
 
 
@@ -112,10 +113,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", required=True)
     a = ap.parse_args()
-    try:
-        led = json.load(open("data/shipments.json", encoding="utf-8"))
-    except Exception:
-        led = None
+    led = Storage().get_shipments()
     txt = ""
     pairs = []
     for attempt in range(3):
@@ -134,9 +132,11 @@ def main():
                            capture_output=True)
         ingested.append({"order": order, "intl": intl, "ok": r.returncode == 0,
                          "detail": r.stdout.decode("utf-8", errors="replace")[:150]})
-    print(json.dumps({"ok": True, "text": txt, "pairs": pairs, "ingested": ingested},
+    ok = bool(pairs) and all(item["ok"] for item in ingested)
+    print(json.dumps({"ok": ok, "text": txt, "pairs": pairs, "ingested": ingested},
                      ensure_ascii=False))
+    return 0 if ok else 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -4,11 +4,14 @@
 import json, sys
 sys.path.insert(0, ".")
 import robust
+from storage import Storage
 from ups_track import track_ups
 from dhl_track import track_dhl
 
-led = robust.load_json_guarded("data/shipments.json", {})
-prev = robust.load_json_guarded("data/ups_results.json", {})
+store = Storage()
+store.migrate_legacy_json()
+led = store.get_shipments()
+prev = store.get_document("ups_results", {})
 retry = [k for k, v in prev.items() if not v.get("ok")]
 print("retry", retry, flush=True)
 for order in retry:
@@ -25,5 +28,5 @@ for order in retry:
     r["fails"] = 0 if r.get("ok") else (prev[order].get("fails") or 0) + 1
     prev[order] = r
     print(f"{order} {tn} -> {r.get('stage') or ('ERR:' + r.get('error', '')[:60])}", flush=True)
-    robust.atomic_write_json("data/ups_results.json", prev)
+    store.put_document("ups_results", prev)
 print("DONE", flush=True)
