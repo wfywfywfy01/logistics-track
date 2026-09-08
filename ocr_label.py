@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """面单 OCR: 调 Qwen 多模态接口提取 XSD==1Z 配对并 ingest-pair。
-环境变量: OCR_BASE_URL / OCR_API_KEY / OCR_MODEL
+环境变量: OCR_BASE_URL / OCR_API_KEY / OCR_MODEL / OCR_CA_FILE(可选)
 用法: python ocr_label.py --image <图片路径>
 """
 import argparse, base64, json, os, re, ssl, subprocess, sys
@@ -37,9 +37,7 @@ def ocr_image(path):
     base = (os.environ.get("OCR_BASE_URL") or "https://qwen3.vertu.cn:8443")
     key = os.environ.get("OCR_API_KEY", "")
     model = (os.environ.get("OCR_MODEL") or "/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf")
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx = ssl.create_default_context(cafile=os.environ.get("OCR_CA_FILE") or None)
     mime, img = image_as_data_url(path)
     prompt = ("Read the shipping label image. Output the order number (XSD... or CKD...) and the waybill/tracking number. One line per pair, format: order==tracking. If nothing, output NONE."
               "每行只输出一个配对，格式严格为: 订单号==国际单号。"

@@ -38,5 +38,12 @@ for order, r in res.items():
         failed.append((order, name, out[:80]))
     db[order] = it
 if sent:
-    robust.save_json_guarded(DB, db)
+    with robust.FileLock("data/.ledger.lock"):
+        latest = robust.load_json_guarded(DB, {})
+        for order in sent:
+            if order not in latest:
+                continue
+            latest[order]["dm_notified_status"] = db[order]["dm_notified_status"]
+            latest[order].setdefault("dm_log", []).append(db[order]["dm_log"][-1])
+        robust.save_json_guarded(DB, latest)
 print("sent: %d skipped: %d failed: %d" % (len(sent), len(skipped), len(failed)))

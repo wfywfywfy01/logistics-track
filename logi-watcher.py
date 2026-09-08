@@ -52,6 +52,9 @@ def process_attachment(att, channel_id, bot_app_id):
     if lower.endswith((".xlsx", ".xls")):
         r = subprocess.run([sys.executable, "tracking-pipeline.py", "ingest-forecast", "--file", str(target)],
                            capture_output=True)
+        if r.returncode != 0:
+            return {"name": name, "ok": False, "kind": "forecast",
+                    "error": r.stderr.decode("utf-8", errors="replace")[:200]}
         try: res = json.loads(r.stdout.decode("utf-8", errors="replace"))
         except Exception: res = {"raw": r.stdout.decode("utf-8", errors="replace")[:200]}
         return {"name": name, "ok": True, "kind": "forecast", "result": res}

@@ -15,10 +15,7 @@ import robust
 LEDGER_LOCK = robust.FileLock(str(DATA / ".ledger.lock"))
 
 def load_json(p, d=None):
-    if p.exists():
-        try: return json.loads(p.read_text(encoding="utf-8"))
-        except Exception: pass
-    return {} if d is None else d
+    return robust.load_json_guarded(str(p), {} if d is None else d)
 
 def save_json(p, obj):
     # 台账类文件原子写 + .bak 兜底; 小缓存直接原子写
