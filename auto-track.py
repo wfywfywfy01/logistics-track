@@ -52,7 +52,8 @@ def execute(a):
                 raise RuntimeError(parsed.get("error") or "OCR produced no fully ingested pair")
             STORE.complete_inbox_with_task(
                 item["id"], "pipeline", f"ocr:{item['id']}",
-                {"channel_id": a.channel_id, "bot_app_id": a.bot_app_id})
+                {"channel_id": a.channel_id, "bot_app_id": a.bot_app_id},
+                orders=[row.get("order") for row in ingested])
             print("inbox OCR ok:", payload.get("name"), parsed.get("pairs"), flush=True)
         except Exception as error:
             state = STORE.fail_inbox(item["id"], str(error))

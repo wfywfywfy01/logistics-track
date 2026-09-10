@@ -371,7 +371,7 @@ class Storage:
                 (iso(), item_id),
             )
 
-    def complete_inbox_with_task(self, item_id, kind, dedupe_key, payload):
+    def complete_inbox_with_task(self, item_id, kind, dedupe_key, payload, orders=None):
         timestamp = iso()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -382,10 +382,17 @@ class Storage:
                 (kind, dedupe_key, json.dumps(payload, ensure_ascii=False),
                  timestamp, timestamp, timestamp),
             )
+            row = connection.execute("SELECT payload FROM inbox WHERE id=?", (item_id,)).fetchone()
+            inbox_payload = json.loads(row["payload"]) if row else {}
+            associated = sorted({str(order) for order in (orders or []) if order})
+            if associated:
+                inbox_payload["orders"] = associated
+                if len(associated) == 1:
+                    inbox_payload["order"] = associated[0]
             connection.execute(
-                """UPDATE inbox SET status='succeeded',lease_owner=NULL,
+                """UPDATE inbox SET payload=?,status='succeeded',lease_owner=NULL,
                    lease_until=NULL,updated_at=? WHERE id=?""",
-                (timestamp, item_id),
+                (json.dumps(inbox_payload, ensure_ascii=False), timestamp, item_id),
             )
 
     def fail_inbox(self, item_id, error, max_attempts=7, now=None):
@@ -463,7 +470,7 @@ class Storage:
             row = connection.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not row:
                 return None
-            if row["status"] == "running" or (row["lease_until"] and row["lease_until"] > timestamp):
+            if row["lease_until"] and row["lease_until"] > timestamp:
                 raise TaskConflict("task is being processed")
             payload = json.loads(row["payload"])
             if action == "retry":
@@ -557,9 +564,13 @@ class Storage:
         timestamp = iso()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute("SELECT payload FROM inbox WHERE id=?", (item_id,)).fetchone()
+            row = connection.execute(
+                "SELECT payload,status,lease_until FROM inbox WHERE id=?", (item_id,)
+            ).fetchone()
             if not row:
                 return None
+            if row["lease_until"] and row["lease_until"] > timestamp:
+                raise TaskConflict("inbox item is being processed")
             payload = json.loads(row["payload"])
             connection.execute(
                 """UPDATE inbox SET status='pending',attempts=0,next_attempt_at=?,lease_owner=NULL,
@@ -592,18 +603,30 @@ class Storage:
         return {"order": order, "salesperson": name, "salesperson_id": user_id}
 
     def evidence_for_order(self, order, limit=100):
-        pattern = "%" + order.replace("%", "") + "%"
         with self.connect() as connection:
             messages = connection.execute(
-                """SELECT channel_id,message_id,created_at,status,last_error FROM incoming_messages
-                   WHERE payload LIKE ? ORDER BY created_at DESC LIMIT ?""", (pattern, limit)
+                """SELECT channel_id,message_id,created_at,status,last_error,payload
+                   FROM incoming_messages AS m WHERE json_extract(m.payload,'$.order')=?
+                   OR EXISTS (SELECT 1 FROM json_each(m.payload,'$.orders') WHERE value=?)
+                   ORDER BY created_at DESC LIMIT ?""", (order, order, limit)
             ).fetchall()
             inbox = connection.execute(
-                """SELECT id,status,last_error,updated_at,payload FROM inbox
-                   WHERE payload LIKE ? ORDER BY updated_at DESC LIMIT ?""", (pattern, limit)
+                """SELECT id,status,last_error,updated_at,payload FROM inbox AS i
+                   WHERE json_extract(i.payload,'$.order')=?
+                   OR EXISTS (SELECT 1 FROM json_each(i.payload,'$.orders') WHERE value=?)
+                   ORDER BY updated_at DESC LIMIT ?""", (order, order, limit)
             ).fetchall()
-        return {"messages": [dict(row) for row in messages],
-                "inbox": [dict(row) for row in inbox]}
+        message_items = []
+        for row in messages:
+            item = dict(row)
+            item["payload"] = json.loads(item["payload"])
+            message_items.append(item)
+        inbox_items = []
+        for row in inbox:
+            item = dict(row)
+            item["payload"] = json.loads(item["payload"])
+            inbox_items.append(item)
+        return {"messages": message_items, "inbox": inbox_items}
 
     def list_issues(self, statuses=("pending", "retry", "dead", "unknown"), limit=500):
         issues = []
