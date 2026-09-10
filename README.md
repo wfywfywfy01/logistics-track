@@ -84,7 +84,9 @@ docker run -d --name logistics-track --restart unless-stopped \
 ssh -L 8080:127.0.0.1:8080 <server>
 ```
 
-浏览器打开 `http://127.0.0.1:8080/orders`，首次使用 Basic Auth 用户名 `admin`、密码 `ADMIN_TOKEN`。`admin` 是受保护的应急账号；修改 `ADMIN_TOKEN` 并重启服务会同步轮换其密码。管理员可在“权限管理”中新增、停用其他账号或调整角色；密码仅保存 PBKDF2 哈希，操作审计使用已认证账号，且账号变更与审计在同一事务提交。
+浏览器打开 `http://127.0.0.1:8080/orders`，页面会跳转到可视化登录页。首次使用用户名 `admin`、密码 `ADMIN_TOKEN`。默认登录有效期为 12 小时，可用 `ADMIN_SESSION_HOURS` 调整；退出登录、停用账号、修改密码或角色后，旧会话立即失效，服务重启也会清除已有会话。脚本调用仍兼容 HTTP Basic Auth。经 HTTPS 反向代理访问时设置 `ADMIN_COOKIE_SECURE=1`；只有代理会覆盖并清洗 `X-Forwarded-For` 时才设置 `ADMIN_TRUST_PROXY=1`。当前仅通过 SSH 隧道访问时两项均保持为 `0`。
+
+`admin` 是受保护的应急账号；修改 `ADMIN_TOKEN` 并重启服务会同步轮换其密码。管理员可在“权限管理”中新增、停用其他账号或调整角色；密码仅保存 PBKDF2 哈希，操作审计使用已认证账号，且账号变更与审计在同一事务提交。
 
 | 角色 | 权限 |
 | --- | --- |

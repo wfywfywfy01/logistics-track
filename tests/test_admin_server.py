@@ -1,9 +1,12 @@
 import base64
 import json
+import re
 import sqlite3
 import threading
+from http.cookiejar import CookieJar
+from urllib.parse import urlencode
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 from admin_server import create_server, csrf_token
 from storage import Storage
@@ -41,6 +44,18 @@ def run_server(tmp_path):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return store, server, "http://127.0.0.1:%d" % server.server_port
+
+
+def session_browser():
+    jar = CookieJar()
+    return build_opener(HTTPCookieProcessor(jar)), jar
+
+
+def login(browser, base, username, password):
+    page = browser.open(base + "/login").read().decode()
+    csrf = re.search(r"name=csrf value='([^']+)'", page).group(1)
+    data = urlencode({"username": username, "password": password, "csrf": csrf}).encode()
+    return browser.open(Request(base + "/login", data=data, method="POST"))
 
 
 def test_admin_api_requires_auth_and_exposes_order_detail(tmp_path):
@@ -382,5 +397,111 @@ def test_malformed_active_value_is_rejected(tmp_path):
             assert False, "malformed active flag must fail closed"
         except HTTPError as error:
             assert error.code == 400
+    finally:
+        server.shutdown()
+
+
+def test_visual_login_session_and_logout(tmp_path):
+    _, server, base = run_server(tmp_path)
+    browser, cookies = session_browser()
+    try:
+        anonymous = browser.open(base + "/orders")
+        assert anonymous.geturl().endswith("/login")
+        assert "登录物流运营台" in anonymous.read().decode()
+
+        signed_in = login(browser, base, "admin", "secret-token")
+        page = signed_in.read().decode()
+        assert signed_in.geturl().endswith("/orders")
+        assert "当前：admin（admin）" in page
+        assert any(cookie.name == "logistics_session" for cookie in cookies)
+
+        csrf = re.search(r"name=csrf content='([^']+)'", page).group(1)
+        browser.open(Request(base + "/logout",
+                             data=urlencode({"csrf": csrf}).encode(), method="POST"))
+        after_logout = browser.open(base + "/orders")
+        assert after_logout.geturl().endswith("/login")
+    finally:
+        server.shutdown()
+
+
+def test_api_unauthorized_response_keeps_basic_challenge(tmp_path):
+    _, server, base = run_server(tmp_path)
+    try:
+        try:
+            urlopen(base + "/api/orders")
+            assert False, "authentication must be required"
+        except HTTPError as error:
+            assert error.code == 401
+            assert error.headers["WWW-Authenticate"] == 'Basic realm="logistics-admin"'
+    finally:
+        server.shutdown()
+
+
+def test_login_rejects_cross_site_origin_and_throttles_failures(tmp_path):
+    _, server, base = run_server(tmp_path)
+    browser, cookies = session_browser()
+    try:
+        data = urlencode({"username": "admin", "password": "secret-token"}).encode()
+        try:
+            browser.open(Request(base + "/login", data=data, method="POST",
+                                 headers={"Origin": "https://attacker.example"}))
+            assert False, "cross-site login must be rejected"
+        except HTTPError as error:
+            assert error.code == 403
+        assert not any(cookie.name == "logistics_session" for cookie in cookies)
+
+        login_page = browser.open(base + "/login").read().decode()
+        login_csrf = re.search(r"name=csrf value='([^']+)'", login_page).group(1)
+        wrong = urlencode({"username": "admin", "password": "wrong-password",
+                           "csrf": login_csrf}).encode()
+        try:
+            browser.open(Request(base + "/login", data=wrong, method="POST"))
+        except HTTPError as error:
+            assert error.code == 401
+        try:
+            login(browser, base, "admin", "wrong-password")
+            assert False, "repeated login must be throttled"
+        except HTTPError as error:
+            assert error.code == 429
+            assert int(error.headers["Retry-After"]) >= 1
+    finally:
+        server.shutdown()
+
+
+def test_basic_auth_uses_the_same_login_throttle(tmp_path):
+    store, server, base = run_server(tmp_path)
+    calls = 0
+    authenticate = store.authenticate_admin
+
+    def counted_authenticate(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return authenticate(*args, **kwargs)
+
+    store.authenticate_admin = counted_authenticate
+    try:
+        for _ in range(2):
+            try:
+                request(base + "/api/orders", "wrong-password")
+            except HTTPError as error:
+                assert error.code == 401
+        assert calls == 1
+    finally:
+        server.shutdown()
+
+
+def test_role_change_invalidates_existing_session(tmp_path):
+    store, server, base = run_server(tmp_path)
+    store.put_admin_user("viewer1", "viewer-password-1", "viewer")
+    browser, _ = session_browser()
+    try:
+        login(browser, base, "viewer1", "viewer-password-1")
+        assert "当前：viewer1（viewer）" in browser.open(base + "/orders").read().decode()
+
+        store.put_admin_user("viewer1", "", "operator")
+        response = browser.open(base + "/orders")
+        assert response.geturl().endswith("/login")
+        assert "当前：viewer1（operator）" in login(
+            browser, base, "viewer1", "viewer-password-1").read().decode()
     finally:
         server.shutdown()
