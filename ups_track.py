@@ -32,12 +32,10 @@ def classify_status(status_type, description):
     if "void" in en: return "退回"
     return None
 
-def track_ups(tn, timeout_nav=60000, wait_ms=25000, proxy=None):
+def _track_once(tn, timeout_nav, wait_ms, proxy):
     """proxy: SOCKS5 代理 URL, 形如 socks5://user:pass@host:port。
     不传则读环境变量 UPS_PROXY。中国数据中心出口直连会被 UPS 的 Akamai 杀 HTTP2,
     必须走海外代理(实测美国节点 GetStatus 200)。"""
-    if proxy is None:
-        proxy = os.environ.get("UPS_PROXY") or None
     from patchright.sync_api import sync_playwright
     with sync_playwright() as p:
         args = ["--no-sandbox", "--window-position=4000,4000"]
@@ -72,15 +70,6 @@ def track_ups(tn, timeout_nav=60000, wait_ms=25000, proxy=None):
             deadline = time.time() + wait_ms / 1000
             while time.time() < deadline and "data" not in got:
                 pg.wait_for_timeout(1000)
-            if "data" not in got:
-                # retry once: reload the page
-                try:
-                    pg.reload(timeout=timeout_nav, wait_until="domcontentloaded")
-                    deadline = time.time() + wait_ms / 1000
-                    while time.time() < deadline and "data" not in got:
-                        pg.wait_for_timeout(1000)
-                except Exception:
-                    pass
         finally:
             b.close()
     td = got.get("data")
@@ -109,6 +98,23 @@ def track_ups(tn, timeout_nav=60000, wait_ms=25000, proxy=None):
         "detail": latest,
         "milestones": [{"date": m.get("date"), "time": m.get("time"), "loc": m.get("location"), "name": m.get("name")} for m in milestones],
     }
+
+
+def track_ups(tn, timeout_nav=60000, wait_ms=25000, proxy=None, attempts=2):
+    """Retry with a fresh browser because stale UPS sessions commonly miss GetStatus."""
+    proxy = proxy if proxy is not None else (os.environ.get("UPS_PROXY") or None)
+    last = None
+    for attempt in range(attempts):
+        try:
+            last = _track_once(tn, timeout_nav, wait_ms, proxy)
+        except Exception as error:
+            last = {"tracking": tn, "ok": False,
+                    "error": type(error).__name__ + ": " + str(error)[:150]}
+        if last.get("ok") or last.get("error") == "unknown UPS status":
+            return last
+        if attempt + 1 < attempts:
+            time.sleep(attempt + 1)
+    return last
 
 if __name__ == "__main__":
     tn = sys.argv[1]

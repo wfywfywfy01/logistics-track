@@ -46,9 +46,6 @@ RUN printf "#!/bin/sh\nexec node /app/bin/vertu-cli.cjs \"\$@\"\n" > /usr/local/
     && chmod +x /usr/local/bin/vertu-cli \
     && chmod +x /app/deploy/entrypoint.sh
 
-# 种子数据: 宿主挂载空 data 目录时会遮住镜像内 data, 故另存一份供入口脚本初始化
-RUN mkdir -p /app/seed && (cp -r /app/data/. /app/seed/ 2>/dev/null || true)
-
 # 健康状态(docker ps 可见): watcher 心跳 10 分钟内有更新
 HEALTHCHECK --interval=60s --timeout=5s --start-period=180s --retries=3 \
   CMD test -f /app/data/.watcher-heartbeat && test -z "$(find /app/data/.watcher-heartbeat -mmin +10)"

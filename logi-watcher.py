@@ -179,18 +179,20 @@ def watch_once(channel_id, bot_app_id, since_ts):
                                        json.dumps(failed, ensure_ascii=False))
             print("message failed:", message_id, state, flush=True)
             continue
-        STORE.complete_message(channel_id, message_id)
+        actionable = [r for r in msg_items if r and r.get("ok") and
+                      r.get("kind") in ("forecast", "label", "pair")]
+        if actionable:
+            STORE.complete_message_with_task(
+                channel_id, message_id, "pipeline", f"pipeline:{message_id}",
+                {"channel_id": channel_id, "bot_app_id": bot_app_id})
+            should_run = True
+        else:
+            STORE.complete_message(channel_id, message_id)
         if mentioned and not [r for r in msg_items if r]:
             cli(["im", "+agent-notify", "--target", "im", "--agent-slug", "logistics-track",
                  "--agent-name", "物流小助手", "--bot-name", "物流小助手",
                  "--channel-id", channel_id, "--no-json",
                  "--body", "【物流小助手】在的！把预报 xlsx、面单图片发到群里，或直接发文字配对（XSD…==1Z…），我就会自动查官网轨迹、通知录单人。"])
-        actionable = [r for r in msg_items if r and r.get("ok") and
-                      r.get("kind") in ("forecast", "label", "pair")]
-        if actionable:
-            STORE.enqueue_task("pipeline", f"pipeline:{message_id}",
-                               {"channel_id": channel_id, "bot_app_id": bot_app_id})
-            should_run = True
     done = [r for r in results if r and r.get("ok")]
     if done:
         n_x = sum(1 for r in done if r.get("kind") == "forecast")

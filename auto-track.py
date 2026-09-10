@@ -16,7 +16,12 @@ STORE.migrate_legacy_json()
 
 def run(args, desc):
     t0 = time.time()
-    r = subprocess.run([sys.executable] + args, capture_output=True)
+    try:
+        r = subprocess.run([sys.executable] + args, capture_output=True,
+                           timeout=int(os.environ.get("STEP_TIMEOUT_SECONDS") or 900))
+    except subprocess.TimeoutExpired:
+        print(f"[{desc}] timed out", flush=True)
+        return False
     ok = r.returncode == 0
     out = r.stdout.decode("utf-8", errors="replace").strip()
     print(f"[{desc}] rc={r.returncode} {time.time()-t0:.0f}s", flush=True)
@@ -45,9 +50,9 @@ def execute(a):
             if result.returncode != 0 or not parsed.get("pairs") or not ingested or not all(
                     row.get("ok") for row in ingested):
                 raise RuntimeError(parsed.get("error") or "OCR produced no fully ingested pair")
-            STORE.complete_inbox(item["id"])
-            STORE.enqueue_task("pipeline", f"ocr:{item['id']}",
-                               {"channel_id": a.channel_id, "bot_app_id": a.bot_app_id})
+            STORE.complete_inbox_with_task(
+                item["id"], "pipeline", f"ocr:{item['id']}",
+                {"channel_id": a.channel_id, "bot_app_id": a.bot_app_id})
             print("inbox OCR ok:", payload.get("name"), parsed.get("pairs"), flush=True)
         except Exception as error:
             state = STORE.fail_inbox(item["id"], str(error))
@@ -59,21 +64,27 @@ def execute(a):
         if not task:
             break
         tasks.append(task)
-    if a.queued_only and not tasks:
+    pending_notifications = (STORE.pending_task_count("notify_group") +
+                             STORE.pending_task_count("notify_dm"))
+    if a.queued_only and not tasks and not pending_notifications:
         print("no queued pipeline task", flush=True)
         return 0
+    if a.queued_only and not tasks:
+        args = ["tracking-pipeline.py", "notify", "--channel-id", a.channel_id,
+                "--bot-app-id", a.bot_app_id]
+        return 0 if run(args, "通知重试") else 1
 
     steps = []
     if not a.skip_track:
         steps.append((["track_all_ups.py", "--mode", a.mode or "full"], "抓官网"))
     steps.extend([
         (["wire_results.py"], "回填台账"),
+        (["operations.py", "refresh"], "刷新异常待办"),
         (["alert.py"], "异常提醒"),
         (["sync_sheet.py"], "同步云表格"),
         (["backup.py"], "台账备份"),
         (["tracking-pipeline.py", "notify", "--channel-id", a.channel_id,
-          "--bot-app-id", a.bot_app_id], "群通知"),
-        (["send_dms.py"], "私聊录单人"),
+          "--bot-app-id", a.bot_app_id], "通知"),
     ])
     ok = True
     for args, description in steps:
