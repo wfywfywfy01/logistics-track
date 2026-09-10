@@ -1,13 +1,10 @@
 #!/usr/bin/env python
-"""FedEx official-site tracker using the page's tracking JSON response."""
+"""FedEx official-site tracker using headed Chromium and response capture."""
 import json
 import os
 import sys
-import threading
 import time
-
-_TOKEN = {"value": None, "expires_at": 0}
-_TOKEN_LOCK = threading.Lock()
+from urllib.parse import quote, urlsplit
 
 
 def classify_status(code, description):
@@ -64,44 +61,23 @@ def parse_tracking_response(tracking, payload):
             "status_en": description, "detail": detail}
 
 
-def _official_track(tracking):
-    from curl_cffi import requests
-    base = os.environ.get("FEDEX_API_BASE") or "https://apis.fedex.com"
-    client_id = os.environ["FEDEX_CLIENT_ID"]
-    client_secret = os.environ["FEDEX_CLIENT_SECRET"]
-    proxy = os.environ.get("FEDEX_API_PROXY") or None
-    now = time.time()
-    with _TOKEN_LOCK:
-        if not _TOKEN["value"] or now >= _TOKEN["expires_at"]:
-            response = requests.post(
-                base + "/oauth/token",
-                data={"grant_type": "client_credentials", "client_id": client_id,
-                      "client_secret": client_secret},
-                proxy=proxy, timeout=30,
-            )
-            response.raise_for_status()
-            token = response.json()
-            _TOKEN["value"] = token["access_token"]
-            _TOKEN["expires_at"] = now + int(token.get("expires_in") or 3600) - 60
-    response = requests.post(
-        base + "/track/v1/trackingnumbers",
-        headers={"Authorization": "Bearer " + _TOKEN["value"],
-                 "Content-Type": "application/json", "X-locale": "en_US"},
-        json={"includeDetailedScans": True,
-              "trackingInfo": [{"trackingNumberInfo": {"trackingNumber": tracking}}]},
-        proxy=proxy, timeout=45,
-    )
-    response.raise_for_status()
-    result = parse_tracking_response(tracking, response.json())
-    return result or {"tracking": tracking, "ok": False,
-                      "error": "no official FedEx API data"}
+def page_failure(tracking, statuses, body):
+    if 403 in statuses:
+        return {"tracking": tracking, "ok": False,
+                "error": "FedEx official site access denied (HTTP 403)"}
+    text = (body or "").lower().replace("’", "'")
+    if "can't find that tracking number" in text or "tracking number cannot be found" in text:
+        return {"tracking": tracking, "ok": False,
+                "error": "FedEx tracking number not found", "not_found": True}
+    return {"tracking": tracking, "ok": False,
+            "error": "no official FedEx tracking data"}
 
 
 def _track_once(tracking, timeout_nav, wait_ms, proxy):
     from patchright.sync_api import sync_playwright
     with sync_playwright() as playwright:
         args = ["--no-sandbox", "--window-position=4000,4000"]
-        if os.environ.get("FEDEX_DISABLE_HTTP2") == "1":
+        if os.environ.get("FEDEX_DISABLE_HTTP2", os.environ.get("UPS_DISABLE_HTTP2")) == "1":
             args.append("--disable-http2")
         browser = playwright.chromium.launch(headless=False, args=args)
         options = {"locale": "en-US", "viewport": {"width": 1366, "height": 768}}
@@ -109,11 +85,13 @@ def _track_once(tracking, timeout_nav, wait_ms, proxy):
             options["proxy"] = {"server": proxy}
         context = browser.new_context(**options)
         page = context.new_page()
-        responses = []
+        responses, statuses = [], []
 
         def receive(response):
-            if "track" not in response.url.lower():
+            parsed_url = urlsplit(response.url)
+            if parsed_url.netloc != "api.fedex.com" or parsed_url.path != "/track/v2/shipments":
                 return
+            statuses.append(response.status)
             try:
                 parsed = parse_tracking_response(tracking, response.json())
                 if parsed:
@@ -123,53 +101,30 @@ def _track_once(tracking, timeout_nav, wait_ms, proxy):
 
         page.on("response", receive)
         try:
-            page.goto("https://www.fedex.com/wtrk/track/",
+            page.goto("https://www.fedex.com/wtrk/track/?trknbr=" + quote(str(tracking)),
                       timeout=timeout_nav, wait_until="domcontentloaded")
-            page.wait_for_timeout(8000)
-            cookie = page.get_by_text("REJECT OPTIONAL COOKIES", exact=True)
-            if cookie.count():
-                cookie.first.click()
-                page.wait_for_timeout(500)
-            page.get_by_text("Track Another Shipment", exact=True).first.click()
-            page.wait_for_timeout(500)
-            inputs = page.locator("input:visible")
-            for index in range(inputs.count()):
-                field = inputs.nth(index)
-                if field.get_attribute("type") == "text" and field.get_attribute("id") != "search":
-                    field.fill(tracking)
-                    break
-            else:
-                raise RuntimeError("FedEx tracking input unavailable")
-            page.get_by_text("Track", exact=True).last.click()
             deadline = time.time() + wait_ms / 1000
             while time.time() < deadline and not responses:
                 page.wait_for_timeout(500)
+            body = page.locator("body").inner_text() if not responses else ""
         finally:
             browser.close()
-    return responses[0] if responses else None
+    return responses[0] if responses else page_failure(tracking, statuses, body)
 
 
 def track_fedex(tracking, timeout_nav=60000, wait_ms=25000, proxy=None, attempts=2):
-    api_error = ""
-    if os.environ.get("FEDEX_CLIENT_ID") and os.environ.get("FEDEX_CLIENT_SECRET"):
-        try:
-            return _official_track(tracking)
-        except Exception as error:
-            api_error = "official API " + type(error).__name__ + ": " + str(error)[:120]
     proxy = proxy if proxy is not None else (os.environ.get("FEDEX_PROXY") or os.environ.get("UPS_PROXY") or None)
     errors = []
     for attempt in range(attempts):
         try:
             result = _track_once(tracking, timeout_nav, wait_ms, proxy)
-            if result:
+            if result.get("ok") or result.get("not_found"):
                 return result
-            errors.append("no official tracking data")
+            errors.append(result.get("error") or "no official tracking data")
         except Exception as error:
             errors.append(type(error).__name__ + ": " + str(error)[:100])
         if attempt + 1 < attempts:
             time.sleep(attempt + 1)
-    if api_error:
-        errors.insert(0, api_error)
     return {"tracking": tracking, "ok": False, "error": "; ".join(errors)[-300:]}
 
 

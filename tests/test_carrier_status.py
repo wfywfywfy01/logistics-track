@@ -68,13 +68,24 @@ def test_ups_retries_with_a_fresh_browser_after_missing_response(monkeypatch):
     assert len(calls) == 2
 
 
-def test_fedex_official_api_is_preferred_when_credentials_exist(monkeypatch):
+def test_fedex_uses_official_page_without_api_credentials(monkeypatch):
     import fedex_track
     monkeypatch.setenv("FEDEX_CLIENT_ID", "client")
     monkeypatch.setenv("FEDEX_CLIENT_SECRET", "secret")
-    monkeypatch.setattr(fedex_track, "_official_track", lambda tracking: {
-        "tracking": tracking, "ok": True, "stage": "运输中"})
-    monkeypatch.setattr(fedex_track, "_track_once", lambda *_args: (_ for _ in ()).throw(
-        AssertionError("browser fallback must not run")))
+    calls = []
+    monkeypatch.setattr(fedex_track.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(fedex_track, "_track_once", lambda *_args: calls.append(1) or (
+        {"tracking": "876543210123", "ok": False, "error": "official site access denied"}
+        if len(calls) == 1 else
+        {"tracking": "876543210123", "ok": True, "stage": "运输中"}))
 
     assert fedex_track.track_fedex("876543210123")["ok"] is True
+    assert len(calls) == 2
+
+
+def test_fedex_page_failure_distinguishes_not_found_from_access_denied():
+    from fedex_track import page_failure
+
+    assert page_failure("123", [403], "")["error"] == "FedEx official site access denied (HTTP 403)"
+    result = page_failure("123", [], "We can’t find that tracking number.")
+    assert result["not_found"] is True
