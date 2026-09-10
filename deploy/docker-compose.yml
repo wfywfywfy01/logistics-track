@@ -14,6 +14,9 @@ services:
       POLL_MINUTES: ${POLL_MINUTES:-60}
       ADMIN_TOKEN: ${ADMIN_TOKEN:-}
       ADMIN_PORT: 8080
+      ADMIN_SESSION_HOURS: ${ADMIN_SESSION_HOURS:-12}
+      ADMIN_COOKIE_SECURE: ${ADMIN_COOKIE_SECURE:-0}
+      ADMIN_TRUST_PROXY: ${ADMIN_TRUST_PROXY:-0}
       BACKUP_DIR: /app/backups
       TZ: Asia/Shanghai
       # 服务容器内 xray 代理自动由 entrypoint 拉起并注入 UPS_PROXY

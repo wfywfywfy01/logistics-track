@@ -5,12 +5,17 @@ import base64
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import mimetypes
 import os
 import secrets
 import subprocess
 import sys
+import threading
+import time
+from collections import OrderedDict
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
@@ -60,6 +65,16 @@ def create_server(store, token, host="127.0.0.1", port=8080):
         raise ValueError("ADMIN_TOKEN is required")
     store.ensure_admin_user("admin", token)
     csrf_value = secrets.token_urlsafe(32)
+    session_seconds = int(float(os.environ.get("ADMIN_SESSION_HOURS") or 12) * 3600)
+    if session_seconds <= 0:
+        raise ValueError("ADMIN_SESSION_HOURS must be positive")
+    cookie_secure = os.environ.get("ADMIN_COOKIE_SECURE") == "1"
+    trust_proxy = os.environ.get("ADMIN_TRUST_PROXY") == "1"
+    sessions = {}
+    sessions_lock = threading.Lock()
+    auth_slots = threading.BoundedSemaphore(4)
+    login_failures = OrderedDict()
+    login_failures_lock = threading.Lock()
 
     def pipeline(args):
         environment = dict(os.environ)
@@ -76,6 +91,25 @@ def create_server(store, token, host="127.0.0.1", port=8080):
         def _principal(self):
             if hasattr(self, "_principal_value"):
                 return self._principal_value
+            cookie = SimpleCookie()
+            try:
+                cookie.load(self.headers.get("Cookie", ""))
+            except CookieError:
+                cookie.clear()
+            session_cookie = cookie.get("logistics_session")
+            session_token = session_cookie.value if session_cookie else ""
+            if session_token:
+                with sessions_lock:
+                    session = sessions.get(session_token)
+                current = store.get_admin_principal(session["username"]) if session else None
+                if (session and session["expires_at"] > time.time() and current and
+                        current["auth_version"] == session["auth_version"]):
+                    self._principal_value = {"username": current["username"],
+                                             "role": current["role"],
+                                             "_session": session_token}
+                    return self._principal_value
+                with sessions_lock:
+                    sessions.pop(session_token, None)
             value = self.headers.get("Authorization", "")
             try:
                 scheme, encoded = value.split(" ", 1)
@@ -84,9 +118,21 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             except Exception:
                 self._principal_value = None
                 return None
-            self._principal_value = (store.authenticate_admin(user, password)
-                                     if scheme.lower() == "basic" else None)
+            if scheme.lower() == "basic":
+                self._principal_value, _ = self._authenticate_admin(user, password)
+            else:
+                self._principal_value = None
             return self._principal_value
+
+        def _csrf(self):
+            principal = self._principal()
+            session_token = (principal or {}).get("_session")
+            if session_token:
+                with sessions_lock:
+                    session = sessions.get(session_token)
+                if session:
+                    return session["csrf"]
+            return csrf_value
 
         def _headers(self, status, content_type, extra=None):
             self.send_response(status)
@@ -94,9 +140,11 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Content-Security-Policy",
-                             "default-src 'self'; style-src 'unsafe-inline'; script-src 'self'")
-            if status == 401:
+                             "default-src 'self'; style-src 'unsafe-inline'; script-src 'self'; "
+                             "form-action 'self'; base-uri 'none'")
+            if status == 401 and urlsplit(self.path).path.startswith("/api/"):
                 self.send_header("WWW-Authenticate", 'Basic realm="logistics-admin"')
             for name, value in (extra or {}).items():
                 self.send_header(name, value)
@@ -111,10 +159,11 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             principal = self._principal() or {"username": "-", "role": "-"}
             users_link = "<a href='/users'>权限管理</a>" if principal["role"] == "admin" else ""
             shell = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
-                     "<meta name=csrf content='" + csrf_value + "'>"
+                     "<meta name=csrf content='" + self._csrf() + "'>"
                      "<title>物流运营台</title><style>body{font:15px system-ui;margin:2rem auto;max-width:1200px;"
                      "padding:0 1rem;color:#17202a;background:#f6f8fa}nav{padding:1rem;border-radius:.7rem;"
                      "background:#17202a}nav a{margin-right:1rem;color:#fff}.user{float:right;color:#c9d1d9}"
+                     ".logout{float:right;margin:-.45rem 0 0 .7rem}.logout button{background:#30363d;border:0}"
                      "h1{margin-top:1.6rem}"
                      "table,pre,.api-form{background:#fff;border:1px solid #d8dee4;border-radius:.6rem}"
                      "table{border-collapse:separate;border-spacing:0;width:100%}th,td{padding:.65rem;"
@@ -126,10 +175,119 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                      "input,select,button{box-sizing:border-box;width:100%;margin:.2rem 0}}</style>"
                      "<nav><a href='/orders'>订单</a><a href='/tasks'>异常待办</a><a href='/notifications'>通知中心</a>"
                      "<a href='/reports/daily'>运营日报</a>" + users_link +
-                     "<span class=user>当前：%s（%s）</span></nav>" % (
-                         html.escape(principal["username"]), html.escape(principal["role"])) + body +
+                     "<form class=logout method=post action='/logout'><input type=hidden name=csrf value='%s'>"
+                     "<button>退出</button></form><span class=user>当前：%s（%s）</span></nav>" % (
+                         html.escape(self._csrf()), html.escape(principal["username"]),
+                         html.escape(principal["role"])) + body +
                      "<script src='/admin.js' defer></script>")
             self.wfile.write(shell.encode())
+
+        def _login_page(self, status=200, error="", extra=None):
+            login_csrf = secrets.token_urlsafe(32)
+            message = "<p class=bad>%s</p>" % html.escape(error) if error else ""
+            body = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+                    "<title>登录物流运营台</title><style>body{font:15px system-ui;background:#f6f8fa;"
+                    "display:grid;min-height:100vh;place-items:center;margin:0}.login{width:min(360px,85vw);"
+                    "padding:2rem;background:#fff;border:1px solid #d8dee4;border-radius:.8rem}label{display:block;"
+                    "margin:1rem 0}input,button{box-sizing:border-box;width:100%;padding:.65rem;margin-top:.35rem;"
+                    "border:1px solid #aab2bd;border-radius:.4rem}button{color:#fff;background:#0969da;"
+                    "border-color:#0969da}.bad{color:#b42318}</style><main class=login>"
+                    "<h1>登录物流运营台</h1>" + message +
+                    "<form method=post action='/login'><input type=hidden name=csrf value='%s'>"
+                    "<label>用户名<input name=username required "
+                    "autocomplete=username></label><label>密码<input name=password type=password required "
+                    "autocomplete=current-password></label><button>登录</button></form></main>" %
+                    html.escape(login_csrf))
+            secure = "; Secure" if cookie_secure else ""
+            headers = dict(extra or {})
+            headers["Set-Cookie"] = (
+                "logistics_login_csrf=%s; Path=/login; HttpOnly; SameSite=Strict; Max-Age=600%s" %
+                (login_csrf, secure))
+            self._headers(status, "text/html; charset=utf-8", headers)
+            self.wfile.write(body.encode())
+
+        def _same_origin_login(self, form):
+            cookie = SimpleCookie()
+            try:
+                cookie.load(self.headers.get("Cookie", ""))
+            except CookieError:
+                cookie.clear()
+            csrf_cookie = cookie.get("logistics_login_csrf")
+            if not csrf_cookie or not hmac.compare_digest(
+                    str(form.get("csrf") or ""), csrf_cookie.value):
+                return False
+            if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+                return False
+            origin = self.headers.get("Origin")
+            if not origin or origin == "null":
+                return True
+            parsed = urlsplit(origin)
+            return (parsed.scheme in ("http", "https") and
+                    parsed.netloc.lower() == self.headers.get("Host", "").lower())
+
+        def _login_backoff(self, key):
+            now = time.time()
+            with login_failures_lock:
+                entry = login_failures.get(key)
+                if not entry:
+                    return 0
+                if entry["last_seen"] < now - 900:
+                    login_failures.pop(key, None)
+                    return 0
+                login_failures.move_to_end(key)
+                return max(0, int(entry["blocked_until"] - now + 0.999))
+
+        def _client_ip(self):
+            forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+            if trust_proxy and forwarded:
+                try:
+                    return str(ipaddress.ip_address(forwarded))
+                except ValueError:
+                    pass
+            return self.client_address[0]
+
+        def _record_login_failure(self, key):
+            now = time.time()
+            with login_failures_lock:
+                failures = login_failures.get(key, {}).get("failures", 0) + 1
+                login_failures[key] = {
+                    "failures": failures, "blocked_until": now + min(2 ** (failures - 1), 60),
+                    "last_seen": now}
+                login_failures.move_to_end(key)
+                while len(login_failures) > 1024:
+                    login_failures.popitem(last=False)
+
+        def _authenticate_admin(self, username, password, include_auth_version=False):
+            failure_key = (self._client_ip(), username.lower())
+            retry_after = self._login_backoff(failure_key)
+            if retry_after:
+                return None, retry_after
+            if not auth_slots.acquire(blocking=False):
+                return None, 1
+            try:
+                principal = store.authenticate_admin(
+                    username, password, include_auth_version=include_auth_version)
+            finally:
+                auth_slots.release()
+            if principal:
+                with login_failures_lock:
+                    login_failures.pop(failure_key, None)
+            else:
+                self._record_login_failure(failure_key)
+            return principal, 0
+
+        def _redirect(self, location, cookie=None):
+            extra = {"Location": location, "Content-Length": "0"}
+            if cookie:
+                extra["Set-Cookie"] = cookie
+            self._headers(303, "text/plain; charset=utf-8", extra)
+
+        def _read_form(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > 65536:
+                raise ValueError("request body too large")
+            return {key: values[-1] for key, values in parse_qs(
+                self.rfile.read(length).decode("utf-8"), keep_blank_values=True).items()}
 
         def _read_json(self):
             length = int(self.headers.get("Content-Length") or 0)
@@ -141,10 +299,13 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             return payload
 
         def do_GET(self):
-            principal = self._principal()
-            if not principal:
-                return self._json(401, {"error": "authentication required"})
             parsed = urlsplit(self.path)
+            principal = self._principal()
+            if parsed.path == "/login":
+                return self._redirect("/orders") if principal else self._login_page()
+            if not principal:
+                return (self._json(401, {"error": "authentication required"})
+                        if parsed.path.startswith("/api/") else self._redirect("/login"))
             params = parse_qs(parsed.query)
             if parsed.path == "/admin.js":
                 self._headers(200, "text/javascript; charset=utf-8")
@@ -300,12 +461,61 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             return self._json(404, {"error": "not found"})
 
         def do_POST(self):
+            parsed_path = urlsplit(self.path).path
+            if parsed_path == "/login":
+                try:
+                    form = self._read_form()
+                except (UnicodeDecodeError, ValueError) as error:
+                    return self._login_page(400, str(error))
+                if not self._same_origin_login(form):
+                    return self._login_page(403, "请求来源无效")
+                username = str(form.get("username") or "").strip()
+                principal, retry_after = self._authenticate_admin(
+                    username, str(form.get("password") or ""), include_auth_version=True)
+                if retry_after:
+                    return self._login_page(429, "登录尝试过多，请稍后重试",
+                                            {"Retry-After": str(retry_after)})
+                if not principal:
+                    return self._login_page(401, "用户名或密码错误")
+                session_token = secrets.token_urlsafe(32)
+                with sessions_lock:
+                    now = time.time()
+                    for old_token, session in list(sessions.items()):
+                        if session["expires_at"] <= now:
+                            sessions.pop(old_token, None)
+                    same_user = sorted(
+                        ((old_token, session) for old_token, session in sessions.items()
+                         if session["username"] == principal["username"]),
+                        key=lambda item: item[1]["created_at"])
+                    for old_token, _ in same_user[:-4]:
+                        sessions.pop(old_token, None)
+                    sessions[session_token] = {
+                        "username": principal["username"], "auth_version": principal["auth_version"],
+                        "created_at": now, "expires_at": now + session_seconds,
+                        "csrf": secrets.token_urlsafe(32)}
+                secure = "; Secure" if cookie_secure else ""
+                return self._redirect(
+                    "/orders", "logistics_session=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%s%s" % (
+                        session_token, session_seconds, secure))
+            if parsed_path == "/logout":
+                principal = self._principal()
+                if principal:
+                    try:
+                        form = self._read_form()
+                    except (UnicodeDecodeError, ValueError) as error:
+                        return self._json(400, {"error": str(error)})
+                    if not hmac.compare_digest(str(form.get("csrf") or ""), self._csrf()):
+                        return self._json(403, {"error": "csrf check failed"})
+                    with sessions_lock:
+                        sessions.pop(principal.get("_session"), None)
+                return self._redirect(
+                    "/login", "logistics_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
             principal = self._principal()
             if not principal:
                 return self._json(401, {"error": "authentication required"})
-            if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), csrf_value):
+            if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), self._csrf()):
                 return self._json(403, {"error": "csrf check failed"})
-            parts = urlsplit(self.path).path.strip("/").split("/")
+            parts = parsed_path.strip("/").split("/")
             try:
                 payload = self._read_json()
             except (ValueError, json.JSONDecodeError) as error:

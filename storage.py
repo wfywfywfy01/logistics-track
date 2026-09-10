@@ -165,15 +165,33 @@ class Storage:
                  row["created_at"] if row else timestamp, timestamp),
             )
 
-    def authenticate_admin(self, username, password):
+    def authenticate_admin(self, username, password, include_auth_version=False):
         with self.connect() as connection:
             row = connection.execute(
-                "SELECT username,password_hash,role,active FROM admin_users WHERE username=?",
+                "SELECT username,password_hash,role,active,updated_at FROM admin_users WHERE username=?",
                 (username,),
             ).fetchone()
-        if not row or not row["active"] or not _password_matches(password, row["password_hash"]):
+        if not row:
+            hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), b"\0" * 16,
+                                PASSWORD_ITERATIONS)
             return None
-        return {"username": row["username"], "role": row["role"]}
+        if not row["active"] or not _password_matches(password, row["password_hash"]):
+            return None
+        principal = {"username": row["username"], "role": row["role"]}
+        if include_auth_version:
+            principal["auth_version"] = row["updated_at"]
+        return principal
+
+    def get_admin_principal(self, username):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT username,role,active,updated_at FROM admin_users WHERE username=?",
+                (username,),
+            ).fetchone()
+        if not row or not row["active"]:
+            return None
+        return {"username": row["username"], "role": row["role"],
+                "auth_version": row["updated_at"]}
 
     def list_admin_users(self):
         with self.connect() as connection:
