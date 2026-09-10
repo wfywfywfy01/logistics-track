@@ -17,6 +17,7 @@
 - 生产已切换到合并版本 `099782d` 对应镜像；FedEx 页面模式候选能把台账疑似号码识别为“官网找不到”，容器重启后保持 `healthy`，数据库仍为 146 个订单且完整性 `ok`，鉴权管理 API 返回 146 个订单。管理端口仅绑定服务器 `127.0.0.1:18080`；切换前备份、旧镜像和停止的回滚容器已保留。停滞阈值未配置时按规则报告 `N/A`，不生成事实性停滞判断。
 - 运营工作台版本已通过 PR #4 合并为 `8be3394` 并发布。服务器镜像 `sha256:d113821c…` 为 `healthy`、重启数 0；数据库 146 个订单、完整性 `ok`，鉴权日报分母为 146，数据过期阈值显示 `N/A`。切换前一致性备份为 `/app/backups/logistics-backup-20260910-181601.zip`，旧服务保留为 `logistics-track-rollback-workbench-20260910`。
 - 可视化权限版本已通过 PR #5 合并为 `aa87518` 并发布。服务器镜像 `sha256:bdcb82fa…` 为 `healthy`、重启数 0；生产验证 `admin` 角色可用、密码哈希未泄露、权限 API 不返回哈希，数据库仍为 146 个订单且完整性 `ok`。切换前备份为 `/app/backups/logistics-backup-20260910-183334.zip`，旧服务保留为 `logistics-track-rollback-rbac-20260910`。
+- 可视化登录会话已通过 PR #6 合并为 `c7d9e8b` 并发布。服务器镜像 `sha256:aaeb3f3c…` 为 `healthy`、重启数 0；生产登录、会话 Cookie、退出验证通过，数据库仍为 146 个订单且完整性 `ok`。切换前备份为 `/app/backups/logistics-backup-20260910-220619.zip`，旧服务保留为 `logistics-track-rollback-sessions-20260910`。
 
 ## 2026-09-08：可靠性与服务器发布准备
 
