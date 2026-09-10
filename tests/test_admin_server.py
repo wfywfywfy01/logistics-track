@@ -1,5 +1,6 @@
 import base64
 import json
+import sqlite3
 import threading
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -8,10 +9,10 @@ from admin_server import create_server, csrf_token
 from storage import Storage
 
 
-def request(url, token=None, method="GET", payload=None, csrf=None):
+def request(url, token=None, method="GET", payload=None, csrf=None, username="admin"):
     headers = {}
     if token:
-        raw = base64.b64encode(("admin:" + token).encode()).decode()
+        raw = base64.b64encode((username + ":" + token).encode()).decode()
         headers["Authorization"] = "Basic " + raw
     if csrf:
         headers["X-CSRF-Token"] = csrf
@@ -22,8 +23,8 @@ def request(url, token=None, method="GET", payload=None, csrf=None):
         return response.status, json.loads(response.read())
 
 
-def request_text(url, token):
-    raw = base64.b64encode(("admin:" + token).encode()).decode()
+def request_text(url, token, username="admin"):
+    raw = base64.b64encode((username + ":" + token).encode()).decode()
     with urlopen(Request(url, headers={"Authorization": "Basic " + raw})) as response:
         return response.status, response.read().decode("utf-8")
 
@@ -74,10 +75,10 @@ def test_task_actions_require_csrf_and_write_audit_log(tmp_path):
             assert error.code == 403
         status, body = request(base + f"/api/tasks/{task_id}/retry", "secret-token",
                                "POST", {"operator": "ops", "reason": "checked"},
-                               csrf_token("secret-token"))
+                               server.csrf_token)
         assert status == 200 and body["status"] == "pending"
         assert store.pending_task_count("review") == 1
-        assert store.list_audit("XSD1")[0]["operator"] == "ops"
+        assert store.list_audit("XSD1")[0]["operator"] == "admin"
     finally:
         server.shutdown()
 
@@ -101,7 +102,7 @@ def test_operator_can_retry_ocr_and_assign_stable_salesperson_id(tmp_path):
     store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "已预报"})
     store.enqueue_inbox("label-1", {"order": "XSD1", "path": "label.png"})
     claimed = store.claim_inbox("worker"); store.fail_inbox(claimed["id"], "ocr", max_attempts=1)
-    auth_csrf = csrf_token("secret-token")
+    auth_csrf = server.csrf_token
     try:
         _, retry = request(base + "/api/inbox/label-1/retry", "secret-token", "POST",
                            {"operator": "ops", "reason": "image repaired"}, auth_csrf)
@@ -124,7 +125,7 @@ def test_operator_can_add_package_through_admin_api(tmp_path):
         _, result = request(base + "/api/orders/XSD1/packages", "secret-token", "POST",
                             {"operator": "ops", "reason": "verified label",
                              "tracking": "876543210123", "carrier": "FedEx"},
-                            csrf_token("secret-token"))
+                            server.csrf_token)
         assert result["added"] is True
         assert store.get_shipment("XSD1")["packages"][0]["carrier"] == "FEDEX"
     finally:
@@ -140,7 +141,7 @@ def test_admin_cannot_retry_task_during_delivery(tmp_path):
     try:
         try:
             request(base + f"/api/tasks/{task_id}/retry", "secret-token", "POST",
-                    {"operator": "ops", "reason": "manual retry"}, csrf_token("secret-token"))
+                    {"operator": "ops", "reason": "manual retry"}, server.csrf_token)
             assert False, "active delivery must reject retry"
         except HTTPError as error:
             assert error.code == 409
@@ -174,7 +175,7 @@ def test_admin_can_retry_task_after_worker_lease_expires(tmp_path):
     try:
         status, result = request(base + f"/api/tasks/{task_id}/retry", "secret-token", "POST",
                                  {"operator": "ops", "reason": "lease expired"},
-                                 csrf_token("secret-token"))
+                                 server.csrf_token)
         assert status == 200 and result["status"] == "pending"
     finally:
         server.shutdown()
@@ -187,7 +188,7 @@ def test_admin_cannot_retry_ocr_while_worker_lease_is_active(tmp_path):
     try:
         try:
             request(base + "/api/inbox/label-1/retry", "secret-token", "POST",
-                    {"operator": "ops", "reason": "manual retry"}, csrf_token("secret-token"))
+                    {"operator": "ops", "reason": "manual retry"}, server.csrf_token)
             assert False, "active OCR lease must reject retry"
         except HTTPError as error:
             assert error.code == 409
@@ -202,7 +203,7 @@ def test_admin_can_retry_ocr_after_worker_lease_expires(tmp_path):
     try:
         status, result = request(base + "/api/inbox/label-1/retry", "secret-token", "POST",
                                  {"operator": "ops", "reason": "lease expired"},
-                                 csrf_token("secret-token"))
+                                 server.csrf_token)
         assert status == 200 and result["status"] == "pending"
     finally:
         server.shutdown()
@@ -258,5 +259,128 @@ def test_daily_report_links_to_affected_orders(tmp_path):
         assert "缺面单：1" in page
         assert "href='/orders/XSD1'" in page
         assert "数据过期阈值：N/A" in page
+    finally:
+        server.shutdown()
+
+
+def test_admin_can_create_users_without_exposing_password_hash(tmp_path):
+    store, server, base = run_server(tmp_path)
+    try:
+        status, created = request(base + "/api/users/operator1", "secret-token", "POST",
+                                  {"password": "operator-password-1", "role": "operator",
+                                   "active": True, "reason": "new colleague"},
+                                  server.csrf_token)
+        assert status == 200 and created == {
+            "username": "operator1", "role": "operator", "active": True}
+        _, users = request(base + "/api/users", "secret-token")
+        assert {row["username"] for row in users["items"]} == {"admin", "operator1"}
+        assert all("password_hash" not in row for row in users["items"])
+        _, orders = request(base + "/api/orders", "operator-password-1", username="operator1")
+        assert orders == {"items": []}
+        stored = store.connect().execute(
+            "SELECT password_hash FROM admin_users WHERE username='operator1'").fetchone()[0]
+        assert "operator-password-1" not in stored
+        _, page = request_text(base + "/users", "secret-token")
+        assert "权限审计" in page and "new colleague" in page
+    finally:
+        server.shutdown()
+
+
+def test_viewer_is_read_only_and_does_not_see_action_forms(tmp_path):
+    store, server, base = run_server(tmp_path)
+    store.put_admin_user("viewer1", "viewer-password-1", "viewer")
+    store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中"})
+    try:
+        _, page = request_text(base + "/orders/XSD1", "viewer-password-1", "viewer1")
+        assert "补录人员" not in page and "class=api-form" not in page
+        try:
+            request(base + "/api/orders/XSD1/salesperson", "viewer-password-1", "POST",
+                    {"salesperson": "张三", "user_id": "u1", "reason": "attempt"},
+                    server.csrf_token, username="viewer1")
+            assert False, "viewer mutation must fail"
+        except HTTPError as error:
+            assert error.code == 403
+        try:
+            request(base + "/api/users", "viewer-password-1", username="viewer1")
+            assert False, "viewer user-management access must fail"
+        except HTTPError as error:
+            assert error.code == 403
+    finally:
+        server.shutdown()
+
+
+def test_authenticated_operator_identity_is_used_for_audit(tmp_path):
+    store, server, base = run_server(tmp_path)
+    store.put_admin_user("operator1", "operator-password-1", "operator")
+    store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "已预报"})
+    try:
+        request(base + "/api/orders/XSD1/salesperson", "operator-password-1", "POST",
+                {"operator": "forged-admin", "reason": "verified", "salesperson": "张三",
+                 "user_id": "u1"}, server.csrf_token, username="operator1")
+        assert store.list_audit("XSD1")[0]["operator"] == "operator1"
+    finally:
+        server.shutdown()
+
+
+def test_last_active_admin_cannot_be_disabled(tmp_path):
+    store, server, base = run_server(tmp_path)
+    try:
+        try:
+            request(base + "/api/users/admin", "secret-token", "POST",
+                    {"role": "viewer", "active": False, "reason": "unsafe change"},
+                    server.csrf_token)
+            assert False, "last active admin must remain available"
+        except HTTPError as error:
+            assert error.code == 400
+        assert store.authenticate_admin("admin", "secret-token")["role"] == "admin"
+    finally:
+        server.shutdown()
+
+
+def test_bootstrap_admin_rotates_with_admin_token(tmp_path):
+    store = Storage(tmp_path)
+    store.ensure_admin_user("admin", "first-admin-token")
+    store.ensure_admin_user("admin", "second-admin-token")
+    assert store.authenticate_admin("admin", "first-admin-token") is None
+    assert store.authenticate_admin("admin", "second-admin-token") == {
+        "username": "admin", "role": "admin"}
+
+
+def test_csrf_secret_is_independent_from_admin_password(tmp_path):
+    _, server, base = run_server(tmp_path)
+    try:
+        _, page = request_text(base + "/orders", "secret-token")
+        assert server.csrf_token in page
+        assert csrf_token("secret-token") not in page
+    finally:
+        server.shutdown()
+
+
+def test_user_change_and_audit_are_atomic(tmp_path):
+    store = Storage(tmp_path)
+    store.ensure_admin_user("admin", "secret-token")
+    with store.connect() as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_user_audit BEFORE INSERT ON audit_log
+               WHEN NEW.entity_type='admin_user' BEGIN SELECT RAISE(ABORT,'audit unavailable'); END""")
+    try:
+        store.put_admin_user("viewer1", "viewer-password-1", "viewer",
+                             operator="admin", reason="new colleague")
+        assert False, "audit failure must abort account change"
+    except sqlite3.IntegrityError:
+        pass
+    assert {row["username"] for row in store.list_admin_users()} == {"admin"}
+
+
+def test_malformed_active_value_is_rejected(tmp_path):
+    _, server, base = run_server(tmp_path)
+    try:
+        try:
+            request(base + "/api/users/viewer1", "secret-token", "POST",
+                    {"password": "viewer-password-1", "role": "viewer",
+                     "active": "ture", "reason": "typo"}, server.csrf_token)
+            assert False, "malformed active flag must fail closed"
+        except HTTPError as error:
+            assert error.code == 400
     finally:
         server.shutdown()

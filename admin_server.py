@@ -8,6 +8,7 @@ import html
 import json
 import mimetypes
 import os
+import secrets
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -57,6 +58,8 @@ def _orders(store, query="", status=""):
 def create_server(store, token, host="127.0.0.1", port=8080):
     if not token:
         raise ValueError("ADMIN_TOKEN is required")
+    store.ensure_admin_user("admin", token)
+    csrf_value = secrets.token_urlsafe(32)
 
     def pipeline(args):
         environment = dict(os.environ)
@@ -70,15 +73,20 @@ def create_server(store, token, host="127.0.0.1", port=8080):
         return result.returncode, payload
 
     class Handler(BaseHTTPRequestHandler):
-        def _authorized(self):
+        def _principal(self):
+            if hasattr(self, "_principal_value"):
+                return self._principal_value
             value = self.headers.get("Authorization", "")
             try:
                 scheme, encoded = value.split(" ", 1)
                 userpass = base64.b64decode(encoded, validate=True).decode()
                 user, password = userpass.split(":", 1)
             except Exception:
-                return False
-            return scheme.lower() == "basic" and user == "admin" and hmac.compare_digest(password, token)
+                self._principal_value = None
+                return None
+            self._principal_value = (store.authenticate_admin(user, password)
+                                     if scheme.lower() == "basic" else None)
+            return self._principal_value
 
         def _headers(self, status, content_type, extra=None):
             self.send_response(status)
@@ -100,11 +108,14 @@ def create_server(store, token, host="127.0.0.1", port=8080):
 
         def _html(self, status, body):
             self._headers(status, "text/html; charset=utf-8")
+            principal = self._principal() or {"username": "-", "role": "-"}
+            users_link = "<a href='/users'>权限管理</a>" if principal["role"] == "admin" else ""
             shell = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
-                     "<meta name=csrf content='" + csrf_token(token) + "'>"
+                     "<meta name=csrf content='" + csrf_value + "'>"
                      "<title>物流运营台</title><style>body{font:15px system-ui;margin:2rem auto;max-width:1200px;"
                      "padding:0 1rem;color:#17202a;background:#f6f8fa}nav{padding:1rem;border-radius:.7rem;"
-                     "background:#17202a}nav a{margin-right:1rem;color:#fff}h1{margin-top:1.6rem}"
+                     "background:#17202a}nav a{margin-right:1rem;color:#fff}.user{float:right;color:#c9d1d9}"
+                     "h1{margin-top:1.6rem}"
                      "table,pre,.api-form{background:#fff;border:1px solid #d8dee4;border-radius:.6rem}"
                      "table{border-collapse:separate;border-spacing:0;width:100%}th,td{padding:.65rem;"
                      "border-bottom:1px solid #e7ebef;text-align:left}.bad{color:#b42318;font-weight:600}"
@@ -114,7 +125,9 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                      "@media(max-width:700px){body{margin:1rem auto}table{display:block;overflow:auto}"
                      "input,select,button{box-sizing:border-box;width:100%;margin:.2rem 0}}</style>"
                      "<nav><a href='/orders'>订单</a><a href='/tasks'>异常待办</a><a href='/notifications'>通知中心</a>"
-                     "<a href='/reports/daily'>运营日报</a></nav>" + body +
+                     "<a href='/reports/daily'>运营日报</a>" + users_link +
+                     "<span class=user>当前：%s（%s）</span></nav>" % (
+                         html.escape(principal["username"]), html.escape(principal["role"])) + body +
                      "<script src='/admin.js' defer></script>")
             self.wfile.write(shell.encode())
 
@@ -128,7 +141,8 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             return payload
 
         def do_GET(self):
-            if not self._authorized():
+            principal = self._principal()
+            if not principal:
                 return self._json(401, {"error": "authentication required"})
             parsed = urlsplit(self.path)
             params = parse_qs(parsed.query)
@@ -167,6 +181,10 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                 return self._json(200, {"items": store.list_issues(tuple(statuses))})
             if parsed.path == "/api/notifications":
                 return self._json(200, {"items": store.list_tasks(kinds=("notify_group", "notify_dm"))})
+            if parsed.path == "/api/users":
+                if principal["role"] != "admin":
+                    return self._json(403, {"error": "permission denied"})
+                return self._json(200, {"items": store.list_admin_users()})
             if parsed.path == "/api/reports/daily":
                 return self._json(200, build_daily_report(
                     store, freshness_hours=os.environ.get("TRACKING_DATA_MAX_AGE_HOURS")))
@@ -187,20 +205,20 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                 if not shipment: return self._html(404, "<h1>订单不存在</h1>")
                 endpoint = "/api/orders/" + quote(order, safe="")
                 evidence = store.evidence_for_order(order)
-                fields = ("<input name=operator required placeholder='操作人'>"
-                          "<input name=reason required placeholder='原因'>")
+                fields = "<input name=reason required placeholder='原因'>"
                 body = "<h1>%s</h1><pre>%s</pre>" % (
                     html.escape(order), html.escape(json.dumps(shipment, ensure_ascii=False, indent=2)))
-                body += ("<h2>补录人员</h2><form class=api-form action='%s/salesperson'>"
-                         "<input name=salesperson required placeholder='姓名'><input name=user_id required "
-                         "placeholder='用户 ID'>%s<button>保存</button></form>") % (endpoint, fields)
-                body += ("<h2>增加包裹</h2><form class=api-form action='%s/packages'>"
-                         "<input name=tracking required placeholder='国际单号'><select name=carrier>"
-                         "<option>UPS</option><option>DHL</option><option>FEDEX</option></select>"
-                         "%s<button>增加</button></form>") % (endpoint, fields)
-                body += ("<h2>换单</h2><form class=api-form action='%s/replace-package'>"
-                         "<input name=tracking required placeholder='原国际单号'><input name=new_tracking "
-                         "required placeholder='新国际单号'>%s<button>换单</button></form>") % (endpoint, fields)
+                if principal["role"] in ("admin", "operator"):
+                    body += ("<h2>补录人员</h2><form class=api-form action='%s/salesperson'>"
+                             "<input name=salesperson required placeholder='姓名'><input name=user_id required "
+                             "placeholder='用户 ID'>%s<button>保存</button></form>") % (endpoint, fields)
+                    body += ("<h2>增加包裹</h2><form class=api-form action='%s/packages'>"
+                             "<input name=tracking required placeholder='国际单号'><select name=carrier>"
+                             "<option>UPS</option><option>DHL</option><option>FEDEX</option></select>"
+                             "%s<button>增加</button></form>") % (endpoint, fields)
+                    body += ("<h2>换单</h2><form class=api-form action='%s/replace-package'>"
+                             "<input name=tracking required placeholder='原国际单号'><input name=new_tracking "
+                             "required placeholder='新国际单号'>%s<button>换单</button></form>") % (endpoint, fields)
                 links = " ".join("<a href='/evidence/%s'>查看 %s</a>" % (
                     quote(str(item["id"]), safe=""), html.escape(str(item["id"])))
                     for item in evidence["inbox"] if (item.get("payload") or {}).get("path"))
@@ -213,17 +231,15 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                 body = "<h1>异常待办</h1><table><tr><th>ID</th><th>类型</th><th>状态</th><th>原因</th><th>内容</th><th>操作</th></tr>"
                 for row in rows:
                     actions = ""
-                    if row.get("source") == "task":
+                    if principal["role"] in ("admin", "operator") and row.get("source") == "task":
                         endpoint = "/api/tasks/%s" % row["id"]
-                        actions = ("<form class=api-form action='%s/retry'><input name=operator required "
-                                   "placeholder='操作人'><input name=reason required placeholder='原因'>"
+                        actions = ("<form class=api-form action='%s/retry'><input name=reason required placeholder='原因'>"
                                    "<button>重试</button><button formaction='%s/claim'>认领</button>"
                                    "<button formaction='%s/resolve'>结案</button></form>") % (
                                        endpoint, endpoint, endpoint)
-                    elif row.get("source") == "inbox":
+                    elif principal["role"] in ("admin", "operator") and row.get("source") == "inbox":
                         endpoint = "/api/inbox/%s/retry" % quote(str(row["id"]), safe="")
-                        actions = ("<form class=api-form action='%s'><input name=operator required "
-                                   "placeholder='操作人'><input name=reason required placeholder='原因'>"
+                        actions = ("<form class=api-form action='%s'><input name=reason required placeholder='原因'>"
                                    "<button>重试</button></form>") % endpoint
                     body += "<tr><td>%s</td><td>%s</td><td class=bad>%s</td><td>%s</td><td><pre>%s</pre></td><td>%s</td></tr>" % (
                         row["id"], html.escape(row["kind"]), html.escape(row["status"]),
@@ -253,22 +269,74 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                 body += "<p>数据过期阈值：%s</p>" % html.escape(
                     str(report["tracking_data_max_age_hours"]))
                 return self._html(200, body)
+            if parsed.path == "/users":
+                if principal["role"] != "admin":
+                    return self._json(403, {"error": "permission denied"})
+                body = ("<h1>权限管理</h1><p>admin：全部权限；operator：处理订单和异常；"
+                        "viewer：只读查看。</p><form class=api-form action='/api/users'>"
+                        "<input name=username required placeholder='用户名'><input name=password type=password "
+                        "required minlength=12 placeholder='初始密码（至少 12 位）'><select name=role>"
+                        "<option>viewer</option><option>operator</option><option>admin</option></select>"
+                        "<input name=reason required placeholder='原因'><button>新增账号</button></form>")
+                body += "<table><tr><th>用户名</th><th>角色</th><th>状态</th><th>修改</th></tr>"
+                for user in store.list_admin_users():
+                    endpoint = "/api/users/" + quote(user["username"], safe="")
+                    active_options = ("<option value=true selected>启用</option><option value=false>停用</option>"
+                                      if user["active"] else
+                                      "<option value=true>启用</option><option value=false selected>停用</option>")
+                    body += ("<tr><td>%s</td><td>%s</td><td>%s</td><td><form class=api-form "
+                             "action='%s'><input name=password type=password minlength=12 "
+                             "placeholder='留空不改密码'><select name=role><option>%s</option>"
+                             "<option>admin</option><option>operator</option><option>viewer</option></select>"
+                             "<select name=active>%s"
+                             "</select><input name=reason required placeholder='原因'><button>保存</button>"
+                             "</form></td></tr>") % (html.escape(user["username"]),
+                                html.escape(user["role"]), "启用" if user["active"] else "停用",
+                                endpoint, html.escape(user["role"]), active_options)
+                body += "</table><h2>权限审计</h2><pre>%s</pre>" % html.escape(json.dumps(
+                    [row for row in store.list_audit(limit=100) if row["entity_type"] == "admin_user"],
+                    ensure_ascii=False, indent=2))
+                return self._html(200, body)
             return self._json(404, {"error": "not found"})
 
         def do_POST(self):
-            if not self._authorized():
+            principal = self._principal()
+            if not principal:
                 return self._json(401, {"error": "authentication required"})
-            if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), csrf_token(token)):
+            if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), csrf_value):
                 return self._json(403, {"error": "csrf check failed"})
             parts = urlsplit(self.path).path.strip("/").split("/")
             try:
                 payload = self._read_json()
             except (ValueError, json.JSONDecodeError) as error:
                 return self._json(400, {"error": str(error)})
-            operator = str(payload.get("operator") or "").strip()
+            operator = principal["username"]
             reason = str(payload.get("reason") or "").strip()
-            if not operator or not reason:
-                return self._json(400, {"error": "operator and reason are required"})
+            if not reason:
+                return self._json(400, {"error": "reason is required"})
+            if len(parts) in (2, 3) and parts[:2] == ["api", "users"]:
+                if principal["role"] != "admin":
+                    return self._json(403, {"error": "permission denied"})
+                username = unquote(parts[2]) if len(parts) == 3 else str(payload.get("username") or "")
+                password = str(payload.get("password") or "")
+                role = str(payload.get("role") or "viewer").lower()
+                if "active" not in payload:
+                    active = None
+                elif isinstance(payload["active"], bool):
+                    active = payload["active"]
+                elif isinstance(payload["active"], str) and payload["active"].strip().lower() in (
+                        "true", "false"):
+                    active = payload["active"].strip().lower() == "true"
+                else:
+                    return self._json(400, {"error": "active must be true or false"})
+                try:
+                    result = store.put_admin_user(
+                        username, password, role, active, operator=operator, reason=reason)
+                except ValueError as error:
+                    return self._json(400, {"error": str(error)})
+                return self._json(200, result)
+            if principal["role"] not in ("admin", "operator"):
+                return self._json(403, {"error": "permission denied"})
             if len(parts) == 4 and parts[:2] == ["api", "inbox"] and parts[3] == "retry":
                 try: result = store.retry_inbox(unquote(parts[2]), operator, reason)
                 except TaskConflict as error: return self._json(409, {"error": str(error)})
@@ -312,7 +380,9 @@ def create_server(store, token, host="127.0.0.1", port=8080):
         def log_message(self, _format, *_args):
             pass
 
-    return ThreadingHTTPServer((host, port), Handler)
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.csrf_token = csrf_value
+    return server
 
 
 def main():

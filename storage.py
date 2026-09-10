@@ -1,10 +1,36 @@
 #!/usr/bin/env python
 """Transactional local state for logistics-track."""
+import hashlib
+import hmac
 import json
 import os
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+
+PASSWORD_ITERATIONS = 310_000
+ADMIN_ROLES = ("admin", "operator", "viewer")
+
+
+def _password_hash(password, salt=None):
+    salt = salt or os.urandom(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS)
+    return "pbkdf2_sha256$%s$%s$%s" % (
+        PASSWORD_ITERATIONS, salt.hex(), digest.hex())
+
+
+def _password_matches(password, encoded):
+    try:
+        algorithm, iterations, salt, expected = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt), int(iterations))
+        return hmac.compare_digest(digest.hex(), expected)
+    except (TypeError, ValueError):
+        return False
 
 
 def utcnow():
@@ -113,8 +139,95 @@ class Storage:
                     reason TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS admin_users (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('admin','operator','viewer')),
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
+
+    def ensure_admin_user(self, username, password):
+        timestamp = iso()
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT created_at FROM admin_users WHERE username=?", (username,)).fetchone()
+            connection.execute(
+                """INSERT INTO admin_users
+                   (username,password_hash,role,active,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?) ON CONFLICT(username) DO UPDATE SET
+                   password_hash=excluded.password_hash,role='admin',active=1,
+                   updated_at=excluded.updated_at""",
+                (username, _password_hash(password), "admin", 1,
+                 row["created_at"] if row else timestamp, timestamp),
+            )
+
+    def authenticate_admin(self, username, password):
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT username,password_hash,role,active FROM admin_users WHERE username=?",
+                (username,),
+            ).fetchone()
+        if not row or not row["active"] or not _password_matches(password, row["password_hash"]):
+            return None
+        return {"username": row["username"], "role": row["role"]}
+
+    def list_admin_users(self):
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT username,role,active,created_at,updated_at FROM admin_users ORDER BY username"
+            ).fetchall()
+        return [{**dict(row), "active": bool(row["active"])} for row in rows]
+
+    def put_admin_user(self, username, password, role, active=None, operator=None, reason=None):
+        username = str(username or "").strip()
+        if not (3 <= len(username) <= 64) or any(
+                character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+                for character in username):
+            raise ValueError("username must be 3-64 letters, digits, dot, underscore or hyphen")
+        if role not in ADMIN_ROLES:
+            raise ValueError("role must be admin, operator or viewer")
+        if password and len(password) < 12:
+            raise ValueError("password must contain at least 12 characters")
+        if operator and not reason:
+            raise ValueError("reason is required for audited user changes")
+        timestamp = iso()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT password_hash,role,active,created_at FROM admin_users WHERE username=?", (username,)
+            ).fetchone()
+            if username == "admin" and existing:
+                raise ValueError("bootstrap admin is managed by ADMIN_TOKEN")
+            if not existing and not password:
+                raise ValueError("password is required for a new user")
+            encoded = _password_hash(password) if password else existing["password_hash"]
+            created_at = existing["created_at"] if existing else timestamp
+            active_value = bool(existing["active"]) if active is None and existing else (
+                True if active is None else bool(active))
+            connection.execute(
+                """INSERT INTO admin_users(username,password_hash,role,active,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?) ON CONFLICT(username) DO UPDATE SET
+                   password_hash=excluded.password_hash,role=excluded.role,
+                   active=excluded.active,updated_at=excluded.updated_at""",
+                (username, encoded, role, int(active_value), created_at, timestamp),
+            )
+            active_admins = connection.execute(
+                "SELECT COUNT(*) FROM admin_users WHERE role='admin' AND active=1"
+            ).fetchone()[0]
+            if active_admins == 0:
+                raise ValueError("at least one active admin is required")
+            if operator:
+                connection.execute(
+                    """INSERT INTO audit_log
+                       (order_no,entity_type,entity_id,action,operator,reason,created_at)
+                       VALUES(NULL,'admin_user',?,'upsert',?,?,?)""",
+                    (username, operator, reason, timestamp),
+                )
+        return {"username": username, "role": role, "active": active_value}
 
     def migrate_legacy_json(self):
         counts = {"shipments": 0, "documents": 0}
