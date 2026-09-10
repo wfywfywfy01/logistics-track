@@ -84,7 +84,7 @@ docker run -d --name logistics-track --restart unless-stopped \
 ssh -L 8080:127.0.0.1:8080 <server>
 ```
 
-浏览器打开 `http://127.0.0.1:8080/orders`，Basic Auth 用户名为 `admin`，密码为 `ADMIN_TOKEN`。停滞阈值分别由 `STALL_HOURS_UPS/DHL/FEDEX` 配置；缺少阈值时显示 `N/A` 且不生成停滞结论。
+浏览器打开 `http://127.0.0.1:8080/orders`，Basic Auth 用户名为 `admin`，密码为 `ADMIN_TOKEN`。停滞阈值分别由 `STALL_HOURS_UPS/DHL/FEDEX` 配置，数据过期阈值由 `TRACKING_DATA_MAX_AGE_HOURS` 配置；缺少阈值时显示 `N/A` 且不生成对应结论。
 
 FedEx、DHL 和 UPS 均从官网页面获取状态，失败时不会猜测结果。UPS 与 FedEx 页面抓取使用两次独立浏览器会话重试。
 
