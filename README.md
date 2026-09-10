@@ -84,7 +84,15 @@ docker run -d --name logistics-track --restart unless-stopped \
 ssh -L 8080:127.0.0.1:8080 <server>
 ```
 
-浏览器打开 `http://127.0.0.1:8080/orders`，Basic Auth 用户名为 `admin`，密码为 `ADMIN_TOKEN`。停滞阈值分别由 `STALL_HOURS_UPS/DHL/FEDEX` 配置，数据过期阈值由 `TRACKING_DATA_MAX_AGE_HOURS` 配置；缺少阈值时显示 `N/A` 且不生成对应结论。
+浏览器打开 `http://127.0.0.1:8080/orders`，首次使用 Basic Auth 用户名 `admin`、密码 `ADMIN_TOKEN`。`admin` 是受保护的应急账号；修改 `ADMIN_TOKEN` 并重启服务会同步轮换其密码。管理员可在“权限管理”中新增、停用其他账号或调整角色；密码仅保存 PBKDF2 哈希，操作审计使用已认证账号，且账号变更与审计在同一事务提交。
+
+| 角色 | 权限 |
+| --- | --- |
+| `admin` | 查看数据、处理订单和异常、管理账号与角色 |
+| `operator` | 查看数据、处理订单和异常 |
+| `viewer` | 只读查看 |
+
+停滞阈值分别由 `STALL_HOURS_UPS/DHL/FEDEX` 配置，数据过期阈值由 `TRACKING_DATA_MAX_AGE_HOURS` 配置；缺少阈值时显示 `N/A` 且不生成对应结论。
 
 FedEx、DHL 和 UPS 均从官网页面获取状态，失败时不会猜测结果。UPS 与 FedEx 页面抓取使用两次独立浏览器会话重试。
 
