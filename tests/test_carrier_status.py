@@ -1,5 +1,8 @@
 from dhl_track import classify_status as classify_dhl
+from fedex_track import classify_status as classify_fedex, parse_tracking_response
+from carriers import detect_carrier
 from ups_track import classify_status as classify_ups
+import ups_track
 
 
 def test_unknown_ups_status_is_not_guessed_as_in_transit():
@@ -13,3 +16,65 @@ def test_unknown_dhl_status_is_not_guessed_as_in_transit():
 def test_known_carrier_statuses_are_classified():
     assert classify_ups("D", "Delivered") == "签收"
     assert classify_dhl("transit", "Departed facility") == "运输中"
+    assert classify_fedex("DL", "Delivered") == "签收"
+    assert classify_fedex("DE", "Delivery exception") == "异常"
+    assert classify_fedex("RP", "Return label link emailed") is None
+
+
+def test_carrier_detection_prefers_explicit_carrier_and_fails_closed():
+    assert detect_carrier("1Z999AA10123456784") == "UPS"
+    assert detect_carrier("1234567890") == "DHL"
+    assert detect_carrier("876543210123") == "FEDEX"
+    assert detect_carrier("123456789012", "DHL国际") == "DHL"
+    assert detect_carrier("ABC123") is None
+
+
+def test_fedex_official_response_is_normalized():
+    payload = {
+        "output": {"completeTrackResults": [{"trackResults": [{
+            "trackingNumberInfo": {"trackingNumber": "876543210123"},
+            "latestStatusDetail": {
+                "code": "IT", "statusByLocale": "On the way",
+                "scanLocation": {"city": "MEMPHIS", "countryCode": "US"},
+            },
+            "scanEvents": [{
+                "date": "2026-09-10T10:20:00-05:00", "eventDescription": "Departed facility",
+                "scanLocation": {"city": "MEMPHIS", "countryCode": "US"},
+            }],
+        }]}]},
+    }
+
+    result = parse_tracking_response("876543210123", payload)
+
+    assert result == {
+        "tracking": "876543210123", "ok": True, "stage": "运输中",
+        "status_en": "On the way",
+        "detail": "2026-09-10T10:20:00-05:00 MEMPHIS US Departed facility",
+    }
+
+
+def test_ups_retries_with_a_fresh_browser_after_missing_response(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ups_track.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(ups_track, "_track_once", lambda *_args: calls.append(1) or (
+        {"tracking": "1Z999AA10123456784", "ok": False, "error": "no GetStatus data"}
+        if len(calls) == 1 else
+        {"tracking": "1Z999AA10123456784", "ok": True, "stage": "运输中"}
+    ))
+
+    result = ups_track.track_ups("1Z999AA10123456784", attempts=2)
+
+    assert result["ok"] is True
+    assert len(calls) == 2
+
+
+def test_fedex_official_api_is_preferred_when_credentials_exist(monkeypatch):
+    import fedex_track
+    monkeypatch.setenv("FEDEX_CLIENT_ID", "client")
+    monkeypatch.setenv("FEDEX_CLIENT_SECRET", "secret")
+    monkeypatch.setattr(fedex_track, "_official_track", lambda tracking: {
+        "tracking": tracking, "ok": True, "stage": "运输中"})
+    monkeypatch.setattr(fedex_track, "_track_once", lambda *_args: (_ for _ in ()).throw(
+        AssertionError("browser fallback must not run")))
+
+    assert fedex_track.track_fedex("876543210123")["ok"] is True

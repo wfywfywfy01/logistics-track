@@ -2,6 +2,10 @@ __pycache__/
 *.pyc
 .git/
 tmp/
+data/
+backups/
+.env
+*.env
 dist/
 extension/
 _skill-publish/

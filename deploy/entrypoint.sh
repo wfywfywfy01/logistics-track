@@ -44,12 +44,6 @@ mkdir -p /app/data
 python proxy-watchdog.py >/var/log/watchdog.log 2>&1 &
 
 
-# 首次启动: 宿主挂载空 data 目录时, 用镜像内种子数据初始化(台账/人员映射)
-if [ -z "$(ls -A /app/data 2>/dev/null)" ]; then
-  echo "[entrypoint] initializing /app/data from seed"
-  mkdir -p /app/data
-  cp -r /app/seed/. /app/data/ 2>/dev/null || true
-fi
 CHANNEL_ID="${CHANNEL_ID:?CHANNEL_ID is required}"
 BOT_APP_ID="${BOT_APP_ID:-vbot_EIBezUGncpO8v0QJ}"
 INTERVAL="${INTERVAL:-30}"
@@ -58,6 +52,13 @@ RECONCILE_HOUR="${RECONCILE_HOUR:-9}"
 RECONCILE_HOUR=$(printf '%02d' "$((10#$RECONCILE_HOUR))")
 
 echo "[entrypoint] channel=$CHANNEL_ID bot=$BOT_APP_ID interval=${INTERVAL}s poll=${POLL_MINUTES}min"
+
+ADMIN_PID=""
+if [ -n "$ADMIN_TOKEN" ]; then
+  echo "[entrypoint] starting authenticated admin console"
+  python admin_server.py --host 0.0.0.0 --port "${ADMIN_PORT:-8080}" >/var/log/admin.log 2>&1 &
+  ADMIN_PID=$!
+fi
 
 # 每天两轮全量巡检 (09:05 / 15:05, Asia/Shanghai); 群里来新料时 watcher 还会即时触发一轮
 TRACK_TIMES="${TRACK_TIMES:-09:05,15:05}"
@@ -129,8 +130,8 @@ TRACK_TIMES="${TRACK_TIMES:-09:05,15:05}"
   done
 ) &
 
-# 下载附件缓存清理: 超过 30 天的 tmp 文件删掉, 防止 logistics-tmp 卷无限涨
-( while true; do find /app/tmp -type f -mtime +30 -delete 2>/dev/null; sleep 86400; done ) &
+# 已完成附件按保留期清理；待办、重试、运行中和死信原件保留。
+( while true; do python cleanup_evidence.py || true; sleep 86400; done ) &
 
 # 群监听(后台子进程, 本脚本留作 PID 1 做存活监督)
 # 注意: 不能 exec python 再 kill 1 —— PID 1 对无 handler 的信号一律忽略, 容器内 kill 不动它
@@ -138,7 +139,7 @@ echo "[entrypoint] starting watcher"
 touch /app/data/.watcher-heartbeat
 python logi-watcher.py --channel-id "$CHANNEL_ID" --bot-app-id "$BOT_APP_ID" --interval "$INTERVAL" &
 WATCHER_PID=$!
-trap 'echo "[entrypoint] SIGTERM, stopping watcher"; kill "$WATCHER_PID" 2>/dev/null; wait "$WATCHER_PID"; exit 0' TERM INT
+trap 'echo "[entrypoint] SIGTERM, stopping services"; kill "$WATCHER_PID" $ADMIN_PID 2>/dev/null; wait "$WATCHER_PID"; exit 0' TERM INT
 
 # watcher 假死自愈: 每轮成功轮询都会刷新 heartbeat。
 # 容器由 --restart unless-stopped 整体拉起(xray/看门狗/定时循环一起重来)
@@ -148,6 +149,10 @@ while kill -0 "$WATCHER_PID" 2>/dev/null; do
   if [ -f /app/data/.watcher-heartbeat ] && [ -n "$(find /app/data/.watcher-heartbeat -mmin +"$WATCHER_STALE_MIN")" ]; then
     echo "[liveness] watcher heartbeat stale > ${WATCHER_STALE_MIN}min, restarting container"
     kill "$WATCHER_PID" 2>/dev/null; sleep 5; kill -9 "$WATCHER_PID" 2>/dev/null
+    exit 1
+  fi
+  if [ -n "$ADMIN_PID" ] && ! kill -0 "$ADMIN_PID" 2>/dev/null; then
+    echo "[liveness] admin console exited unexpectedly"
     exit 1
   fi
 done

@@ -68,35 +68,23 @@ def test_failed_forecast_import_is_not_acknowledged(monkeypatch, tmp_path):
 
 
 def test_dm_checkpoint_does_not_overwrite_concurrent_ledger_change(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    data = tmp_path / "data"
-    data.mkdir()
-    ledger = data / "shipments.json"
-    ledger.write_text(
-        json.dumps(
-            {"XSD1": {"salesperson": "张三", "status": "运输中", "intl": "1Z1"}},
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    (data / "ups_results.json").write_text(
-        json.dumps({"XSD1": {"ok": True}}, ensure_ascii=False), encoding="utf-8"
-    )
-    (data / "users_map.json").write_text(
-        json.dumps({"张三": "user-1"}, ensure_ascii=False), encoding="utf-8"
-    )
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {
+        "orderNo": "XSD1", "salesperson": "张三", "status": "运输中",
+        "intl": "1Z1", "needs_notify": True, "binding_version": 1,
+        "history": [{"from": "已出国际单", "to": "运输中", "at": "event-1"}],
+        "products": [],
+    })
+    pipeline.STORE.put_document("org_people", {"张三": "user-1"})
 
-    import robust
-    from storage import Storage
+    def send_and_add_order(_args):
+        pipeline.STORE.upsert_shipment("XSD2", {"orderNo": "XSD2", "status": "已预报"})
+        return "ok"
 
-    def send_and_add_order(*args, **kwargs):
-        Storage(data).upsert_shipment("XSD2", {"orderNo": "XSD2", "status": "已预报"})
-        return 0, '{"ok": true}', ""
+    monkeypatch.setattr(pipeline, "cli", send_and_add_order)
+    pipeline.notify("channel")
 
-    monkeypatch.setattr(robust, "cli_run", send_and_add_order)
-    runpy.run_path(str(ROOT / "send_dms.py"), run_name="__main__")
-
-    saved = Storage(data).get_shipments()
+    saved = pipeline.STORE.get_shipments()
     assert "XSD2" in saved
     assert saved["XSD1"]["dm_notified_status"] == "运输中"
 
@@ -185,3 +173,118 @@ def test_failed_pipeline_task_remains_retryable(monkeypatch, tmp_path):
 
     assert auto_track.main() == 1
     assert auto_track.STORE.pending_task_count("pipeline") == 1
+
+
+def test_duplicate_forecast_preserves_binding_and_queues_conflict_review(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    existing = {
+        "orderNo": "XSD1", "intl": "1ZOLD", "carrier": "UPS", "binding_version": 3,
+        "binding_history": [{"from": None, "to": "1ZOLD"}],
+        "status": "运输中", "history": [{"from": "已出国际单", "to": "运输中"}],
+    }
+    pipeline.STORE.upsert_shipment("XSD1", existing)
+    monkeypatch.setattr(pipeline, "parse_forecast", lambda _path: [{
+        "orderNo": "XSD1", "intl": "876543210123", "products": ["new"],
+        "domestic": "SF2", "carrier": "FedEx", "recipient": "buyer", "note": "new",
+    }])
+    monkeypatch.setattr(pipeline, "match_sales", lambda *_args, **_kwargs: {})
+
+    pipeline.ingest_forecast("forecast.xlsx")
+
+    saved = pipeline.STORE.get_shipment("XSD1")
+    assert saved["intl"] == "1ZOLD"
+    assert saved["carrier"] == "UPS"
+    assert saved["binding_version"] == 3
+    assert saved["binding_history"] == existing["binding_history"]
+    assert saved["status"] == "运输中"
+    assert pipeline.STORE.pending_task_count("review") == 1
+
+
+def test_old_group_receipt_does_not_clear_new_notification(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {
+        "orderNo": "XSD1", "status": "运输中", "intl": "1Z1",
+        "binding_version": 1, "needs_notify": True,
+        "history": [{"from": "已出国际单", "to": "运输中", "at": "event-1"}],
+        "products": [],
+    })
+
+    def send_then_advance(_args):
+        pipeline.track_update("XSD1", "清关中", observed_at="2026-09-10T12:00:00+00:00")
+        return "ok"
+
+    monkeypatch.setattr(pipeline, "cli", send_then_advance)
+    pipeline.notify("channel")
+
+    saved = pipeline.STORE.get_shipment("XSD1")
+    assert saved["status"] == "清关中"
+    assert saved["needs_notify"] is True
+
+
+def test_full_ledger_snapshot_cannot_overwrite_committed_patch(tmp_path):
+    from storage import Storage
+    store = Storage(tmp_path)
+    store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中"})
+    stale = store.get_shipments()
+    store.patch_shipment("XSD1", {"notified_status": "运输中"})
+
+    store.put_shipments(stale)
+
+    assert store.get_shipment("XSD1")["notified_status"] == "运输中"
+
+
+def test_ambiguous_org_name_invalidates_cached_user(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.put_document("users_map", {"张三": "old-user"})
+    pipeline.STORE.put_document("org_people", {"张三": ["user-1", "user-2"]})
+    monkeypatch.setattr(pipeline, "cli_json", lambda _args: None)
+
+    assert pipeline.resolve_user("张三") is None
+    assert "张三" not in pipeline.STORE.get_document("users_map", {})
+
+
+def test_departed_person_is_not_resolved_from_stale_cache(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.put_document("users_map", {"张三": "old-user"})
+    pipeline.STORE.put_document("org_people", {"李四": "user-2"})
+    monkeypatch.setattr(pipeline, "cli_json", lambda _args: None)
+
+    assert pipeline.resolve_user("张三") is None
+
+
+def test_notification_only_queue_is_drained(monkeypatch, tmp_path):
+    auto_track = load_auto_track(monkeypatch, tmp_path)
+    auto_track.STORE.enqueue_task("notify_group", "group:XSD1:event-1", {})
+    calls = []
+    monkeypatch.setattr(auto_track, "run", lambda args, _desc: calls.append(args) or True)
+    options = types.SimpleNamespace(queued_only=True, skip_track=False, mode="full",
+                                    channel_id="channel", bot_app_id="bot")
+
+    assert auto_track.execute(options) == 0
+    assert calls == [["tracking-pipeline.py", "notify", "--channel-id", "channel",
+                      "--bot-app-id", "bot"]]
+
+
+def test_message_completion_and_pipeline_task_are_atomic(tmp_path):
+    from storage import Storage
+    store = Storage(tmp_path)
+    store.record_message("channel", "message-1", "2026-09-10T00:00:00Z", {})
+
+    store.complete_message_with_task("channel", "message-1", "pipeline",
+                                     "pipeline:message-1", {"channel_id": "channel"})
+
+    assert store.pending_messages("channel") == []
+    assert store.pending_task_count("pipeline") == 1
+
+
+def test_forced_rebinding_updates_carrier(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1",
+        "intl": "1Z999AA10123456784", "carrier": "UPS", "status": "运输中",
+        "history": [], "products": []})
+    monkeypatch.setattr(pipeline, "match_sales", lambda *_args, **_kwargs: {})
+
+    result = pipeline.ingest_pair("XSD1", "876543210123", force=True)
+
+    assert result["paired"] == "XSD1"
+    assert pipeline.STORE.get_shipment("XSD1")["carrier"] == "FEDEX"
