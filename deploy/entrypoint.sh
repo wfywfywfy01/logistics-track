@@ -10,6 +10,11 @@ sleep 2
 export DISPLAY=:99
 export PYTHONIOENCODING=utf-8
 
+WATCHER_STALE_MIN="${WATCHER_STALE_MIN:-10}"
+case "$WATCHER_STALE_MIN" in
+  ''|*[!0-9]*|0) echo "[entrypoint] WATCHER_STALE_MIN must be a positive integer"; exit 1 ;;
+esac
+
 # xray 本地代理(SS 节点 -> 海外出口): 密码从环境变量注入, 不落仓库
 # s1 = XRAY_*, s2(备用, 可选) = XRAY2_*; 看门狗按 config-s1/config-s2 切换
 write_xray_cfg() {  # $1=输出文件 $2=addr $3=port $4=method $5=pass
@@ -143,7 +148,6 @@ trap 'echo "[entrypoint] SIGTERM, stopping services"; kill "$WATCHER_PID" $ADMIN
 
 # watcher 假死自愈: 每轮成功轮询都会刷新 heartbeat。
 # 容器由 --restart unless-stopped 整体拉起(xray/看门狗/定时循环一起重来)
-WATCHER_STALE_MIN="${WATCHER_STALE_MIN:-10}"
 while kill -0 "$WATCHER_PID" 2>/dev/null; do
   sleep 60 & wait $!   # 用 wait 让 SIGTERM 能立刻打断 sleep 进 trap
   if [ -f /app/data/.watcher-heartbeat ] && [ -n "$(find /app/data/.watcher-heartbeat -mmin +"$WATCHER_STALE_MIN")" ]; then

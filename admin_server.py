@@ -300,6 +300,20 @@ def create_server(store, token, host="127.0.0.1", port=8080):
 
         def do_GET(self):
             parsed = urlsplit(self.path)
+            if parsed.path == "/healthz":
+                try:
+                    if not store.path.is_file():
+                        raise FileNotFoundError(store.path)
+                    with store.connect() as connection:
+                        database = connection.execute("PRAGMA quick_check").fetchone()[0]
+                        tables = {row[0] for row in connection.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'")}
+                    if not {"shipments", "tasks", "admin_users"}.issubset(tables):
+                        database = "error"
+                except Exception:
+                    database = "error"
+                return self._json(200 if database == "ok" else 503,
+                                  {"ok": database == "ok", "database": database})
             principal = self._principal()
             if parsed.path == "/login":
                 return self._redirect("/orders") if principal else self._login_page()

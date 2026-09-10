@@ -48,6 +48,11 @@ RUN printf "#!/bin/sh\nexec node /app/bin/vertu-cli.cjs \"\$@\"\n" > /usr/local/
 
 # 健康状态(docker ps 可见): watcher 心跳 10 分钟内有更新
 HEALTHCHECK --interval=60s --timeout=5s --start-period=180s --retries=3 \
-  CMD test -f /app/data/.watcher-heartbeat && test -z "$(find /app/data/.watcher-heartbeat -mmin +10)"
+  CMD STALE_MIN="${WATCHER_STALE_MIN:-10}" \
+      && case "$STALE_MIN" in ''|*[!0-9]*|0) exit 1 ;; esac \
+      && test -f /app/data/.watcher-heartbeat \
+      && STALE_FILE="$(find /app/data/.watcher-heartbeat -mmin +"$STALE_MIN" -print -quit)" \
+      && test -z "$STALE_FILE" \
+      && { [ -z "$ADMIN_TOKEN" ] || curl -fsS --max-time 3 http://127.0.0.1:${ADMIN_PORT:-8080}/healthz >/dev/null; }
 
 ENTRYPOINT ["/app/deploy/entrypoint.sh"]
