@@ -76,6 +76,31 @@ def test_admin_api_requires_auth_and_exposes_order_detail(tmp_path):
         server.shutdown()
 
 
+def test_health_endpoint_is_public_and_checks_database(tmp_path):
+    _, server, base = run_server(tmp_path)
+    try:
+        with urlopen(base + "/healthz") as response:
+            result = json.loads(response.read())
+        assert response.status == 200
+        assert result == {"ok": True, "database": "ok"}
+    finally:
+        server.shutdown()
+
+
+def test_health_endpoint_fails_when_database_is_missing(tmp_path):
+    store, server, base = run_server(tmp_path)
+    store.path = tmp_path / "missing.db"
+    try:
+        try:
+            urlopen(base + "/healthz")
+            assert False, "missing database must fail health check"
+        except HTTPError as error:
+            assert error.code == 503
+            assert json.loads(error.read()) == {"ok": False, "database": "error"}
+    finally:
+        server.shutdown()
+
+
 def test_task_actions_require_csrf_and_write_audit_log(tmp_path):
     store, server, base = run_server(tmp_path)
     task_id = store.enqueue_task("review", "review:XSD1", {"order": "XSD1"})

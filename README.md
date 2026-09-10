@@ -70,11 +70,11 @@ docker run -d --name logistics-track --restart unless-stopped \
   -v logistics-backups:/app/backups logistics-track:latest
 ```
 
-自愈：watcher 每轮成功轮询刷新 `data/.watcher-heartbeat`。超过 `WATCHER_STALE_MIN`（默认 10）分钟未更新，入口脚本结束主进程，由 Docker 重启容器；`docker ps` 的 HEALTHCHECK 使用同一判据。
+自愈：watcher 每轮成功轮询刷新 `data/.watcher-heartbeat`。超过 `WATCHER_STALE_MIN`（默认 10）分钟未更新，入口脚本结束主进程，由 Docker 重启容器；`docker ps` 的 HEALTHCHECK 使用同一阈值，并通过 `/healthz` 检查管理进程和 SQLite。
 
 恢复演练必须先停止服务，再运行 `python restore_backup.py <backup.zip> --data-dir data --force`，随后执行 SQLite `PRAGMA integrity_check` 并核对订单计数。
 
-默认备份写入持久卷 `/app/backups`。配置 `BACKUP_UPLOAD=1` 才额外上传 V 盘；远端身份不可用时本地备份仍会保留，任务返回失败并重试。
+默认备份写入持久卷 `/app/backups`，并按 `BACKUP_RETENTION_DAYS`（默认 30 天）清理过期的 `logistics-backup-*.zip`。配置 `BACKUP_UPLOAD=1` 才额外上传 V 盘；远端身份不可用时本地备份仍会保留，任务返回失败并重试。
 
 ## 运营工作台
 

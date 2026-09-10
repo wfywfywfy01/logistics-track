@@ -9,7 +9,21 @@ from storage import Storage, iso
 BACKUP_PARENT = os.environ.get("BACKUP_PARENT_ID", "")
 
 
+def prune_backups(backup_dir, retention_days, keep=None, now=None):
+    retention_days = int(retention_days)
+    if retention_days <= 0:
+        raise ValueError("BACKUP_RETENTION_DAYS must be positive")
+    cutoff = (now or time.time()) - retention_days * 86400
+    keep = Path(keep).resolve() if keep else None
+    for archive in Path(backup_dir).glob("logistics-backup-*.zip"):
+        if archive.resolve() != keep and archive.stat().st_mtime < cutoff:
+            archive.unlink()
+
+
 def create_backup(output=None, data_dir=None):
+    retention_days = int(os.environ.get("BACKUP_RETENTION_DAYS") or 30)
+    if retention_days <= 0:
+        raise ValueError("BACKUP_RETENTION_DAYS must be positive")
     store = Storage(data_dir)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup_dir = Path(os.environ.get("BACKUP_DIR") or tempfile.gettempdir())
@@ -35,6 +49,7 @@ def create_backup(output=None, data_dir=None):
         with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.write(snapshot, "shipments.db")
             archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+    prune_backups(backup_dir, retention_days, keep=output)
     return output
 
 def main():
