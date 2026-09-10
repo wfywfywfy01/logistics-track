@@ -12,7 +12,7 @@
 - 本地证据：`python -m pytest -q` 为 61 passed；`python -m compileall -q .`、`git diff --check` 与 `bash -n deploy/entrypoint.sh` 通过。
 - 服务器候选证据：镜像 `logistics-track:candidate-20260910-v2` 构建成功；生产库事务备份副本 `PRAGMA integrity_check=ok`，迁移后 146 个订单；鉴权日报 API 返回同一分母；真实 UPS 运单经服务器代理返回官网“签收”。
 - FedEx 服务器实测：候选代码已进入 FedEx 官网追踪流程，但当前出口未取得官方追踪 JSON；生产环境没有 `FEDEX_CLIENT_ID`/`FEDEX_CLIENT_SECRET`，因此 FedEx API 端到端验收仍阻塞于官方凭证或可用出口。
-- 生产切换待执行；停滞阈值未配置时按规则报告 `N/A`，不生成事实性停滞判断。
+- 生产已切换到合并版本 `a8e3548` 对应镜像；容器重启后保持 `healthy`，数据库仍为 146 个订单且完整性 `ok`，鉴权管理 API 返回 146 个订单。管理端口仅绑定服务器 `127.0.0.1:18080`；切换前备份、旧镜像和停止的 `logistics-track-rollback-20260910` 容器已保留。停滞阈值未配置时按规则报告 `N/A`，不生成事实性停滞判断。
 
 ## 2026-09-08：可靠性与服务器发布准备
 
