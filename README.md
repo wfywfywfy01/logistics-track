@@ -20,7 +20,7 @@
 ```
 
 - 台账唯一：`data/shipments.db`。旧 JSON 在首次启动时幂等迁移。消息、OCR、工作任务和通知均使用持久队列与租约。
-- 官网抓取用 `patchright` 有头 Chromium（窗口移出屏幕 / 容器内 Xvfb）拦截官方 JSON 接口。FedEx 配置 `FEDEX_CLIENT_ID/FEDEX_CLIENT_SECRET` 后优先走官方 Track API；页面通道仅作兜底。
+- 官网抓取用 `patchright` 有头 Chromium（窗口移出屏幕 / 容器内 Xvfb）拦截官方 JSON 接口。FedEx 与 DHL 使用同一模式，无需 API 凭据；可用 `FEDEX_PROXY` 单独指定 FedEx 出口。
 - 运单绑定带版本，旧运单结果不得覆盖新绑定；承运商未知状态保持未知，不猜测为运输中。
 - 一单支持多个包裹；单个包裹签收时订单为“部分签收”，全部包裹签收后才为“签收”。
 - 工作台提供订单、详情、异常待办、通知回执和运营日报。所有写操作记录操作者与原因。
@@ -86,7 +86,7 @@ ssh -L 8080:127.0.0.1:8080 <server>
 
 浏览器打开 `http://127.0.0.1:8080/orders`，Basic Auth 用户名为 `admin`，密码为 `ADMIN_TOKEN`。停滞阈值分别由 `STALL_HOURS_UPS/DHL/FEDEX` 配置；缺少阈值时显示 `N/A` 且不生成停滞结论。
 
-FedEx 生产 API 凭据需在 [FedEx Developer Portal](https://developer.fedex.com/api/en-us/get-started.html) 创建。UPS 页面抓取保留两次独立浏览器重试；如后续申请 UPS OAuth 凭据，可再切换为官方 API 首选。
+FedEx、DHL 和 UPS 均从官网页面获取状态，失败时不会猜测结果。UPS 与 FedEx 页面抓取使用两次独立浏览器会话重试。
 
 或 `cd deploy && docker compose up -d`。容器入口自动：Xvfb → xray 代理 → 看门狗 → 定时巡检（`TRACK_TIMES`）/ 每日对账（`RECONCILE_HOUR`）/ 每周日组织刷新 → 前台 watcher。
 

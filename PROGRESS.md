@@ -2,16 +2,16 @@
 
 ## 2026-09-10：承运商、可靠性与运营工作台
 
-- FedEx 已增加承运商识别、官方页面响应解析和官方 OAuth Track API 首选通道；服务器现有直连及两个代理访问页面 API 均被 Akamai 403，生产跑通仍需 `FEDEX_CLIENT_ID/FEDEX_CLIENT_SECRET` 或可用出口。
+- FedEx 已按 DHL 模式改为有头 Chromium 打开官网详情页并拦截官方 JSON；无需 API 凭据，支持独立出口和新浏览器重试。服务器现有两个代理访问 FedEx 追踪接口均被 Akamai 403。
 - UPS 增加独立浏览器会话重试；候选镜像在服务器通过真实脱敏样本返回 `ok=true / 签收`。
 - 重复预报保留绑定版本与历史，冲突进入审核；所有状态与配对改为单订单 SQLite 事务更新，旧全量快照不能覆盖新字段。
 - 通知回执绑定状态事件；发送前进入 `unknown`，进程崩溃或超时不自动重复发送。群与私聊统一由持久通知队列处理，同名/离职缓存失效并支持稳定人员 ID。
 - 消息/OCR 完成与后继任务创建置于同一事务；失败原件在结案前不清理。
 - 新增认证运营工作台：订单列表/详情、综合异常待办、重试/认领/结案审计、通知中心和可下钻日报。
 - 新增可配置停滞提醒并区分官网抓取失败；无阈值时为 `N/A`。新增多包裹、换单历史和“部分签收”聚合。
-- 本地证据：`python -m pytest -q` 为 61 passed；`python -m compileall -q .`、`git diff --check` 与 `bash -n deploy/entrypoint.sh` 通过。
+- 本地证据：`python -m pytest -q` 为 62 passed；`python -m compileall -q .`、`git diff --check` 与 `bash -n deploy/entrypoint.sh` 通过。
 - 服务器候选证据：镜像 `logistics-track:candidate-20260910-v2` 构建成功；生产库事务备份副本 `PRAGMA integrity_check=ok`，迁移后 146 个订单；鉴权日报 API 返回同一分母；真实 UPS 运单经服务器代理返回官网“签收”。
-- FedEx 服务器实测：候选代码已进入 FedEx 官网追踪流程，但当前出口未取得官方追踪 JSON；生产环境没有 `FEDEX_CLIENT_ID`/`FEDEX_CLIENT_SECRET`，因此 FedEx API 端到端验收仍阻塞于官方凭证或可用出口。
+- FedEx 服务器实测：官网访客 OAuth 成功，但两个出口的 `/track/v2/shipments` 均明确返回 HTTP 403；台账中两条仅按长度推断的 12 位号码，官网均返回“找不到该运单”。端到端业务验收仍需可用 FedEx 出口和一条已确认的真实 FedEx 运单。
 - 生产已切换到合并版本 `a8e3548` 对应镜像；容器重启后保持 `healthy`，数据库仍为 146 个订单且完整性 `ok`，鉴权管理 API 返回 146 个订单。管理端口仅绑定服务器 `127.0.0.1:18080`；切换前备份、旧镜像和停止的 `logistics-track-rollback-20260910` 容器已保留。停滞阈值未配置时按规则报告 `N/A`，不生成事实性停滞判断。
 
 ## 2026-09-08：可靠性与服务器发布准备
