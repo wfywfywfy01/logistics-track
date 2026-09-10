@@ -19,6 +19,7 @@
 - 运营工作台版本已通过 PR #4 合并为 `8be3394` 并发布。服务器镜像 `sha256:d113821c…` 为 `healthy`、重启数 0；数据库 146 个订单、完整性 `ok`，鉴权日报分母为 146，数据过期阈值显示 `N/A`。切换前一致性备份为 `/app/backups/logistics-backup-20260910-181601.zip`，旧服务保留为 `logistics-track-rollback-workbench-20260910`。
 - 可视化权限版本已通过 PR #5 合并为 `aa87518` 并发布。服务器镜像 `sha256:bdcb82fa…` 为 `healthy`、重启数 0；生产验证 `admin` 角色可用、密码哈希未泄露、权限 API 不返回哈希，数据库仍为 146 个订单且完整性 `ok`。切换前备份为 `/app/backups/logistics-backup-20260910-183334.zip`，旧服务保留为 `logistics-track-rollback-rbac-20260910`。
 - 可视化登录会话已通过 PR #6 合并为 `c7d9e8b` 并发布。服务器镜像 `sha256:aaeb3f3c…` 为 `healthy`、重启数 0；生产登录、会话 Cookie、退出验证通过，数据库仍为 146 个订单且完整性 `ok`。切换前备份为 `/app/backups/logistics-backup-20260910-220619.zip`，旧服务保留为 `logistics-track-rollback-sessions-20260910`。
+- 健康检查与备份保留版本已通过 PR #7 合并为 `97ecfa0` 并发布。服务器镜像 `sha256:f45df371…` 为 `healthy`、重启数 0；`/healthz`、生产备份、146 单和数据库完整性均通过。切换前备份为 `/app/backups/logistics-backup-20260910-222406.zip`，旧服务保留为 `logistics-track-rollback-health-20260910`。清理仅限本项目过期容器和镜像后，主机磁盘占用从 88% 降至 86%。
 
 ## 2026-09-08：可靠性与服务器发布准备
 
