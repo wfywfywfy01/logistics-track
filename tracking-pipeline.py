@@ -611,7 +611,7 @@ def main():
     elif args.cmd == "package-update":
         result = package_update(args.order, args.tracking, args.status, args.detail,
                                 args.observed_at, args.binding_version)
-        rc = 2 if result.get("error") or result.get("reason") else 0
+        rc = 2 if result.get("error") or result.get("reason") in ("unknown status", "stale binding") else 0
         print(json.dumps(result, ensure_ascii=False))
     elif args.cmd == "list": print(json.dumps(list_cmd(args.need_review), ensure_ascii=False))
     elif args.cmd == "notify":
