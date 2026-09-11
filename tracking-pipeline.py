@@ -344,7 +344,9 @@ def package_update(order, tracking, status, detail="", observed_at=None, binding
                         for event in item.get("binding_history") or [])
             outcome.update({"changed": False, "reason": "stale binding" if stale else "package not found"})
             return shipment, []
-        if binding_version is not None and int(binding_version) != int(package.get("binding_version") or 0):
+        reported_version = int(binding_version) if binding_version is not None else 0
+        bound_version = int(package.get("binding_version") or 0)
+        if reported_version and bound_version and reported_version != bound_version:
             outcome.update({"changed": False, "reason": "stale binding"}); return shipment, []
         if normalized is None:
             outcome.update({"changed": False, "reason": "unknown status"}); return shipment, []
@@ -406,7 +408,8 @@ def _track_update(order, status, detail="", observed_at=None, tracking=None,
         reason = None
         if ns is None:
             reason = "unknown status"
-        elif binding_version is not None and int(binding_version) != int(it.get("binding_version") or 0):
+        elif binding_version is not None and int(binding_version) and int(it.get("binding_version") or 0) \
+                and int(binding_version) != int(it.get("binding_version") or 0):
             reason = "stale binding"
         elif tracking and tracking not in (it.get("intl"), it.get("alt_intl")):
             reason = "stale binding"

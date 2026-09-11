@@ -52,6 +52,32 @@ def test_package_status_does_not_move_backwards(monkeypatch, tmp_path):
     assert pipeline.STORE.get_shipment("XSD1")["packages"][0]["status"] == "运输中"
 
 
+def test_legacy_unversioned_package_accepts_version_zero(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "已预报",
+        "intl": "1Z1234567890", "history": [], "products": []})
+
+    result = pipeline.package_update("XSD1", "1Z1234567890", "运输中",
+                                     observed_at="2026-09-10T01:00:00+00:00",
+                                     binding_version=0)
+
+    assert result["changed"] is True
+    assert result["status"] == "运输中"
+
+
+def test_mismatched_binding_version_is_still_rejected(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "已预报",
+        "intl": "1Z1234567890", "binding_version": 2, "history": [], "products": []})
+
+    result = pipeline.package_update("XSD1", "1Z1234567890", "运输中",
+                                     observed_at="2026-09-10T01:00:00+00:00",
+                                     binding_version=1)
+
+    assert result["changed"] is False
+    assert result["reason"] == "stale binding"
+
+
 def test_legacy_alternate_package_detects_its_own_carrier(monkeypatch, tmp_path):
     pipeline = load_pipeline(monkeypatch, tmp_path)
     shipment = {"orderNo": "XSD1", "intl": "1Z999AA10123456784",
