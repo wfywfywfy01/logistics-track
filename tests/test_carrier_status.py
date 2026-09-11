@@ -83,6 +83,33 @@ def test_fedex_uses_official_page_without_api_credentials(monkeypatch):
     assert len(calls) == 2
 
 
+def test_fedex_dom_status_parsed_when_api_blocked():
+    from fedex_track import parse_dom_status, page_failure
+
+    body = ("DELIVERED\nThursday, 9/10/2026 at 10:45 AM\nMEMPHIS, TN US\n"
+            "Package delivered to recipient")
+    result = parse_dom_status("876543210123", body)
+
+    assert result["ok"] is True
+    assert result["stage"] == "签收"
+    assert result["source"] == "dom"
+    assert "MEMPHIS" in result["detail"]
+
+    # 403 on the API endpoint alone no longer hides rendered page data
+    assert page_failure("876543210123", [403], body)["ok"] is True
+
+
+def test_fedex_dom_status_prefers_heading_over_scan_history():
+    from fedex_track import dom_status_hint
+
+    body = ("DELIVERED\nWednesday, 9/9/2026\nANCHORAGE, AK\n"
+            "IN TRANSIT\nTuesday, 9/8/2026\nMEMPHIS, TN")
+
+    assert dom_status_hint(body) == ("签收", "DELIVERED")
+    assert dom_status_hint("no carrier text here") is None
+    assert dom_status_hint("") is None
+
+
 def test_fedex_page_failure_distinguishes_not_found_from_access_denied():
     from fedex_track import page_failure
 

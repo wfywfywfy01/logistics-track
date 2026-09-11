@@ -18,6 +18,8 @@ def apply_results(store, runner=run_pipeline):
     ledger = store.get_shipments()
     applied = failed = 0
     for order, result in results.items():
+        if not result.get("ok") and not (result.get("package_results") or {}):
+            continue
         tracking = result.get("tracking") or ledger.get(order, {}).get("intl") or (sales.get(order) or {}).get("intl")
         if order not in ledger and tracking:
             code, output = runner(["ingest-pair", "--order", order, "--intl", tracking])

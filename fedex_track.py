@@ -61,7 +61,61 @@ def parse_tracking_response(tracking, payload):
             "status_en": description, "detail": detail}
 
 
+DOM_STAGES = (
+    ("OUT FOR DELIVERY", "运输中"),
+    ("IN TRANSIT", "运输中"),
+    ("DELIVERED", "签收"),
+    ("DELIVERY EXCEPTION", "异常"),
+    ("SHIPMENT EXCEPTION", "异常"),
+    ("CLEARANCE IN PROGRESS", "清关中"),
+    ("AVAILABLE FOR CLEARANCE", "清关中"),
+    ("CLEARANCE DELAY", "清关中"),
+    ("LABEL CREATED", "已出国际单"),
+    ("SHIPMENT INFORMATION SENT TO FEDEX", "已出国际单"),
+    ("PICKED UP", "已出国际单"),
+    ("RETURNED TO SHIPPER", "退回"),
+    ("RETURNING TO SHIPPER", "退回"),
+)
+
+
+def dom_status_hint(body):
+    """Map rendered FedEx page text to a stage; earliest match wins
+    (the status heading appears before scan-history rows)."""
+    if not body:
+        return None
+    upper = str(body).upper()
+    best = None
+    for phrase, stage in DOM_STAGES:
+        pos = upper.find(phrase)
+        if pos >= 0 and (best is None or pos < best[0]):
+            best = (pos, stage, phrase)
+    if not best:
+        return None
+    return best[1], best[2]
+
+
+def parse_dom_status(tracking, body):
+    """Fall back to the rendered FedEx page when the API payload is blocked."""
+    if not body or not str(body).strip():
+        return None
+    hint = dom_status_hint(body)
+    if not hint:
+        return None
+    stage, phrase = hint
+    lines = [line.strip() for line in str(body).splitlines() if line.strip()]
+    detail = ""
+    for index, line in enumerate(lines):
+        if phrase in line.upper():
+            detail = " | ".join(lines[index + 1:index + 5])[:200]
+            break
+    return {"tracking": tracking, "ok": True, "stage": stage,
+            "status_en": phrase, "detail": detail or phrase, "source": "dom"}
+
+
 def page_failure(tracking, statuses, body):
+    dom = parse_dom_status(tracking, body)
+    if dom:
+        return dom
     if 403 in statuses:
         return {"tracking": tracking, "ok": False,
                 "error": "FedEx official site access denied (HTTP 403)"}
@@ -104,12 +158,22 @@ def _track_once(tracking, timeout_nav, wait_ms, proxy):
             page.goto("https://www.fedex.com/wtrk/track/?trknbr=" + quote(str(tracking)),
                       timeout=timeout_nav, wait_until="domcontentloaded")
             deadline = time.time() + wait_ms / 1000
+            body = ""
             while time.time() < deadline and not responses:
                 page.wait_for_timeout(500)
-            body = page.locator("body").inner_text() if not responses else ""
+                try:
+                    body = page.locator("body").inner_text() or ""
+                except Exception:
+                    body = ""
+                lower = body.lower()
+                if dom_status_hint(body) or "can't find that tracking number" in lower or \
+                        "tracking number cannot be found" in lower:
+                    break
         finally:
             browser.close()
-    return responses[0] if responses else page_failure(tracking, statuses, body)
+    if responses:
+        return responses[0]
+    return page_failure(tracking, statuses, body)
 
 
 def track_fedex(tracking, timeout_nav=60000, wait_ms=25000, proxy=None, attempts=2):

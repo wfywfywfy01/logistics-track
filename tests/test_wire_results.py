@@ -16,3 +16,15 @@ def test_package_results_are_applied_individually(tmp_path):
 
     assert result == {"applied": 1, "failed": 0}
     assert calls[0][:5] == ["package-update", "--order", "XSD1", "--tracking", "A"]
+
+
+def test_failed_result_for_missing_order_is_skipped_not_reingested(tmp_path):
+    store = Storage(tmp_path)
+    store.put_document("ups_results", {"XSD-GHOST": {
+        "tracking": "1ZC23W53D41751825", "ok": False, "error": "unknown carrier"}})
+    calls = []
+
+    result = apply_results(store, lambda args: (calls.append(args) or (0, "ok")))
+
+    assert result == {"applied": 0, "failed": 0}
+    assert calls == []
