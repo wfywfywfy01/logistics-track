@@ -1,5 +1,14 @@
 # 生产化进度
 
+## 2026-09-11：采用评审 + 线上数据与管线修复
+
+- 评审结论：线上镜像 `f45df371` 与 master `bde441e` 一致，SQLite 台账 146 单已迁移、完整性 `ok`，新版整体可靠，采用并继续演进。
+- 数据清理：台账中两条 OCR 误读幽灵订单（XSD260801141252 / XSD26080903141532，单号缺位）连同 `shipments.json` 旧源与 `ups_results` 残留一并清除，台账 146→144；切换前备份 `logistics-backup-20260911-preswitch.zip` 与 `manual-cleanup-20260911.db` 保留。
+- FedEx 增加页面 DOM 兜底：`/track/v2/shipments` 被 Akamai 403 时，从渲染页文本识别官网状态词（最早命中优先），官网返回“找不到该运单”仍走 not_found。仍缺一条可确认的真实 FedEx 运单做端到端验收。
+- 修复绑定版本语义：无 `binding_version` 的历史订单（track 侧传 0、台账侧合成 1）不再误判 `stale binding`，回填从 4/28 恢复到 28/28；`package-update` 退出码与 `track-update` 对齐，终态/停滞等良性 no-op 不再拉红 `wire_results`。
+- 已知待办：`docs +sheet-set-cells` 报“当前会话未绑定企业身份”（本机与容器一致），`sync_sheet` 每日 rc=1 属平台绑定问题，待企业成员身份绑定恢复后自行转绿。
+- 发布：`cdcf302`(DOM 兜底) → `da7ac52`(版本容忍) → `cf490b4`(退出码) 依次构建推送，生产切到 `cf490b4` 对应镜像，`healthy`、重启数 0、台账 144 单、`integrity_check=ok`、`wire_results` applied 28 / failed 0。回滚镜像保留：`rollback-dom1-20260911`、`rollback-binding-20260911`。
+
 ## 2026-09-10：承运商、可靠性与运营工作台
 
 - 可视化后台新增 `admin/operator/viewer` 三档权限和账号管理页；密码使用带随机盐的 PBKDF2 哈希，CSRF 使用独立随机密钥，写操作以登录账号审计，账号变更与审计原子提交。只读账号不显示操作入口；`admin` 是由 `ADMIN_TOKEN` 管理的应急账号，重启时支持密码轮换且不可停用。
