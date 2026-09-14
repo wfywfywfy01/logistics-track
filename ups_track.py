@@ -41,6 +41,10 @@ def parse_tracking_response(tn, payload):
                    if str(item.get("trackingNumber") or "").strip().upper() == wanted), None)
     if not detail:
         return None
+    error_text = detail.get("errorText") or ""
+    if str(detail.get("errorCode") or "") == "504" or "not found" in error_text.lower():
+        return {"tracking": tn, "ok": False, "not_found": True,
+                "error": "UPS tracking number not found"}
     status_type = (detail.get("packageStatusType") or "").upper()
     status_text = detail.get("packageStatus") or ""
     stage = classify_status(status_type, status_text)
@@ -133,7 +137,7 @@ def track_ups(tn, timeout_nav=60000, wait_ms=25000, proxy=None, attempts=2):
         except Exception as error:
             last = {"tracking": tn, "ok": False,
                     "error": type(error).__name__ + ": " + str(error)[:150]}
-        if last.get("ok") or last.get("error") == "unknown UPS status":
+        if last.get("ok") or last.get("not_found") or last.get("error") == "unknown UPS status":
             return last
         if attempt + 1 < attempts:
             time.sleep(attempt + 1)
