@@ -144,6 +144,33 @@ def test_ups_official_response_is_normalized():
     assert "MEMPHIS" in result["detail"]
 
 
+def test_ups_official_not_found_is_not_an_unknown_status():
+    payload = {"trackDetails": [{
+        "trackingNumber": "1Z999AA10123456784",
+        "errorCode": "504",
+        "errorText": "Tracking number not found in database",
+    }]}
+
+    result = ups_track.parse_tracking_response("1Z999AA10123456784", payload)
+
+    assert result["ok"] is False
+    assert result["not_found"] is True
+    assert result["error"] == "UPS tracking number not found"
+
+
+def test_ups_does_not_retry_official_not_found(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ups_track, "_track_once", lambda *_args: calls.append(1) or {
+        "tracking": "1Z999AA10123456784", "ok": False,
+        "not_found": True, "error": "UPS tracking number not found",
+    })
+
+    result = ups_track.track_ups("1Z999AA10123456784", attempts=2)
+
+    assert result["not_found"] is True
+    assert len(calls) == 1
+
+
 def test_ups_drains_response_arriving_at_wait_deadline(monkeypatch):
     payload = {"trackDetails": [{
         "trackingNumber": "1Z999AA10123456784",
