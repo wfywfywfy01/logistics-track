@@ -28,10 +28,19 @@ def cli(args):
         return None
     return out if rc == 0 else None
 
-def cli_json(args):
-    out = cli(args)
-    try: return json.loads(out) if out else None
-    except Exception: return None
+def cli_json(args, timeout=None):
+    try:
+        kwargs = {"timeout": timeout} if timeout is not None else {}
+        rc, out, err = robust.cli_run(args, **kwargs)
+    except Exception as error:
+        raise RuntimeError("CLI failed: " + type(error).__name__) from error
+    detail = " ".join((err or out or "no output").split())[:200]
+    if rc != 0:
+        raise RuntimeError(f"CLI rc={rc}: {detail}")
+    try:
+        return json.loads(out)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError("CLI returned invalid JSON") from error
 
 def load(p, d): return STORE.get_document(p.stem.lstrip("."), d)
 def save(p, o): STORE.put_document(p.stem.lstrip("."), o)
@@ -129,15 +138,37 @@ def fetch_history(channel_id, since_ts):
     """Fetch every page since the persisted high-water time; IDs provide overlap dedupe."""
     page_size = 50
     max_pages = int(os.environ.get("HISTORY_MAX_PAGES") or "100")
+    attempts = min(5, max(1, int(os.environ.get("HISTORY_ATTEMPTS") or "3")))
+    request_timeout = min(60, max(1, int(
+        os.environ.get("HISTORY_REQUEST_TIMEOUT_SECONDS") or "30")))
+    budget = min(300, max(1, int(
+        os.environ.get("HISTORY_BUDGET_SECONDS") or "180")))
+    deadline = time.monotonic() + budget
     latest = since_ts
     for page in range(max_pages):
         args = ["im", "+history", "--channel-id", channel_id,
                 "--date-from", since_ts, "--limit", str(page_size),
                 "--offset", str(page * page_size)]
-        data = cli_json(args)
-        if data is None:
-            raise RuntimeError("history query failed")
-        messages = (data or {}).get("messages", [])
+        data = None
+        for attempt in range(attempts):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"history query budget exhausted page={page}")
+            try:
+                data = cli_json(args, timeout=max(1, min(request_timeout, int(remaining))))
+                if not isinstance(data, dict) or "messages" not in data or \
+                        not isinstance(data["messages"], list):
+                    raise RuntimeError("history response schema invalid")
+                break
+            except RuntimeError as error:
+                if attempt + 1 == attempts:
+                    raise RuntimeError(
+                        f"history query failed page={page} attempts={attempts}: {error}") from error
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f"history query budget exhausted page={page}") from error
+                time.sleep(min(attempt + 1, remaining))
+        messages = data["messages"]
         for message in messages:
             message_id = message.get("id") or "sha256:" + hashlib.sha256(
                 json.dumps(message, ensure_ascii=False, sort_keys=True).encode()

@@ -191,7 +191,7 @@ def test_watcher_processes_distinct_message_with_same_timestamp(monkeypatch, tmp
     watcher = load_watcher(monkeypatch, tmp_path)
     timestamp = "2026-09-08T01:00:00Z"
     message = {"id": "message-2", "created_at": timestamp, "body": "XSD1==1Z1234567890"}
-    monkeypatch.setattr(watcher, "cli_json", lambda args: {"messages": [message]})
+    monkeypatch.setattr(watcher, "cli_json", lambda args, timeout=None: {"messages": [message]})
     processed = []
     monkeypatch.setattr(
         watcher,
@@ -204,6 +204,72 @@ def test_watcher_processes_distinct_message_with_same_timestamp(monkeypatch, tmp
     watcher.watch_once("channel", "bot", timestamp)
 
     assert processed == ["XSD1==1Z1234567890"]
+
+
+def test_watcher_history_retries_same_page_before_advancing(monkeypatch, tmp_path):
+    watcher = load_watcher(monkeypatch, tmp_path)
+    timestamp = "2026-09-08T01:00:00Z"
+    calls, sleeps = [], []
+    replies = [RuntimeError("CLI rc=1: temporary failure"), {
+        "messages": [{"id": "message-1", "created_at": timestamp, "body": "hello"}]
+    }]
+
+    def history(args, timeout=None):
+        calls.append(args)
+        assert 1 <= timeout <= 60
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(watcher, "cli_json", history)
+    monkeypatch.setattr(watcher.time, "sleep", sleeps.append)
+
+    assert watcher.fetch_history("channel", timestamp) == timestamp
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert sleeps == [1]
+
+
+def test_watcher_history_failure_reports_cli_reason(monkeypatch, tmp_path):
+    watcher = load_watcher(monkeypatch, tmp_path)
+    monkeypatch.setattr(watcher.robust, "cli_run", lambda _args: (
+        1, "", "upstream authentication unavailable\n"))
+
+    with pytest.raises(RuntimeError, match="rc=1.*authentication unavailable"):
+        watcher.cli_json(["im", "+history"])
+
+
+def test_watcher_history_retries_invalid_response_schema(monkeypatch, tmp_path):
+    watcher = load_watcher(monkeypatch, tmp_path)
+    replies = [{}, {"messages": []}]
+    monkeypatch.setattr(watcher, "cli_json", lambda _args, timeout=None: replies.pop(0))
+    monkeypatch.setattr(watcher.time, "sleep", lambda _seconds: None)
+
+    assert watcher.fetch_history("channel", "2026-09-08T01:00:00Z") == \
+        "2026-09-08T01:00:00Z"
+    assert replies == []
+
+
+def test_watcher_history_round_has_hard_budget(monkeypatch, tmp_path):
+    watcher = load_watcher(monkeypatch, tmp_path)
+    monkeypatch.setenv("HISTORY_ATTEMPTS", "5")
+    monkeypatch.setenv("HISTORY_BUDGET_SECONDS", "300")
+    monkeypatch.setenv("HISTORY_REQUEST_TIMEOUT_SECONDS", "999")
+    clock = iter((0, 0, 301))
+    monkeypatch.setattr(watcher.time, "monotonic", lambda: next(clock))
+    calls = []
+
+    def unavailable(_args, timeout=None):
+        calls.append(timeout)
+        raise RuntimeError("CLI timed out")
+
+    monkeypatch.setattr(watcher, "cli_json", unavailable)
+    monkeypatch.setattr(watcher.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(RuntimeError, match="budget exhausted"):
+        watcher.fetch_history("channel", "2026-09-08T01:00:00Z")
+    assert calls == [60]
 
 
 def test_ocr_worker_does_not_overwrite_new_inbox_item(monkeypatch, tmp_path):
