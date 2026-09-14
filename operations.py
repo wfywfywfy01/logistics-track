@@ -23,12 +23,24 @@ def refresh_operational_tasks(store, now=None, thresholds=None, freshness_hours=
     reported = {carrier: thresholds.get(carrier, "N/A") for carrier in ("UPS", "DHL", "FEDEX")}
     shipments = store.get_shipments()
     results = store.get_document("ups_results", {})
+    operational_kinds = ("tracking_failure", "tracking_stale", "stalled")
+    operational_orders = {str(row["payload"].get("order") or "") for row in
+                          store.list_tasks(("pending", "retry", "running", "unknown", "dead"),
+                                           limit=100000, kinds=operational_kinds)}
+
+    def clear_operational_tasks(order, reason):
+        for kind in operational_kinds:
+            store.sync_operational_tasks(kind, order, [], reason)
+
     created = []
     for order, shipment in shipments.items():
-        if not shipment.get("intl") and not shipment.get("packages"):
+        configured_packages = shipment.get("packages") or []
+        packages = [item for item in configured_packages if item.get("active", True)]
+        if (configured_packages and not packages) or (not configured_packages and
+                                                       not shipment.get("intl")):
+            clear_operational_tasks(order, "shipment has no active tracking number")
             continue
         result = results.get(order) or {}
-        packages = [item for item in shipment.get("packages") or [] if item.get("active", True)]
         package_results = result.get("package_results") or {}
         if package_results and packages:
             evaluations = []
@@ -45,7 +57,8 @@ def refresh_operational_tasks(store, now=None, thresholds=None, freshness_hours=
         else:
             evaluations = [result]
 
-        failures = stale_results = 0
+        failure_tasks = []
+        stale_tasks = []
         for current in evaluations:
             tracking = current.get("tracking") or shipment.get("intl")
             carrier = current.get("carrier") or detect_carrier(tracking, shipment.get("carrier"))
@@ -54,28 +67,29 @@ def refresh_operational_tasks(store, now=None, thresholds=None, freshness_hours=
                 reason = ("official tracking failed" if not current.get("ok") else
                           "official tracking observation time unavailable")
                 error = current.get("error") or ("observed_at is missing" if observed_value == "N/A" else "N/A")
-                store.enqueue_task(
-                    "tracking_failure", f"tracking-failure:{order}:{tracking}:{observed_value}", {
-                        "order": order, "tracking": tracking or "N/A", "carrier": carrier or "N/A",
-                        "reason": reason, "observed_at": observed_value, "error": error})
-                created.append((order, "tracking_failure")); failures += 1
+                failure_tasks.append((f"tracking-failure:{order}:{tracking or 'N/A'}", {
+                    "order": order, "tracking": tracking or "N/A", "carrier": carrier or "N/A",
+                    "reason": reason, "observed_at": observed_value, "error": error}))
+                created.append((order, "tracking_failure"))
                 continue
             result_observed = _datetime(observed_value)
             package_terminal = current.get("stage") in ("签收", "退回")
             if (not package_terminal and freshness_hours is not None and
                     (now - result_observed).total_seconds() >= freshness_hours * 3600):
-                store.enqueue_task("tracking_stale", f"tracking-stale:{order}:{tracking}:{observed_value}", {
+                stale_tasks.append((f"tracking-stale:{order}:{tracking or 'N/A'}", {
                     "order": order, "tracking": tracking or "N/A", "carrier": carrier or "N/A",
                     "reason": "official tracking data is stale", "observed_at": observed_value,
-                    "threshold_hours": freshness_hours})
-                created.append((order, "tracking_stale")); stale_results += 1
+                    "threshold_hours": freshness_hours}))
+                created.append((order, "tracking_stale"))
 
-        if not failures:
-            store.resolve_tasks("tracking_failure", order, "official tracking recovered")
-        if not stale_results:
-            store.resolve_tasks("tracking_stale", order, "tracking data is current or shipment is terminal")
-        if failures or stale_results:
-            store.resolve_tasks("stalled", order, "tracking unavailable or stale; stall decision blocked")
+        store.sync_operational_tasks(
+            "tracking_failure", order, failure_tasks, "official tracking recovered")
+        store.sync_operational_tasks(
+            "tracking_stale", order, stale_tasks,
+            "tracking data is current or shipment is terminal")
+        if failure_tasks or stale_tasks:
+            store.sync_operational_tasks(
+                "stalled", order, [], "tracking unavailable or stale; stall decision blocked")
             continue
 
         carrier = result.get("carrier") or detect_carrier(shipment.get("intl"), shipment.get("carrier"))
@@ -83,16 +97,23 @@ def refresh_operational_tasks(store, now=None, thresholds=None, freshness_hours=
         threshold = thresholds.get(carrier)
         changed_at = _datetime(shipment.get("status_observed_at"))
         if threshold is None or changed_at is None or terminal:
-            store.resolve_tasks("stalled", order, "stall condition cleared or unavailable")
+            store.sync_operational_tasks(
+                "stalled", order, [], "stall condition cleared or unavailable")
             continue
         if (now - changed_at).total_seconds() >= threshold * 3600:
             key = f"stalled:{order}:{shipment.get('status_observed_at')}"
-            store.enqueue_task("stalled", key, {"order": order, "carrier": carrier,
+            store.sync_operational_tasks("stalled", order, [(key, {
+                "order": order, "carrier": carrier,
                 "tracking": shipment.get("intl"), "reason": "logistics status has not moved",
-                "last_status_at": shipment.get("status_observed_at"), "threshold_hours": threshold})
+                "last_status_at": shipment.get("status_observed_at"),
+                "threshold_hours": threshold})], "logistics status moved within threshold")
             created.append((order, "stalled"))
         else:
-            store.resolve_tasks("stalled", order, "logistics status moved within threshold")
+            store.sync_operational_tasks(
+                "stalled", order, [], "logistics status moved within threshold")
+    for order in operational_orders - set(shipments):
+        if order:
+            clear_operational_tasks(order, "shipment no longer exists")
     return {"created": created, "thresholds": reported,
             "freshness_threshold_hours": freshness_hours if freshness_hours is not None else "N/A"}
 

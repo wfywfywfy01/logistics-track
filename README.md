@@ -96,6 +96,8 @@ ssh -L 8080:127.0.0.1:8080 <server>
 
 停滞阈值分别由 `STALL_HOURS_UPS/DHL/FEDEX` 配置，数据过期阈值由 `TRACKING_DATA_MAX_AGE_HOURS` 配置；缺少阈值时显示 `N/A` 且不生成对应结论。
 
+OCR 进程超时、退出异常或返回损坏数据时最多按 `OCR_MAX_ATTEMPTS` 重试，默认 3 次；OCR 正常完成但无法得到完整订单与运单配对时，原件直接进入工作台“人工审核”，不重复消耗识别资源。云表格同步依赖企业成员身份，失败会保留错误日志，但不再回滚已经完成的物流抓取、台账回填、备份和通知。
+
 FedEx、DHL 和 UPS 均从官网页面获取状态，失败时不会猜测结果。UPS 与 FedEx 页面抓取使用两次独立浏览器会话重试。
 
 或 `cd deploy && docker compose up -d`。容器入口自动：Xvfb → xray 代理 → 看门狗 → 定时巡检（`TRACK_TIMES`）/ 每日对账（`RECONCILE_HOUR`）/ 每周日组织刷新 → 前台 watcher。

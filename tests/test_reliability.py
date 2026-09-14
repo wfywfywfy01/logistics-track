@@ -38,6 +38,14 @@ def load_auto_track(monkeypatch, tmp_path):
     return module
 
 
+def load_ocr_label(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOGIBOT_DATA_DIR", str(tmp_path))
+    spec = importlib.util.spec_from_file_location("ocr_label_test", ROOT / "ocr_label.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_pipeline_recovers_corrupt_ledger_from_backup(monkeypatch, tmp_path):
     ledger = tmp_path / "shipments.json"
     ledger.write_text("{broken", encoding="utf-8")
@@ -160,7 +168,89 @@ def test_ocr_worker_does_not_overwrite_new_inbox_item(monkeypatch, tmp_path):
 
     assert auto_track.main() == 0
     states = {item["id"]: item["status"] for item in auto_track.STORE.get_inbox()}
-    assert states == {"label-1": "succeeded", "label-2": "retry"}
+    assert states == {"label-1": "succeeded", "label-2": "succeeded"}
+    assert auto_track.STORE.pending_task_count("review") == 1
+
+
+def test_ocr_without_complete_pair_goes_to_review_without_retry(monkeypatch, tmp_path):
+    auto_track = load_auto_track(monkeypatch, tmp_path)
+    image = tmp_path / "unclear.png"
+    image.write_bytes(b"fixture")
+    auto_track.STORE.enqueue_inbox(
+        "label-unclear", {"name": "unclear.png", "path": str(image)}
+    )
+    result = types.SimpleNamespace(
+        returncode=2,
+        stdout=json.dumps({"ok": True, "pairs": [], "ingested": []}).encode(),
+    )
+    monkeypatch.setattr(auto_track.subprocess, "run", lambda *args, **kwargs: result)
+    monkeypatch.setattr(auto_track, "run", lambda *args: True)
+    options = types.SimpleNamespace(queued_only=False, skip_track=True, mode="incremental",
+                                    channel_id="channel", bot_app_id="bot")
+
+    assert auto_track.execute(options) == 0
+    inbox = auto_track.STORE.get_inbox()[0]
+    reviews = auto_track.STORE.list_tasks(("pending",), kinds=("review",))
+    assert inbox["status"] == "succeeded"
+    assert inbox["attempts"] == 1
+    assert len(reviews) == 1
+    assert reviews[0]["payload"]["source_inbox_id"] == "label-unclear"
+
+
+def test_partial_ocr_result_queues_success_and_reuses_pair_review(monkeypatch, tmp_path):
+    auto_track = load_auto_track(monkeypatch, tmp_path)
+    image = tmp_path / "mixed.png"
+    image.write_bytes(b"fixture")
+    auto_track.STORE.enqueue_inbox("label-mixed", {"name": "mixed.png", "path": str(image)})
+    auto_track.STORE.enqueue_task("review", "pair-review:XSD2:1Z2", {
+        "reason": "unknown order", "order": "XSD2", "intl": "1Z2"})
+    result = types.SimpleNamespace(returncode=2, stdout=json.dumps({
+        "ok": False,
+        "retryable": False,
+        "pairs": [["XSD1", "1Z1"], ["XSD2", "1Z2"]],
+        "ingested": [
+            {"order": "XSD1", "intl": "1Z1", "ok": True},
+            {"order": "XSD2", "intl": "1Z2", "ok": False},
+        ],
+    }).encode())
+    monkeypatch.setattr(auto_track.subprocess, "run", lambda *args, **kwargs: result)
+    monkeypatch.setattr(auto_track, "run", lambda *args: True)
+    options = types.SimpleNamespace(queued_only=False, skip_track=True, mode="incremental",
+                                    channel_id="channel", bot_app_id="bot")
+
+    assert auto_track.execute(options) == 0
+    assert auto_track.STORE.get_inbox()[0]["status"] == "succeeded"
+    assert auto_track.STORE.pending_task_count("pipeline") == 0
+    assert len(auto_track.STORE.list_tasks(("pending",), kinds=("review",))) == 1
+    assert auto_track.STORE.task_counts()["pipeline"]["succeeded"] == 1
+
+
+def test_ocr_cli_marks_provider_failure_as_retryable(monkeypatch, tmp_path, capsys):
+    ocr = load_ocr_label(monkeypatch, tmp_path)
+    image = tmp_path / "label.png"
+    image.write_bytes(b"fixture")
+    monkeypatch.setattr(ocr, "ocr_image", lambda _path: (_ for _ in ()).throw(
+        TimeoutError("provider timeout")))
+    monkeypatch.setattr(ocr, "time_sleep", lambda _seconds: None)
+    monkeypatch.setattr(sys, "argv", ["ocr_label.py", "--image", str(image)])
+
+    assert ocr.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["retryable"] is True
+    assert "TimeoutError" in payload["error"]
+
+
+def test_ocr_cli_marks_readable_image_without_pair_for_review(monkeypatch, tmp_path, capsys):
+    ocr = load_ocr_label(monkeypatch, tmp_path)
+    image = tmp_path / "label.png"
+    image.write_bytes(b"fixture")
+    monkeypatch.setattr(ocr, "ocr_image", lambda _path: "没有可识别的订单号和运单号")
+    monkeypatch.setattr(ocr, "time_sleep", lambda _seconds: None)
+    monkeypatch.setattr(sys, "argv", ["ocr_label.py", "--image", str(image)])
+
+    assert ocr.main() == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["retryable"] is False
 
 
 def test_failed_pipeline_task_remains_retryable(monkeypatch, tmp_path):
@@ -173,6 +263,24 @@ def test_failed_pipeline_task_remains_retryable(monkeypatch, tmp_path):
 
     assert auto_track.main() == 1
     assert auto_track.STORE.pending_task_count("pipeline") == 1
+
+
+def test_sheet_sync_failure_does_not_fail_completed_pipeline(monkeypatch, tmp_path):
+    auto_track = load_auto_track(monkeypatch, tmp_path)
+    auto_track.STORE.enqueue_task("pipeline", "pipeline:message-1", {})
+    calls = []
+
+    def run(args, _description):
+        calls.append(args[0])
+        return args[0] != "sync_sheet.py"
+
+    monkeypatch.setattr(auto_track, "run", run)
+    options = types.SimpleNamespace(queued_only=True, skip_track=True, mode="incremental",
+                                    channel_id="channel", bot_app_id="bot")
+
+    assert auto_track.execute(options) == 0
+    assert "sync_sheet.py" in calls
+    assert auto_track.STORE.task_counts()["pipeline"]["succeeded"] == 1
 
 
 def test_duplicate_forecast_preserves_binding_and_queues_conflict_review(monkeypatch, tmp_path):
