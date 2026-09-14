@@ -32,6 +32,40 @@ def classify_status(status_type, description):
     if "void" in en: return "退回"
     return None
 
+
+def parse_tracking_response(tn, payload):
+    if not isinstance(payload, dict):
+        return None
+    wanted = str(tn).strip().upper()
+    detail = next((item for item in (payload.get("trackDetails") or [])
+                   if str(item.get("trackingNumber") or "").strip().upper() == wanted), None)
+    if not detail:
+        return None
+    status_type = (detail.get("packageStatusType") or "").upper()
+    status_text = detail.get("packageStatus") or ""
+    stage = classify_status(status_type, status_text)
+    if not stage:
+        return {"tracking": tn, "ok": False, "error": "unknown UPS status",
+                "status_en": status_text}
+    milestones = detail.get("milestones") or []
+    latest = next((item for item in milestones if item.get("isCurrent")), None)
+    if not latest and milestones:
+        latest = milestones[-1]
+    latest_text = ""
+    if latest:
+        latest_text = f"{latest.get('date','')} {latest.get('time','')} " \
+                      f"{latest.get('location','')} {latest.get('name','')}".strip()
+    return {
+        "tracking": tn, "ok": True, "stage": stage,
+        "status_en": status_text,
+        "progress": detail.get("progressBarPercentage", ""),
+        "received_by": detail.get("receivedBy") or "",
+        "detail": latest_text,
+        "milestones": [{"date": item.get("date"), "time": item.get("time"),
+                        "loc": item.get("location"), "name": item.get("name")}
+                       for item in milestones],
+    }
+
 def _track_once(tn, timeout_nav, wait_ms, proxy):
     """proxy: SOCKS5 代理 URL, 形如 socks5://user:pass@host:port。
     不传则读环境变量 UPS_PROXY。中国数据中心出口直连会被 UPS 的 Akamai 杀 HTTP2,
@@ -47,18 +81,23 @@ def _track_once(tn, timeout_nav, wait_ms, proxy):
             kw["proxy"] = {"server": proxy}
         ctx = b.new_context(**kw)
         pg = ctx.new_page()
-        got = {}
+        responses, parse_errors = [], []
         def on_resp(r):
-            if "GetStatus" in r.url and "requestedTrackingNumber" not in got:
-                try:
-                    d = r.json()
-                    tds = d.get("trackDetails") or []
-                    for td in tds:
-                        if td.get("trackingNumber") == tn:
-                            got["data"] = td
-                except Exception:
-                    pass
+            if "GetStatus" in r.url:
+                responses.append(r)
         pg.on("response", on_resp)
+        result, processed = None, 0
+
+        def drain_responses():
+            nonlocal result, processed
+            while processed < len(responses) and not result:
+                response = responses[processed]
+                processed += 1
+                try:
+                    result = parse_tracking_response(tn, response.json())
+                except Exception as error:
+                    parse_errors.append(type(error).__name__)
+
         try:
             pg.goto(f"https://www.ups.com/track?tracknum={tn}&loc=en_US",
                     timeout=timeout_nav, wait_until="domcontentloaded")
@@ -68,36 +107,20 @@ def _track_once(tn, timeout_nav, wait_ms, proxy):
                     if el and el.is_visible(): el.click(); pg.wait_for_timeout(1000); break
                 except Exception: pass
             deadline = time.time() + wait_ms / 1000
-            while time.time() < deadline and "data" not in got:
+            while time.time() < deadline and not result:
+                drain_responses()
+                if result:
+                    break
                 pg.wait_for_timeout(1000)
+            drain_responses()
         finally:
             b.close()
-    td = got.get("data")
-    if not td:
-        return {"tracking": tn, "ok": False, "error": "no GetStatus data"}
-    st_type = (td.get("packageStatusType") or "").upper()
-    en = (td.get("packageStatus") or "").lower()
-    stage = classify_status(st_type, en)
-    if not stage:
-        return {"tracking": tn, "ok": False, "error": "unknown UPS status",
-                "status_en": td.get("packageStatus", "")}
-    milestones = td.get("milestones") or []
-    latest = ""
-    for m in milestones:
-        if m.get("isCurrent"):
-            latest = f"{m.get('date','')} {m.get('time','')} {m.get('location','')} {m.get('name','')}".strip()
-            break
-    if not latest and milestones:
-        m = milestones[-1]
-        latest = f"{m.get('date','')} {m.get('time','')} {m.get('location','')} {m.get('name','')}".strip()
-    return {
-        "tracking": tn, "ok": True, "stage": stage,
-        "status_en": td.get("packageStatus", ""),
-        "progress": td.get("progressBarPercentage", ""),
-        "received_by": td.get("receivedBy") or "",
-        "detail": latest,
-        "milestones": [{"date": m.get("date"), "time": m.get("time"), "loc": m.get("location"), "name": m.get("name")} for m in milestones],
-    }
+    if result:
+        return result
+    if parse_errors:
+        return {"tracking": tn, "ok": False,
+                "error": "UPS response parse failed: " + parse_errors[-1]}
+    return {"tracking": tn, "ok": False, "error": "no GetStatus data"}
 
 
 def track_ups(tn, timeout_nav=60000, wait_ms=25000, proxy=None, attempts=2):
