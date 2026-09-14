@@ -1,9 +1,11 @@
 # 生产化进度
 
-## 2026-09-14：UPS 官方未找到状态候选
+## 2026-09-14：UPS 官方未找到状态与发布
 
 - UPS 官网 `trackDetails.errorCode=504` 或明确的未找到文本现在归类为 `not_found`，不再误报未知状态，也不进行无效浏览器重试；与 FedEx 的官网未找到语义一致。
 - 本地验证：UPS 未找到归类和不重试回归测试通过；全量 `python -m pytest -q` 为 124 passed / 1 个 Linux 专用测试跳过，编译、入口脚本语法和 diff 检查通过。
+- PR #15 已合并为 `a2ea9a1` 并发布；生产镜像 manifest 为 `f0ee704d5399…`，容器 `healthy`、重启数 0、数据库 144 单且 `integrity_check=ok`。
+- 发布后对 UPS 官网明确未找到响应复测，返回 `not_found=true` 且无第二次浏览器重试；切换前备份 `/app/backups/logistics-backup-20260914-175633.zip`，旧容器 `logistics-track-rollback-ups-notfound-20260914` 与旧镜像 `logistics-track:rollback-ups-notfound-20260914` 保留。
 
 ## 2026-09-14：IM 历史查询稳定性与发布
 
