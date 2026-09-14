@@ -1,5 +1,12 @@
 # 生产化进度
 
+## 2026-09-14：承运商响应稳定性候选
+
+- UPS 与 FedEx 的浏览器响应回调只收集官方响应对象，JSON 读取和状态归一化移到页面等待循环，避免同步 Playwright API 在回调重入时抛错后被吞掉；解析异常现在保留错误类型，不再统一误报为官网无数据。
+- UPS 官方响应归一化独立成纯函数，运单号匹配忽略大小写和首尾空白；未知状态继续失败关闭。
+- 本地验证：`python -m pytest -q` 为 114 passed；新增末尾响应排空与 FedEx DOM 优先级回归测试；`python -m compileall -q .`、`bash -n deploy/entrypoint.sh`、`git diff --check` 通过。
+- 服务器候选烟测：通过生产容器实际 Xray 代理访问 UPS 官网，脱敏历史真实样本返回 `ok=true / 签收` 且包含轨迹详情。FedEx 仍缺已确认的真实运单，当前只完成官方响应解析单测，不能记为端到端通过。
+
 ## 2026-09-14：稳定性恢复候选
 
 - 云表格同步改为非核心步骤；企业身份未绑定时保留失败日志，但不再把已完成的物流抓取、台账回填、备份和通知任务打回重试。
@@ -8,6 +15,8 @@
 - 每日对账和管理员私信新增 pipeline 待执行/终止、OCR、人工审核、官网异常与物流停滞数量，官网抓取异常和物流停滞分开统计。
 - 本地验证：`python -m pytest -q` 为 111 passed；`python -m compileall -q .`、`bash -n deploy/entrypoint.sh`、`git diff --check` 通过；独立复审无剩余 Critical/Important。
 - 生产库备份副本演练：变更前 tracking_failure 活动项 166，连续两次 refresh 后稳定为 21；订单数保持 144，`PRAGMA integrity_check=ok`。线上切换证据将在发布后补记。
+- PR #8 已合并为 `dcbe640` 并发布。生产镜像 manifest 为 `3156364752ae…`，容器 `healthy`、重启数 0、共享内存 1 GiB、数据库 144 单且 `integrity_check=ok`；切换前备份 `/app/backups/logistics-backup-20260914-154704.zip`，回滚容器 `logistics-track-rollback-stability-20260914` 保留。
+- 发布后清理并审计重试 3 个由旧容器遗留租约的 pipeline 任务，增量管线完整跑通：官网结果回填 16 / 失败 0、运营任务刷新、通知、备份均完成；云表格仍因企业身份未绑定返回 rc=1，但不再拖垮核心管线。
 
 ## 2026-09-11：采用评审 + 线上数据与管线修复
 

@@ -139,27 +139,38 @@ def _track_once(tracking, timeout_nav, wait_ms, proxy):
             options["proxy"] = {"server": proxy}
         context = browser.new_context(**options)
         page = context.new_page()
-        responses, statuses = [], []
+        responses, statuses, raw_responses, parse_errors = [], [], [], []
 
         def receive(response):
             parsed_url = urlsplit(response.url)
             if parsed_url.netloc != "api.fedex.com" or parsed_url.path != "/track/v2/shipments":
                 return
             statuses.append(response.status)
-            try:
-                parsed = parse_tracking_response(tracking, response.json())
-                if parsed:
-                    responses.append(parsed)
-            except Exception:
-                pass
+            raw_responses.append(response)
 
         page.on("response", receive)
+        body, processed = "", 0
+
+        def drain_responses():
+            nonlocal processed
+            while processed < len(raw_responses) and not responses:
+                response = raw_responses[processed]
+                processed += 1
+                try:
+                    parsed = parse_tracking_response(tracking, response.json())
+                    if parsed:
+                        responses.append(parsed)
+                except Exception as error:
+                    parse_errors.append(type(error).__name__)
+
         try:
             page.goto("https://www.fedex.com/wtrk/track/?trknbr=" + quote(str(tracking)),
                       timeout=timeout_nav, wait_until="domcontentloaded")
             deadline = time.time() + wait_ms / 1000
-            body = ""
             while time.time() < deadline and not responses:
+                drain_responses()
+                if responses:
+                    break
                 page.wait_for_timeout(500)
                 try:
                     body = page.locator("body").inner_text() or ""
@@ -169,11 +180,18 @@ def _track_once(tracking, timeout_nav, wait_ms, proxy):
                 if dom_status_hint(body) or "can't find that tracking number" in lower or \
                         "tracking number cannot be found" in lower:
                     break
+            drain_responses()
         finally:
             browser.close()
     if responses:
         return responses[0]
-    return page_failure(tracking, statuses, body)
+    fallback = page_failure(tracking, statuses, body)
+    if fallback.get("ok") or fallback.get("not_found") or 403 in statuses:
+        return fallback
+    if parse_errors:
+        return {"tracking": tracking, "ok": False,
+                "error": "FedEx response parse failed: " + parse_errors[-1]}
+    return fallback
 
 
 def track_fedex(tracking, timeout_nav=60000, wait_ms=25000, proxy=None, attempts=2):
