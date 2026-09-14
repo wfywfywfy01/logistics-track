@@ -1,11 +1,16 @@
 import importlib.util
 import json
+import os
 import re
 import runpy
 import ssl
 import sys
+import threading
+import time
 import types
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -122,6 +127,66 @@ def test_ocr_api_verifies_tls_certificate(monkeypatch, tmp_path):
     assert seen["context"].verify_mode == ssl.CERT_REQUIRED
 
 
+def test_ocr_request_timeout_is_capped(monkeypatch, tmp_path):
+    spec = importlib.util.spec_from_file_location("ocr_label", ROOT / "ocr_label.py")
+    ocr = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ocr)
+    image = tmp_path / "label.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    timeouts = []
+
+    def unavailable(_request, timeout, context):
+        timeouts.append(timeout)
+        raise TimeoutError("provider unavailable")
+
+    monkeypatch.setenv("OCR_REQUEST_TIMEOUT", "999")
+    monkeypatch.setattr("urllib.request.urlopen", unavailable)
+
+    with pytest.raises(TimeoutError):
+        ocr.ocr_image(image)
+
+    assert timeouts == [60]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="production hard deadline uses SIGALRM")
+def test_ocr_request_deadline_stops_slow_stream(monkeypatch, tmp_path):
+    spec = importlib.util.spec_from_file_location("ocr_label", ROOT / "ocr_label.py")
+    ocr = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ocr)
+    image = tmp_path / "label.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    class SlowHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_POST(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            try:
+                for _ in range(100):
+                    self.wfile.write(b"x")
+                    self.wfile.flush()
+                    time.sleep(0.05)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("OCR_BASE_URL", f"http://127.0.0.1:{server.server_port}")
+    monkeypatch.setenv("OCR_REQUEST_TIMEOUT", "1")
+    started = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            ocr.ocr_image(image)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert time.monotonic() - started < 2
+
+
 def test_watcher_processes_distinct_message_with_same_timestamp(monkeypatch, tmp_path):
     watcher = load_watcher(monkeypatch, tmp_path)
     timestamp = "2026-09-08T01:00:00Z"
@@ -229,28 +294,70 @@ def test_ocr_cli_marks_provider_failure_as_retryable(monkeypatch, tmp_path, caps
     ocr = load_ocr_label(monkeypatch, tmp_path)
     image = tmp_path / "label.png"
     image.write_bytes(b"fixture")
-    monkeypatch.setattr(ocr, "ocr_image", lambda _path: (_ for _ in ()).throw(
-        TimeoutError("provider timeout")))
-    monkeypatch.setattr(ocr, "time_sleep", lambda _seconds: None)
+    calls = []
+    monkeypatch.setattr(ocr, "ocr_image", lambda _path: calls.append(1) or (
+        _ for _ in ()).throw(TimeoutError("provider timeout")))
     monkeypatch.setattr(sys, "argv", ["ocr_label.py", "--image", str(image)])
 
     assert ocr.main() == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload["retryable"] is True
     assert "TimeoutError" in payload["error"]
+    assert len(calls) == 1
 
 
 def test_ocr_cli_marks_readable_image_without_pair_for_review(monkeypatch, tmp_path, capsys):
     ocr = load_ocr_label(monkeypatch, tmp_path)
     image = tmp_path / "label.png"
     image.write_bytes(b"fixture")
-    monkeypatch.setattr(ocr, "ocr_image", lambda _path: "没有可识别的订单号和运单号")
-    monkeypatch.setattr(ocr, "time_sleep", lambda _seconds: None)
+    calls = []
+    monkeypatch.setattr(ocr, "ocr_image", lambda _path: calls.append(1) or
+                        "没有可识别的订单号和运单号")
     monkeypatch.setattr(sys, "argv", ["ocr_label.py", "--image", str(image)])
 
     assert ocr.main() == 2
     payload = json.loads(capsys.readouterr().out)
     assert payload["retryable"] is False
+    assert len(calls) == 1
+
+
+def test_ocr_ingest_timeout_is_retryable_and_bounded(monkeypatch, tmp_path, capsys):
+    ocr = load_ocr_label(monkeypatch, tmp_path)
+    image = tmp_path / "label.png"
+    image.write_bytes(b"fixture")
+    monkeypatch.setattr(ocr, "ocr_image", lambda _path: "XSD1==1Z1234567890")
+    timeouts = []
+
+    def timeout_ingest(*_args, **kwargs):
+        timeouts.append(kwargs.get("timeout"))
+        raise __import__("subprocess").TimeoutExpired("ingest-pair", kwargs["timeout"])
+
+    monkeypatch.setattr(ocr.subprocess, "run", timeout_ingest)
+    monkeypatch.setattr(sys, "argv", ["ocr_label.py", "--image", str(image)])
+
+    assert ocr.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["retryable"] is True
+    assert payload["ingested"][0]["ok"] is False
+    assert 1 <= timeouts[0] <= 120
+
+
+@pytest.mark.parametrize(("returncode", "expected_rc", "retryable"), (
+    (1, 1, True),
+    (2, 2, False),
+))
+def test_ocr_ingest_exit_code_distinguishes_retry_from_review(
+        monkeypatch, tmp_path, capsys, returncode, expected_rc, retryable):
+    ocr = load_ocr_label(monkeypatch, tmp_path)
+    image = tmp_path / "label.png"
+    image.write_bytes(b"fixture")
+    monkeypatch.setattr(ocr, "ocr_image", lambda _path: "XSD1==1Z1234567890")
+    result = types.SimpleNamespace(returncode=returncode, stdout=b"failure", stderr=b"")
+    monkeypatch.setattr(ocr.subprocess, "run", lambda *_args, **_kwargs: result)
+    monkeypatch.setattr(sys, "argv", ["ocr_label.py", "--image", str(image)])
+
+    assert ocr.main() == expected_rc
+    assert json.loads(capsys.readouterr().out)["retryable"] is retryable
 
 
 def test_failed_pipeline_task_remains_retryable(monkeypatch, tmp_path):

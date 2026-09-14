@@ -4,14 +4,35 @@
 环境变量: OCR_BASE_URL / OCR_API_KEY / OCR_MODEL / OCR_CA_FILE(可选)
 用法: python ocr_label.py --image <图片路径>
 """
-import argparse, base64, json, os, re, ssl, subprocess, sys
-from time import sleep as time_sleep
+import argparse, base64, json, os, re, signal, ssl, subprocess, sys, threading
+from time import monotonic as time_monotonic
 from pathlib import Path
 from storage import Storage
 
 ORDER_RE = re.compile(r"\b((?:XSD|CKD)[-\w]+)\b", re.I)
 INTL_RE = re.compile(r"\b(1Z[A-Z0-9]{10,18}|[A-Z]{2}\d{8,14}|\d{9,14})\b", re.I)
 PAIR_RE = re.compile(r"((?:XSD|CKD)[-\w]+)\s*(?:==|=|｜|\||\s)\s*(1Z[A-Z0-9]{10,18}|[A-Z]{2}\d{8,14}|\d{9,14})", re.I)
+
+
+def _read_response(req, timeout, context):
+    """Enforce a total HTTP deadline in the Linux production worker."""
+    import urllib.request
+    can_alarm = hasattr(signal, "setitimer") and threading.current_thread() is threading.main_thread()
+    previous = None
+    if can_alarm:
+        previous = signal.getsignal(signal.SIGALRM)
+
+        def expired(_signum, _frame):
+            raise TimeoutError("OCR request deadline exceeded")
+
+        signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=context).read()
+    finally:
+        if can_alarm:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
 
 
 def image_as_data_url(path):
@@ -57,15 +78,9 @@ def ocr_image(path):
                                  data=json.dumps(body).encode("utf-8"),
                                  headers={"authorization": "Bearer " + key,
                                           "content-type": "application/json"})
-    last = None
-    for attempt in range(4):
-        try:
-            d = json.loads(urllib.request.urlopen(req, timeout=90, context=ctx).read().decode("utf-8"))
-            return d["choices"][0]["message"]["content"]
-        except Exception as e:
-            last = e
-            time_sleep(10 * (attempt + 1))
-    raise last
+    timeout = min(60, max(1, int(os.environ.get("OCR_REQUEST_TIMEOUT") or 60)))
+    d = json.loads(_read_response(req, timeout, ctx).decode("utf-8"))
+    return d["choices"][0]["message"]["content"]
 
 
 def extract_pairs(text, led=None):
@@ -113,31 +128,44 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--image", required=True)
     a = ap.parse_args()
+    budget = min(190, max(1, int(os.environ.get("OCR_PROCESS_BUDGET_SECONDS") or 190)))
+    deadline = time_monotonic() + budget
     led = Storage().get_shipments()
     txt = ""
     pairs = []
     ocr_error = ""
-    for attempt in range(3):
-        try:
-            txt = ocr_image(a.image)
-            ocr_error = ""
-        except Exception as e:
-            txt = ""
-            ocr_error = type(e).__name__ + ": " + str(e)[:300]
-        pairs = extract_pairs(txt, led)
-        if pairs or attempt == 2:
-            break
-        time_sleep(8)  # 换一种网络/温度重试, 模型输出有随机性
+    try:
+        txt = ocr_image(a.image)
+    except Exception as e:
+        ocr_error = type(e).__name__ + ": " + str(e)[:300]
+    pairs = extract_pairs(txt, led)
     ingested = []
+    ingest_retryable = False
     for order, intl in pairs:
-        r = subprocess.run([sys.executable, "tracking-pipeline.py", "ingest-pair",
-                            "--order", order, "--intl", intl],
-                           capture_output=True)
-        ingested.append({"order": order, "intl": intl, "ok": r.returncode == 0,
-                         "detail": r.stdout.decode("utf-8", errors="replace")[:150]})
-    ok = bool(pairs) and all(item["ok"] for item in ingested)
-    retryable = bool(ocr_error and not pairs)
-    error = ocr_error or ("OCR produced no pair" if not pairs else
+        remaining = int(deadline - time_monotonic())
+        if remaining < 1:
+            ingested.append({"order": order, "intl": intl, "ok": False,
+                             "detail": "OCR process budget exhausted"})
+            ingest_retryable = True
+            break
+        try:
+            r = subprocess.run([sys.executable, "tracking-pipeline.py", "ingest-pair",
+                                "--order", order, "--intl", intl],
+                               capture_output=True, timeout=min(120, remaining))
+            ingested.append({"order": order, "intl": intl, "ok": r.returncode == 0,
+                             "detail": r.stdout.decode("utf-8", errors="replace")[:150]})
+            if r.returncode not in (0, 2):
+                ingest_retryable = True
+                break
+        except subprocess.TimeoutExpired:
+            ingested.append({"order": order, "intl": intl, "ok": False,
+                             "detail": "ingest-pair timed out"})
+            ingest_retryable = True
+            break
+    retryable = bool((ocr_error and not pairs) or ingest_retryable)
+    ok = bool(pairs) and not retryable and all(item["ok"] for item in ingested)
+    error = ocr_error or ("ingest-pair failed or timed out" if ingest_retryable else
+                          "OCR produced no pair" if not pairs else
                           "one or more OCR pairs could not be ingested")
     print(json.dumps({"ok": ok, "retryable": retryable, "error": error if not ok else "",
                       "text": txt, "pairs": pairs, "ingested": ingested}, ensure_ascii=False))
