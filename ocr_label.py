@@ -116,11 +116,14 @@ def main():
     led = Storage().get_shipments()
     txt = ""
     pairs = []
+    ocr_error = ""
     for attempt in range(3):
         try:
             txt = ocr_image(a.image)
+            ocr_error = ""
         except Exception as e:
             txt = ""
+            ocr_error = type(e).__name__ + ": " + str(e)[:300]
         pairs = extract_pairs(txt, led)
         if pairs or attempt == 2:
             break
@@ -133,9 +136,12 @@ def main():
         ingested.append({"order": order, "intl": intl, "ok": r.returncode == 0,
                          "detail": r.stdout.decode("utf-8", errors="replace")[:150]})
     ok = bool(pairs) and all(item["ok"] for item in ingested)
-    print(json.dumps({"ok": ok, "text": txt, "pairs": pairs, "ingested": ingested},
-                     ensure_ascii=False))
-    return 0 if ok else 2
+    retryable = bool(ocr_error and not pairs)
+    error = ocr_error or ("OCR produced no pair" if not pairs else
+                          "one or more OCR pairs could not be ingested")
+    print(json.dumps({"ok": ok, "retryable": retryable, "error": error if not ok else "",
+                      "text": txt, "pairs": pairs, "ingested": ingested}, ensure_ascii=False))
+    return 0 if ok else (1 if retryable else 2)
 
 
 if __name__ == "__main__":

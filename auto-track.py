@@ -47,16 +47,40 @@ def execute(a):
                                     capture_output=True, timeout=210)
             parsed = json.loads(result.stdout.decode("utf-8", errors="replace"))
             ingested = parsed.get("ingested") or []
-            if result.returncode != 0 or not parsed.get("pairs") or not ingested or not all(
-                    row.get("ok") for row in ingested):
+            if result.returncode not in (0, 2) or parsed.get("retryable"):
                 raise RuntimeError(parsed.get("error") or "OCR produced no fully ingested pair")
+            if not parsed.get("pairs") or not ingested or not all(row.get("ok") for row in ingested):
+                successful = [row for row in ingested if row.get("ok")]
+                failed = [row for row in ingested if not row.get("ok")]
+                followups = []
+                if successful:
+                    followups.append(("pipeline", f"ocr:{item['id']}", {
+                        "channel_id": a.channel_id, "bot_app_id": a.bot_app_id}))
+                for row in failed:
+                    order = row.get("order") or "N/A"
+                    tracking = row.get("intl") or "N/A"
+                    followups.append(("review", f"pair-review:{order}:{tracking}", {
+                        "reason": "OCR pair could not be ingested", "order": order,
+                        "intl": tracking, "source_inbox_id": item["id"]}))
+                if not followups:
+                    followups.append(("review", f"ocr-review:{item['id']}", {
+                        "source_inbox_id": item["id"],
+                        "name": payload.get("name") or "",
+                        "path": img_path,
+                        "reason": parsed.get("error") or "OCR produced no fully ingested pair",
+                    }))
+                STORE.complete_inbox_with_tasks(
+                    item["id"], followups, orders=[row.get("order") for row in ingested])
+                print("inbox OCR needs review:", payload.get("name"), flush=True)
+                continue
             STORE.complete_inbox_with_task(
                 item["id"], "pipeline", f"ocr:{item['id']}",
                 {"channel_id": a.channel_id, "bot_app_id": a.bot_app_id},
                 orders=[row.get("order") for row in ingested])
             print("inbox OCR ok:", payload.get("name"), parsed.get("pairs"), flush=True)
         except Exception as error:
-            state = STORE.fail_inbox(item["id"], str(error))
+            max_attempts = max(1, int(os.environ.get("OCR_MAX_ATTEMPTS") or 3))
+            state = STORE.fail_inbox(item["id"], str(error), max_attempts=max_attempts)
             print("inbox OCR failed:", payload.get("name"), state, str(error)[:120], flush=True)
 
     tasks = []
@@ -77,20 +101,20 @@ def execute(a):
 
     steps = []
     if not a.skip_track:
-        steps.append((["track_all_ups.py", "--mode", a.mode or "full"], "抓官网"))
+        steps.append((["track_all_ups.py", "--mode", a.mode or "full"], "抓官网", True))
     steps.extend([
-        (["wire_results.py"], "回填台账"),
-        (["operations.py", "refresh"], "刷新异常待办"),
-        (["alert.py"], "异常提醒"),
-        (["sync_sheet.py"], "同步云表格"),
-        (["backup.py"], "台账备份"),
+        (["wire_results.py"], "回填台账", True),
+        (["operations.py", "refresh"], "刷新异常待办", True),
+        (["alert.py"], "异常提醒", True),
+        (["sync_sheet.py"], "同步云表格", False),
+        (["backup.py"], "台账备份", True),
         (["tracking-pipeline.py", "notify", "--channel-id", a.channel_id,
-          "--bot-app-id", a.bot_app_id], "通知"),
+          "--bot-app-id", a.bot_app_id], "通知", True),
     ])
     ok = True
-    for args, description in steps:
+    for args, description, required in steps:
         step_ok = run(args, description)
-        ok = step_ok and ok
+        ok = (step_ok or not required) and ok
     for task in tasks:
         if ok:
             STORE.complete_task(task["id"])

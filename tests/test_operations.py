@@ -24,6 +24,148 @@ def test_tracking_failure_and_stall_are_distinct_and_deduplicated(tmp_path):
         ("tracking_failure", "official tracking failed")]
 
 
+def test_tracking_failure_keeps_one_current_task_when_observation_changes(tmp_path):
+    store = Storage(tmp_path)
+    store.upsert_shipment("XSD1", shipment())
+    now = datetime(2026, 9, 10, 12, tzinfo=UTC)
+    store.put_document("ups_results", {"XSD1": {"tracking": "1Z1", "carrier": "UPS",
+        "ok": False, "observed_at": "2026-09-10T00:00:00+00:00", "error": "timeout"}})
+    refresh_operational_tasks(store, now, {"UPS": 48})
+
+    store.put_document("ups_results", {"XSD1": {"tracking": "1Z1", "carrier": "UPS",
+        "ok": False, "observed_at": "2026-09-10T01:00:00+00:00", "error": "proxy down"}})
+    refresh_operational_tasks(store, now, {"UPS": 48})
+
+    active = store.list_tasks(("pending", "retry", "running"), kinds=("tracking_failure",))
+    assert len(active) == 1
+    assert active[0]["dedupe_key"] == "tracking-failure:XSD1:1Z1"
+    assert active[0]["payload"]["observed_at"] == "2026-09-10T01:00:00+00:00"
+    assert active[0]["payload"]["error"] == "proxy down"
+
+
+def test_tracking_refresh_preserves_task_owner(tmp_path):
+    store = Storage(tmp_path)
+    store.upsert_shipment("XSD1", shipment())
+    now = datetime(2026, 9, 10, 12, tzinfo=UTC)
+    store.put_document("ups_results", {"XSD1": {"tracking": "1Z1", "carrier": "UPS",
+        "ok": False, "observed_at": "2026-09-10T00:00:00+00:00", "error": "timeout"}})
+    refresh_operational_tasks(store, now, {"UPS": 48})
+    task = store.list_tasks(("pending",), kinds=("tracking_failure",))[0]
+    store.act_on_task(task["id"], "claim", "operator-1", "负责核查官网异常")
+
+    store.put_document("ups_results", {"XSD1": {"tracking": "1Z1", "carrier": "UPS",
+        "ok": False, "observed_at": "2026-09-10T01:00:00+00:00", "error": "proxy down"}})
+    refresh_operational_tasks(store, now, {"UPS": 48})
+
+    current = store.list_tasks(("pending",), kinds=("tracking_failure",))[0]
+    assert current["payload"]["owner"] == "operator-1"
+
+
+def test_tracking_refresh_migrates_owner_from_legacy_timestamped_task(tmp_path):
+    store = Storage(tmp_path)
+    store.upsert_shipment("XSD1", shipment())
+    task_id = store.enqueue_task(
+        "tracking_failure", "tracking-failure:XSD1:1Z1:2026-09-10T00:00:00+00:00",
+        {"order": "XSD1", "tracking": "1Z1", "error": "timeout"})
+    store.act_on_task(task_id, "claim", "operator-1", "负责核查官网异常")
+    store.put_document("ups_results", {"XSD1": {"tracking": "1Z1", "carrier": "UPS",
+        "ok": False, "observed_at": "2026-09-10T01:00:00+00:00", "error": "proxy down"}})
+
+    refresh_operational_tasks(store, datetime(2026, 9, 10, 12, tzinfo=UTC), {"UPS": 48})
+
+    current = store.list_tasks(("pending",), kinds=("tracking_failure",))
+    assert len(current) == 1
+    assert current[0]["dedupe_key"] == "tracking-failure:XSD1:1Z1"
+    assert current[0]["payload"]["owner"] == "operator-1"
+
+
+def test_tracking_failure_can_recur_after_official_tracking_recovers(tmp_path):
+    store = Storage(tmp_path)
+    store.upsert_shipment("XSD1", shipment())
+    now = datetime(2026, 9, 10, 12, tzinfo=UTC)
+    failed = {"XSD1": {"tracking": "1Z1", "carrier": "UPS", "ok": False,
+                        "observed_at": "2026-09-10T00:00:00+00:00", "error": "timeout"}}
+    store.put_document("ups_results", failed)
+    refresh_operational_tasks(store, now, {"UPS": 48})
+    first_id = store.list_tasks(("pending",), kinds=("tracking_failure",))[0]["id"]
+
+    store.put_document("ups_results", {"XSD1": {"tracking": "1Z1", "carrier": "UPS",
+        "ok": True, "observed_at": "2026-09-10T11:30:00+00:00"}})
+    refresh_operational_tasks(store, now, {"UPS": 48})
+    assert store.pending_task_count("tracking_failure") == 0
+
+    store.put_document("ups_results", failed)
+    refresh_operational_tasks(store, now, {"UPS": 48})
+    active = store.list_tasks(("pending",), kinds=("tracking_failure",))
+    assert len(active) == 1
+    assert active[0]["id"] != first_id
+
+
+def test_refresh_resolves_legacy_timestamped_tracking_failure_duplicates(tmp_path):
+    store = Storage(tmp_path)
+    store.upsert_shipment("XSD1", shipment())
+    for observed in ("2026-09-10T00:00:00+00:00", "2026-09-10T01:00:00+00:00"):
+        store.enqueue_task("tracking_failure", f"tracking-failure:XSD1:1Z1:{observed}", {
+            "order": "XSD1", "tracking": "1Z1", "observed_at": observed})
+    store.put_document("ups_results", {"XSD1": {"tracking": "1Z1", "carrier": "UPS",
+        "ok": False, "observed_at": "2026-09-10T02:00:00+00:00", "error": "timeout"}})
+
+    refresh_operational_tasks(store, datetime(2026, 9, 10, 12, tzinfo=UTC), {"UPS": 48})
+
+    active = store.list_tasks(("pending", "retry", "running"), kinds=("tracking_failure",))
+    assert len(active) == 1
+    assert active[0]["dedupe_key"] == "tracking-failure:XSD1:1Z1"
+
+
+def test_tracking_tasks_close_when_tracking_is_removed_or_order_is_deleted(tmp_path):
+    store = Storage(tmp_path)
+    for order in ("XSD1", "XSD2"):
+        item = shipment()
+        item["orderNo"] = order
+        store.upsert_shipment(order, item)
+        store.enqueue_task("tracking_failure", f"tracking-failure:{order}:1Z1", {
+            "order": order, "tracking": "1Z1", "reason": "official tracking failed"})
+    store.patch_shipment("XSD1", {"intl": "", "packages": []})
+    with store.connect() as connection:
+        connection.execute("DELETE FROM shipments WHERE order_no='XSD2'")
+
+    refresh_operational_tasks(store, datetime(2026, 9, 10, 12, tzinfo=UTC), {"UPS": 48})
+
+    assert store.pending_task_count("tracking_failure") == 0
+
+
+def test_tracking_tasks_close_when_all_packages_are_inactive(tmp_path):
+    store = Storage(tmp_path)
+    item = shipment()
+    item["packages"] = [{"tracking": "1Z1", "carrier": "UPS", "active": False}]
+    store.upsert_shipment("XSD1", item)
+    store.enqueue_task("tracking_failure", "tracking-failure:XSD1:1Z1", {
+        "order": "XSD1", "tracking": "1Z1", "reason": "official tracking failed"})
+    store.put_document("ups_results", {"XSD1": {"ok": False, "package_results": {
+        "1Z1": {"tracking": "1Z1", "carrier": "UPS", "ok": False,
+                "observed_at": "2026-09-10T00:00:00+00:00", "error": "timeout"}}}})
+
+    refresh_operational_tasks(store, datetime(2026, 9, 10, 12, tzinfo=UTC), {"UPS": 48})
+
+    assert store.pending_task_count("tracking_failure") == 0
+
+
+def test_recovered_dead_tracking_task_is_no_longer_actionable(tmp_path):
+    store = Storage(tmp_path)
+    store.upsert_shipment("XSD1", shipment())
+    task_id = store.enqueue_task("tracking_failure", "tracking-failure:XSD1:1Z1:legacy", {
+        "order": "XSD1", "tracking": "1Z1", "reason": "official tracking failed"})
+    store.claim_task("test", kind="tracking_failure")
+    store.fail_task(task_id, "handling failed", max_attempts=1)
+    store.put_document("ups_results", {"XSD1": {"tracking": "1Z1", "carrier": "UPS",
+        "ok": True, "observed_at": "2026-09-10T11:30:00+00:00"}})
+
+    refresh_operational_tasks(store, datetime(2026, 9, 10, 12, tzinfo=UTC), {"UPS": 48})
+
+    task = store.list_tasks(kinds=("tracking_failure",))[0]
+    assert task["status"] == "succeeded"
+
+
 def test_stall_task_resolves_after_status_moves(tmp_path):
     store = Storage(tmp_path)
     store.upsert_shipment("XSD1", shipment())

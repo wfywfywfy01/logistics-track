@@ -503,16 +503,21 @@ class Storage:
             )
 
     def complete_inbox_with_task(self, item_id, kind, dedupe_key, payload, orders=None):
+        return self.complete_inbox_with_tasks(
+            item_id, [(kind, dedupe_key, payload)], orders=orders)
+
+    def complete_inbox_with_tasks(self, item_id, tasks, orders=None):
         timestamp = iso()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """INSERT OR IGNORE INTO tasks
-                   (kind,dedupe_key,payload,next_attempt_at,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?)""",
-                (kind, dedupe_key, json.dumps(payload, ensure_ascii=False),
-                 timestamp, timestamp, timestamp),
-            )
+            for kind, dedupe_key, payload in tasks:
+                connection.execute(
+                    """INSERT OR IGNORE INTO tasks
+                       (kind,dedupe_key,payload,next_attempt_at,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?)""",
+                    (kind, dedupe_key, json.dumps(payload, ensure_ascii=False),
+                     timestamp, timestamp, timestamp),
+                )
             row = connection.execute("SELECT payload FROM inbox WHERE id=?", (item_id,)).fetchone()
             inbox_payload = json.loads(row["payload"]) if row else {}
             associated = sorted({str(order) for order in (orders or []) if order})
@@ -543,6 +548,75 @@ class Storage:
                 "SELECT id FROM tasks WHERE dedupe_key=?", (dedupe_key,)
             ).fetchone()
         return row["id"]
+
+    def sync_operational_tasks(self, kind, order, desired, resolved_reason):
+        """Keep one current task per operational condition and archive cleared keys."""
+        timestamp = iso()
+        desired = list(desired)
+        keep_keys = {dedupe_key for dedupe_key, _payload in desired}
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            legacy_owners = {}
+            owner_rows = connection.execute(
+                """SELECT payload FROM tasks WHERE kind=?
+                   AND status IN ('pending','retry','running','unknown','dead')
+                   ORDER BY updated_at DESC,id DESC""", (kind,)
+            ).fetchall()
+            for owner_row in owner_rows:
+                old_payload = json.loads(owner_row["payload"])
+                if str(old_payload.get("order") or "") == order and old_payload.get("owner"):
+                    legacy_owners.setdefault(
+                        str(old_payload.get("tracking") or "N/A"), old_payload["owner"])
+            for dedupe_key, payload in desired:
+                existing = connection.execute(
+                    "SELECT payload FROM tasks WHERE dedupe_key=?", (dedupe_key,)
+                ).fetchone()
+                payload = dict(payload)
+                if existing:
+                    owner = json.loads(existing["payload"]).get("owner")
+                    if owner:
+                        payload["owner"] = owner
+                if not payload.get("owner"):
+                    owner = legacy_owners.get(str(payload.get("tracking") or "N/A"))
+                    if owner:
+                        payload["owner"] = owner
+                encoded = json.dumps(payload, ensure_ascii=False)
+                connection.execute(
+                    """INSERT OR IGNORE INTO tasks
+                       (kind,dedupe_key,payload,next_attempt_at,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?)""",
+                    (kind, dedupe_key, encoded, timestamp, timestamp, timestamp),
+                )
+                connection.execute(
+                    "UPDATE tasks SET payload=?,updated_at=? WHERE dedupe_key=?",
+                    (encoded, timestamp, dedupe_key),
+                )
+            rows = connection.execute(
+                "SELECT id,dedupe_key,payload,status FROM tasks WHERE kind=?", (kind,)
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row["payload"])
+                if str(payload.get("order") or "") != order:
+                    continue
+                key = row["dedupe_key"]
+                if key in keep_keys or ":resolved:" in key:
+                    continue
+                if row["status"] in ("pending", "retry", "running", "unknown", "dead"):
+                    connection.execute(
+                        """UPDATE tasks SET status='succeeded',lease_owner=NULL,lease_until=NULL,
+                           last_error=NULL,updated_at=? WHERE id=?""", (timestamp, row["id"])
+                    )
+                    connection.execute(
+                        """INSERT INTO audit_log
+                           (order_no,entity_type,entity_id,action,operator,reason,created_at)
+                           VALUES(?,?,?,?,?,?,?)""",
+                        (order, "task", str(row["id"]), "auto_resolve", "system",
+                         resolved_reason, timestamp),
+                    )
+                connection.execute(
+                    "UPDATE tasks SET dedupe_key=? WHERE id=?",
+                    (f"{key}:resolved:{row['id']}", row["id"]),
+                )
 
     def claim_task(self, worker, now=None, lease_seconds=300, kind=None):
         return self._claim("tasks", worker, now, lease_seconds, kind)
