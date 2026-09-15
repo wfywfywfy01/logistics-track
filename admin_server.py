@@ -24,6 +24,37 @@ from storage import Storage, TaskConflict
 from operations import build_daily_report
 
 
+def parse_content_length(value):
+    try:
+        length = int(value or 0)
+    except (TypeError, ValueError):
+        raise ValueError("invalid Content-Length")
+    if length < 0 or length > 65536:
+        raise ValueError("request body too large" if length > 65536 else "invalid Content-Length")
+    return length
+
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 64
+
+    def __init__(self, *args, max_workers=64, **kwargs):
+        self._request_slots = threading.BoundedSemaphore(max_workers)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
 ADMIN_JS = """
 document.addEventListener('submit', async event => {
   const form = event.target;
@@ -70,6 +101,9 @@ def create_server(store, token, host="127.0.0.1", port=8080):
         raise ValueError("ADMIN_SESSION_HOURS must be positive")
     cookie_secure = os.environ.get("ADMIN_COOKIE_SECURE") == "1"
     trust_proxy = os.environ.get("ADMIN_TRUST_PROXY") == "1"
+    request_timeout = float(os.environ.get("ADMIN_REQUEST_TIMEOUT_SECONDS") or 15)
+    if request_timeout <= 0:
+        raise ValueError("ADMIN_REQUEST_TIMEOUT_SECONDS must be positive")
     sessions = {}
     sessions_lock = threading.Lock()
     auth_slots = threading.BoundedSemaphore(4)
@@ -88,6 +122,10 @@ def create_server(store, token, host="127.0.0.1", port=8080):
         return result.returncode, payload
 
     class Handler(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(request_timeout)
+
         def _principal(self):
             if hasattr(self, "_principal_value"):
                 return self._principal_value
@@ -283,16 +321,12 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             self._headers(303, "text/plain; charset=utf-8", extra)
 
         def _read_form(self):
-            length = int(self.headers.get("Content-Length") or 0)
-            if length > 65536:
-                raise ValueError("request body too large")
+            length = parse_content_length(self.headers.get("Content-Length"))
             return {key: values[-1] for key, values in parse_qs(
                 self.rfile.read(length).decode("utf-8"), keep_blank_values=True).items()}
 
         def _read_json(self):
-            length = int(self.headers.get("Content-Length") or 0)
-            if length > 65536:
-                raise ValueError("request body too large")
+            length = parse_content_length(self.headers.get("Content-Length"))
             payload = json.loads(self.rfile.read(length) or b"{}")
             if not isinstance(payload, dict):
                 raise ValueError("request body must be a JSON object")
@@ -604,7 +638,7 @@ def create_server(store, token, host="127.0.0.1", port=8080):
         def log_message(self, _format, *_args):
             pass
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = BoundedThreadingHTTPServer((host, port), Handler)
     server.csrf_token = csrf_value
     return server
 

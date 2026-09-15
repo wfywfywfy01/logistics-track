@@ -8,7 +8,7 @@ from urllib.parse import urlencode
 from urllib.error import HTTPError
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
-from admin_server import create_server, csrf_token
+from admin_server import create_server, csrf_token, parse_content_length
 from storage import Storage
 
 
@@ -74,6 +74,17 @@ def test_admin_api_requires_auth_and_exposes_order_detail(tmp_path):
         assert detail["shipment"]["history"] == [{"to": "运输中"}]
     finally:
         server.shutdown()
+
+
+def test_request_length_rejects_negative_and_invalid_values():
+    assert parse_content_length(None) == 0
+    assert parse_content_length("12") == 12
+    for value in ("-1", "invalid", "65537"):
+        try:
+            parse_content_length(value)
+            assert False, "invalid Content-Length must fail"
+        except ValueError:
+            pass
 
 
 def test_health_endpoint_is_public_and_checks_database(tmp_path):

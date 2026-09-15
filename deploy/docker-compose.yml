@@ -17,15 +17,17 @@ services:
       ADMIN_SESSION_HOURS: ${ADMIN_SESSION_HOURS:-12}
       ADMIN_COOKIE_SECURE: ${ADMIN_COOKIE_SECURE:-0}
       ADMIN_TRUST_PROXY: ${ADMIN_TRUST_PROXY:-0}
+      ADMIN_REQUEST_TIMEOUT_SECONDS: ${ADMIN_REQUEST_TIMEOUT_SECONDS:-15}
       BACKUP_DIR: /app/backups
+      LOGIBOT_TMP_DIR: /app/tmp
       TZ: Asia/Shanghai
       # 服务容器内 xray 代理自动由 entrypoint 拉起并注入 UPS_PROXY
     volumes:
-      - ./data:/app/data
-      - ./tmp:/app/tmp
+      - logistics-data:/app/data
+      - logistics-tmp:/app/tmp
       - logistics-backups:/app/backups
     ports:
-      - "127.0.0.1:${ADMIN_HOST_PORT:-8080}:8080"
+      - "127.0.0.1:${ADMIN_HOST_PORT:-18080}:8080"
     shm_size: 1g
     # 内存硬限制: 宿主机仅 3.7GB 且跑着生产容器, 必须限死
     mem_limit: 1536m
@@ -39,4 +41,6 @@ services:
         max-file: "3"
 
 volumes:
+  logistics-data:
+  logistics-tmp:
   logistics-backups:

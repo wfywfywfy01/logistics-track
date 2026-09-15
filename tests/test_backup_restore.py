@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import zipfile
 import pytest
@@ -25,6 +26,53 @@ def test_restore_rejects_modified_backup(tmp_path):
         value.writestr("shipments.db", b"tampered")
     with pytest.raises(ValueError, match="checksum"):
         restore(archive, tmp_path / "target")
+
+
+def test_backup_restores_registered_evidence_files(tmp_path):
+    source = tmp_path / "source"
+    source_tmp = tmp_path / "source-tmp"
+    source_tmp.mkdir()
+    label = source_tmp / "label.png"
+    label.write_bytes(b"label-image")
+    store = Storage(source)
+    store.enqueue_inbox("label-1", {"order": "XSD1", "path": str(label)})
+
+    archive = create_backup(tmp_path / "backup.zip", source, source_tmp)
+    target = tmp_path / "target"
+    target_tmp = tmp_path / "target-tmp"
+    restore(archive, target, tmp_dir=target_tmp)
+
+    assert (target_tmp / "label.png").read_bytes() == b"label-image"
+    restored = Storage(target).get_inbox()[0]["payload"]
+    assert restored["path"] == str(target_tmp / "label.png")
+
+
+def test_restore_rejects_modified_evidence(tmp_path):
+    source = tmp_path / "source"
+    source_tmp = tmp_path / "source-tmp"
+    source_tmp.mkdir()
+    label = source_tmp / "label.png"
+    label.write_bytes(b"label-image")
+    store = Storage(source)
+    store.enqueue_inbox("label-1", {"path": str(label)})
+    archive = create_backup(tmp_path / "backup.zip", source, source_tmp)
+    with zipfile.ZipFile(archive) as value:
+        manifest = json.loads(value.read("manifest.json"))
+        evidence_name = manifest["evidence"][0]["archive"]
+    with zipfile.ZipFile(archive, "a") as value:
+        value.writestr(evidence_name, b"tampered")
+
+    with pytest.raises(ValueError, match="evidence checksum"):
+        restore(archive, tmp_path / "target", tmp_dir=tmp_path / "target-tmp")
+
+
+def test_backup_fails_when_required_evidence_is_missing(tmp_path):
+    source = tmp_path / "source"
+    store = Storage(source)
+    store.enqueue_inbox("label-1", {"path": str(tmp_path / "missing.png")})
+
+    with pytest.raises(FileNotFoundError, match="required evidence"):
+        create_backup(tmp_path / "backup.zip", source, tmp_path / "source-tmp")
 
 
 def test_backup_prunes_only_expired_managed_archives(monkeypatch, tmp_path):
