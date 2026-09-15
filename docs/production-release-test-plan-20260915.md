@@ -4,11 +4,11 @@
 
 候选分支：`codex/production-readiness-fixes`
 
-代码范围：`e1adf41..0d60dfc`
+代码范围：`e1adf41..f05cf7b`
 
 ## 当前状态
 
-候选代码已分六个功能提交完成，本地全量测试为 166 passed、1 skipped；跳过项是 Linux `SIGALRM` 总时限测试。Python 编译、`deploy/entrypoint.sh`、`deploy/deploy-from-git.sh`、Compose 配置和 diff 检查通过。候选尚未推送、构建服务器镜像或切换生产。
+候选代码已分七个功能提交完成，本地全量测试为 166 passed、1 skipped；跳过项是 Linux `SIGALRM` 总时限测试。Python 编译、`deploy/entrypoint.sh`、`deploy/deploy-from-git.sh`、Compose 配置和 diff 检查通过。候选尚未推送、构建服务器镜像或切换生产。
 
 以下测试分为本地、隔离候选、真实官网、灰度生产四层。故障注入、恢复和重复通知测试禁止直接操作生产台账或正式通知渠道。
 
@@ -43,6 +43,8 @@ git diff --check origin/master..HEAD
 ## 第二层：隔离候选测试
 
 使用生产数据库和附件卷的一致性副本，独立命名卷、独立端口、专用通知渠道。先记录订单数、任务数、附件数、数据库哈希及 `integrity_check`。测试后销毁候选副本，不反写生产。
+
+部署前先检查现有容器的 `Mounts`。当前服务应继续挂载既有 `logistics-data`、`logistics-tmp`、`logistics-backups` 卷；如果旧环境仍使用仓库目录 bind mount，必须停写、备份、复制到命名卷并核对订单数、附件数和 `integrity_check`，禁止直接启动空卷。
 
 ### 数据与换单
 
