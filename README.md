@@ -20,7 +20,7 @@
 ```
 
 - 台账唯一：`data/shipments.db`。旧 JSON 在首次启动时幂等迁移。消息、OCR、工作任务和通知均使用持久队列与租约。
-- 官网抓取用 `patchright` 有头 Chromium（窗口移出屏幕 / 容器内 Xvfb）拦截官方 JSON 接口。FedEx 与 DHL 使用同一模式，无需 API 凭据；可用 `FEDEX_PROXY` 单独指定 FedEx 出口。
+- 官网抓取用 `patchright` 有头 Chromium（窗口移出屏幕 / 容器内 Xvfb）拦截官方 JSON 接口。FedEx 与 DHL 使用同一模式，无需 API 凭据；可用 `FEDEX_PROXY` 指定无认证出口。带用户名密码的 SOCKS5 应配置为 Xray 上游（`XRAY_PROTOCOL=socks5`、`XRAY_USER`、`XRAY_PASS`），由本地无认证 SOCKS 端口供浏览器使用。
 - 运单绑定带版本，旧运单结果不得覆盖新绑定；承运商未知状态保持未知，不猜测为运输中。
 - 一单支持多个包裹；单个包裹签收时订单为“部分签收”，全部包裹签收后才为“签收”。
 - 工作台提供订单、详情、异常待办、通知回执和运营日报。所有写操作记录操作者与原因。
@@ -106,4 +106,4 @@ FedEx、DHL 和 UPS 均从官网页面获取状态，失败时不会猜测结果
 
 ## 环境变量
 
-见 `deploy/.env.example`，全部变量均有注释。必填：`VERTU_*` 四项、`CHANNEL_ID`、`XRAY_PASS`（无出口代理官网抓取会失败）。
+见 `deploy/.env.example`，全部变量均有注释。必填：`VERTU_*` 四项、`CHANNEL_ID`、`XRAY_PASS`（无出口代理官网抓取会失败）；上游为 SOCKS5 时另填 `XRAY_PROTOCOL=socks5` 和 `XRAY_USER`。

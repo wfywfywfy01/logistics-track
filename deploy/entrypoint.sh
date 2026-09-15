@@ -15,23 +15,32 @@ case "$WATCHER_STALE_MIN" in
   ''|*[!0-9]*|0) echo "[entrypoint] WATCHER_STALE_MIN must be a positive integer"; exit 1 ;;
 esac
 
-# xray 本地代理(SS 节点 -> 海外出口): 密码从环境变量注入, 不落仓库
+# xray 本地代理(SS 或上游 SOCKS5 -> 海外出口): 密码从环境变量注入, 不落仓库
 # s1 = XRAY_*, s2(备用, 可选) = XRAY2_*; 看门狗按 config-s1/config-s2 切换
-write_xray_cfg() {  # $1=输出文件 $2=addr $3=port $4=method $5=pass
-  cat > "$1" <<EOF
+write_xray_cfg() {  # $1=file $2=addr $3=port $4=method $5=pass $6=protocol $7=user
+  if [ "${6:-shadowsocks}" = "socks5" ]; then
+    cat > "$1" <<EOF
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [{"port": 10809, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
+  "outbounds": [{"protocol": "socks", "settings": {"address": "$2", "port": $3, "user": "$7", "pass": "$5"}}]}
+EOF
+  else
+    cat > "$1" <<EOF
 {
   "log": {"loglevel": "warning"},
   "inbounds": [{"port": 10809, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": true}}],
   "outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "$2", "port": $3, "method": "$4", "password": "$5"}]}}]}
 EOF
+  fi
 }
 if [ -z "$XRAY_PASS" ]; then
   echo "[entrypoint] XRAY_PASS missing, proxy disabled (直接抓取会失败)"
 else
   mkdir -p /app/deploy/xray
-  write_xray_cfg /app/deploy/xray/config-s1.json "${XRAY_ADDR:-c57s1.portablesubmarines.com}" "${XRAY_PORT:-15615}" "${XRAY_METHOD:-aes-256-gcm}" "$XRAY_PASS"
+  write_xray_cfg /app/deploy/xray/config-s1.json "${XRAY_ADDR:-c57s1.portablesubmarines.com}" "${XRAY_PORT:-15615}" "${XRAY_METHOD:-aes-256-gcm}" "$XRAY_PASS" "${XRAY_PROTOCOL:-shadowsocks}" "${XRAY_USER:-}"
   rm -f /app/deploy/xray/config-s2.json
-  [ -n "$XRAY2_PASS" ] && write_xray_cfg /app/deploy/xray/config-s2.json "${XRAY2_ADDR:?XRAY2_ADDR required}" "${XRAY2_PORT:?XRAY2_PORT required}" "${XRAY2_METHOD:-aes-256-gcm}" "$XRAY2_PASS"
+  [ -n "$XRAY2_PASS" ] && write_xray_cfg /app/deploy/xray/config-s2.json "${XRAY2_ADDR:?XRAY2_ADDR required}" "${XRAY2_PORT:?XRAY2_PORT required}" "${XRAY2_METHOD:-aes-256-gcm}" "$XRAY2_PASS" "${XRAY2_PROTOCOL:-${XRAY_PROTOCOL:-shadowsocks}}" "${XRAY2_USER:-${XRAY_USER:-}}"
   NODE=$(cat /app/data/.active_node 2>/dev/null || echo s1)
   [ -f "/app/deploy/xray/config-$NODE.json" ] || NODE=s1
   cp "/app/deploy/xray/config-$NODE.json" /app/deploy/xray/config.json
