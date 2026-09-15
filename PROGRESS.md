@@ -89,9 +89,13 @@
 - 服务器生产版本 `9307767` 已运行：Docker `healthy`、重启数 0、连续两轮 watcher 心跳正常、错误日志筛查为空。生产库 139 条、`integrity_check=ok`、持久任务积压 0。
 - 生产备份已写入 `logistics-backups` 卷并通过 SHA-256；从该备份恢复到空卷后仍为 139 条且完整性为 `ok`。旧镜像 `e35fe19d9729` 和切换前容器均保留，可直接回滚。
 - V 盘上传实测失败原因为“当前会话没有有效的企业成员身份”。该项不阻塞服务器本地持久备份，但不满足异地容灾；修复企业成员身份后设置 `BACKUP_UPLOAD=1` 再验收。
-## 2026-09-15：三家官网完整轨迹归一化候选
+
+## 2026-09-15：三家官网完整轨迹归一化与发布
 
 - UPS 官网 `GetStatus` 现在同时保留官网状态、预计送达、最后节点、五段进度和 `shipmentProgressActivities` 完整扫描历史；事件包含官网原文、地点、当地显示时间、UTC 时间、当地偏移、扫描码、异常码及报关事件标识。
 - DHL 官网 `utapi` 现在保留预计送达时间窗和完整事件；响应读取移出 Playwright 回调，避免同步回调重入导致官网成功响应丢失。FedEx 官网响应同步归一化预计送达时间窗、最新事件和完整 `scanEvents`；DOM 兜底仍明确标记来源，缺失字段不臆测。
 - 三家统一输出 `source / estimated_delivery / latest_event / progress_steps / events`，并随成功观测写入对应包裹的 `official_tracking`；订单详情 API 与运营后台读取同一台账即可展示。较弱的 DOM 结果采用字段合并，不会清空此前抓到的完整历史。
 - 2026-09-15 本地验证：`python -m pytest -q` 为 135 passed / 1 个 Linux 专用测试跳过；相关 Python 编译和 `git diff --check` 通过。服务器以截图单号只读验证 UPS 官网返回 18 条完整事件、5 个进度节点、预计送达及目的地时区；生产库脱敏 DHL 实票确认官网事件结构。FedEx 仍缺一条可确认的真实运单，端到端实票验收保持未完成。
+- PR #17 已合并为 `a1d06f8`，两个 Linux CI 测试任务均通过。生产已切换到镜像 manifest `sha256:30aa66e1e5aa7a70a72659826afdca8073462069f8378725cfec5c1bb5c8f13e`；容器 `healthy`、重启数 0，`/healthz` 与数据库 `integrity_check` 均为 `ok`，台账保持 144 单。
+- 发布后增量回填检查 44 个包裹：UPS 29 个中官网成功 24 个、完整事件 6 个；DHL 12 个中官网成功 11 个、完整事件 5 个；3 个 FedEx 候选号均被官网明确判定为未找到。35 个成功结果全部应用、失败 0；台账共保存 11 份官方完整事件快照。只有页面状态而无官方事件数组的成功结果不记作完整历史。
+- 切换前备份为 `/app/backups/logistics-backup-20260915-154530.zip`，旧容器保留为 `logistics-track-rollback-full-tracking-20260915`。FedEx 解析、持久化和回归测试已完成，但仍需一条官网可查的真实 FedEx 运单完成生产端到端验收。
