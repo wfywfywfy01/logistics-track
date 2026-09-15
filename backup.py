@@ -60,6 +60,7 @@ def create_backup(output=None, data_dir=None, tmp_dir=None):
                        ("/app/tmp" if Path("/app/tmp").is_dir() else "tmp")).resolve()
         roots = {"data": store.data_dir.resolve(), "tmp": tmp_dir}
         evidence = []
+        evidence_content = {}
         for item_id in sorted(protected_ids):
             item = inbox_rows.get(item_id)
             if not item:
@@ -86,13 +87,14 @@ def create_backup(output=None, data_dir=None, tmp_dir=None):
             evidence.append({"inbox_id": item_id, "root": root_name,
                              "path": relative.as_posix(), "archive": archive_name,
                              "sha256": hashlib.sha256(content).hexdigest()})
+            evidence_content[archive_name] = content
         manifest = {"created_at": iso(), "database": "shipments.db",
                     "sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
                     "evidence": evidence}
         with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.write(snapshot, "shipments.db")
             for item in evidence:
-                archive.write(roots[item["root"]] / item["path"], item["archive"])
+                archive.writestr(item["archive"], evidence_content[item["archive"]])
             archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
     prune_backups(backup_dir, retention_days, keep=output)
     return output

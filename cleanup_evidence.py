@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 """Delete old temporary files only after their inbox work is complete."""
+import json
 import os
 import time
 from pathlib import Path
@@ -10,8 +11,24 @@ from storage import Storage
 def cleanup(store, directory, retention_days=30, now=None):
     cutoff = (now or time.time()) - retention_days * 86400
     protected = set()
-    for item in store.get_inbox(("pending", "retry", "running", "dead")):
-        path = (item.get("payload") or {}).get("path")
+    connection = store.connect()
+    try:
+        connection.execute("BEGIN")
+        inbox = {row["id"]: json.loads(row["payload"]) for row in connection.execute(
+            "SELECT id,payload FROM inbox")}
+        protected_ids = {row["id"] for row in connection.execute(
+            "SELECT id FROM inbox WHERE status IN ('pending','retry','running','dead')")}
+        for row in connection.execute(
+                "SELECT payload FROM tasks WHERE status IN "
+                "('pending','retry','running','dead','unknown')"):
+            payload = json.loads(row["payload"])
+            source_id = payload.get("source_inbox_id") or payload.get("inbox_id")
+            if source_id:
+                protected_ids.add(str(source_id))
+    finally:
+        connection.close()
+    for item_id in protected_ids:
+        path = (inbox.get(item_id) or {}).get("path")
         if path:
             protected.add(str(Path(path).resolve()))
     deleted = []

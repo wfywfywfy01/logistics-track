@@ -34,23 +34,34 @@ def save_json(p, obj):
 def cli(args):
     """headless vertu-cli；返回 stdout 文本或 None(Linux 参数列表防注入, Windows 回退 shell)"""
     try:
-        rc, out, _ = robust.cli_run(args)
+        rc, out, err = robust.cli_run(args)
     except subprocess.TimeoutExpired:
         raise
     except Exception:
         return None
     if rc != 0:
-        raise CliRejected((out or "command rejected")[:300])
+        detail = out or err or "command failed"
+        try:
+            rejected = json.loads(detail).get("ok") is False
+        except (AttributeError, json.JSONDecodeError):
+            rejected = False
+        if rejected:
+            raise CliRejected(detail[:300])
+        raise CliOutcomeUnknown(detail[:300])
     return out
 
 
 class CliRejected(RuntimeError):
     pass
 
+
+class CliOutcomeUnknown(RuntimeError):
+    pass
+
 def cli_json(args):
     try:
         out = cli(args)
-    except CliRejected:
+    except (CliRejected, CliOutcomeUnknown):
         return None
     try: return json.loads(out) if out else None
     except Exception: return None

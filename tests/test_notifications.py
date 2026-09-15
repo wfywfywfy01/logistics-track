@@ -120,13 +120,30 @@ def test_notification_enqueue_failure_rolls_back_status_change(monkeypatch, tmp_
     assert pipeline.STORE.get_shipment("XSD1")["status"] == "运输中"
 
 
-def test_cli_nonzero_delivery_is_a_retryable_rejection(monkeypatch, tmp_path):
+def test_cli_nonzero_without_explicit_rejection_is_unknown(monkeypatch, tmp_path):
     pipeline = load_pipeline(monkeypatch, tmp_path)
     pipeline.STORE.upsert_shipment("XSD1", {
         "orderNo": "XSD1", "status": "运输中", "intl": "1Z1", "history": [],
         "products": [], "needs_notify": True, "binding_version": 1,
     })
     monkeypatch.setattr(pipeline.robust, "cli_run", lambda _args: (1, "", "rejected"))
+
+    result = pipeline.notify("channel")
+
+    assert result["failed"] == 1
+    assert pipeline.STORE.pending_task_count("notify_group") == 0
+    assert pipeline.STORE.task_counts()["notify_group"]["unknown"] == 1
+
+
+def test_cli_nonzero_explicit_rejection_is_retryable(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {
+        "orderNo": "XSD1", "status": "运输中", "intl": "1Z1", "history": [],
+        "products": [], "needs_notify": True, "binding_version": 1,
+    })
+    monkeypatch.setattr(
+        pipeline.robust, "cli_run",
+        lambda _args: (1, '{"ok":false,"error":"rejected"}', ""))
 
     result = pipeline.notify("channel")
 

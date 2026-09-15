@@ -280,6 +280,23 @@ def test_failed_package_does_not_hide_another_package_stall(tmp_path):
         ("tracking_failure", "1Z1"), ("stalled", "876543210123")}
 
 
+def test_missing_order_result_creates_failure_for_each_active_package(tmp_path):
+    store = Storage(tmp_path)
+    item = shipment()
+    item["packages"] = [
+        {"tracking": "1Z1", "carrier": "UPS", "active": True},
+        {"tracking": "876543210123", "carrier": "FEDEX", "active": True},
+    ]
+    store.upsert_shipment("XSD1", item)
+
+    refresh_operational_tasks(store, datetime(2026, 9, 10, 12, tzinfo=UTC),
+                              {"UPS": 48, "FEDEX": 48})
+
+    failures = store.list_tasks(("pending",), kinds=("tracking_failure",))
+    assert {row["payload"]["tracking"] for row in failures} == {
+        "1Z1", "876543210123"}
+
+
 def test_daily_freshness_counts_each_package_carrier(tmp_path):
     store = Storage(tmp_path)
     store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中", "packages": [

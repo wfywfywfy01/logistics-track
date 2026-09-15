@@ -111,6 +111,34 @@ def test_backup_evidence_selection_comes_from_database_snapshot(monkeypatch, tmp
     assert archive.is_file()
 
 
+def test_backup_hash_and_archive_use_same_evidence_bytes(monkeypatch, tmp_path):
+    import hashlib
+    source = tmp_path / "source"
+    source_tmp = tmp_path / "source-tmp"
+    source_tmp.mkdir()
+    label = source_tmp / "label.png"
+    label.write_bytes(b"original")
+    store = Storage(source)
+    store.enqueue_inbox("label-1", {"path": str(label)})
+    real_read = Path.read_bytes
+
+    def mutate_after_read(path):
+        content = real_read(path)
+        if path.resolve() == label.resolve():
+            path.write_bytes(b"changed")
+        return content
+
+    monkeypatch.setattr(Path, "read_bytes", mutate_after_read)
+    archive_path = create_backup(tmp_path / "backup.zip", source, source_tmp)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        item = manifest["evidence"][0]
+        archived = archive.read(item["archive"])
+    assert archived == b"original"
+    assert hashlib.sha256(archived).hexdigest() == item["sha256"]
+
+
 def test_restore_rolls_back_evidence_when_switch_fails(monkeypatch, tmp_path):
     source = tmp_path / "source"
     source_tmp = tmp_path / "source-tmp"

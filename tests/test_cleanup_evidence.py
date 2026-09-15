@@ -19,3 +19,20 @@ def test_dead_letter_evidence_is_retained(tmp_path):
 
     assert protected.exists()
     assert not removable.exists()
+
+
+def test_open_review_keeps_succeeded_inbox_evidence(tmp_path):
+    data = tmp_path / "data"; files = tmp_path / "tmp"
+    files.mkdir(); old = (datetime.now(UTC) - timedelta(days=31)).timestamp()
+    protected = files / "review.png"
+    protected.write_bytes(b"review")
+    os.utime(protected, (old, old))
+    store = Storage(data)
+    store.enqueue_inbox("review-source", {"path": str(protected)})
+    store.complete_inbox_with_task(
+        "review-source", "review", "review:review-source",
+        {"source_inbox_id": "review-source", "reason": "manual review"})
+
+    cleanup(store, files, retention_days=30)
+
+    assert protected.exists()

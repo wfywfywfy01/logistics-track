@@ -54,20 +54,26 @@ def refresh_operational_tasks(store, now=None, thresholds=None, freshness_hours=
     for order, shipment in shipments.items():
         configured_packages = shipment.get("packages") or []
         packages = [item for item in configured_packages if item.get("active", True)]
+        if not configured_packages and shipment.get("intl"):
+            packages = [{"tracking": shipment.get("intl"),
+                         "carrier": shipment.get("carrier"), "active": True}]
         if (configured_packages and not packages) or (not configured_packages and
                                                        not shipment.get("intl")):
             clear_operational_tasks(order, "shipment has no active tracking number")
             continue
         result = results.get(order) or {}
         package_results = result.get("package_results") or {}
-        if package_results and packages:
+        if packages:
             evaluations = []
             for package in packages:
                 tracking = package.get("tracking")
-                current = dict(package_results.get(tracking) or {})
+                matched = package_results.get(tracking)
+                if matched is None and not package_results and result.get("tracking") == tracking:
+                    matched = result
+                current = dict(matched or {})
                 current.setdefault("tracking", tracking)
                 current.setdefault("carrier", package.get("carrier"))
-                if tracking not in package_results:
+                if not matched:
                     current.update({"ok": False, "error": "package result is missing"})
                 evaluations.append(current)
         elif package_results:
