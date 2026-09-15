@@ -4,6 +4,7 @@ import subprocess
 import sys
 
 from storage import Storage
+from official_tracking import result_hash
 
 
 def run_pipeline(args):
@@ -37,6 +38,11 @@ def apply_results(store, runner=run_pipeline):
                         "--observed-at", package.get("observed_at") or ""]
                 if package.get("binding_version") is not None:
                     args += ["--binding-version", str(package["binding_version"])]
+                # Only authoritative API results have an events key. DOM fallback updates
+                # status but must not replace a complete carrier snapshot.
+                if "events" in package:
+                    args += ["--official-from-results", "--official-result-hash",
+                             result_hash(package)]
                 code, output = runner(args)
                 print("package-update:", order, package.get("tracking"), "->", output[:120], flush=True)
                 applied += int(code == 0); failed += int(code != 0)

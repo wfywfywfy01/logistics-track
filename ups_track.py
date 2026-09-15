@@ -3,6 +3,7 @@
 """UPS 官网真实抓取通道 (patchright headed + GetStatus API 拦截)。
 后台执行：窗口移出屏幕，无前台弹窗。"""
 import sys, json, os, time
+from datetime import datetime, timezone
 
 STAGE_MAP = {
     "D": "签收", "I": "运输中", "P": "已出国际单", "M": "已出国际单", "O": "运输中",
@@ -33,6 +34,58 @@ def classify_status(status_type, description):
     return None
 
 
+def _compact_date(value):
+    value = str(value or "")
+    if len(value) == 8 and value.isdigit():
+        return f"{value[:4]}-{value[4:6]}-{value[6:]}"
+    return value
+
+
+def _compact_time(value):
+    value = str(value or "")
+    if len(value) == 6 and value.isdigit():
+        return f"{value[:2]}:{value[2:4]}:{value[4:]}"
+    return value
+
+
+def _ups_utc(date_value, time_value):
+    raw_date = str(date_value or "")
+    raw_time = str(time_value or "").replace(":", "")
+    try:
+        parsed = datetime.strptime(raw_date + raw_time, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+        return parsed.isoformat(timespec="seconds").replace("+00:00", "Z")
+    except ValueError:
+        return "N/A"
+
+
+def _local_to_utc(date_value, time_value, offset):
+    date_text, time_text = _compact_date(date_value), _compact_time(time_value)
+    if not date_text or not time_text or not offset:
+        return "N/A"
+    try:
+        parsed = datetime.fromisoformat(f"{date_text}T{time_text}{offset}")
+        return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except ValueError:
+        return "N/A"
+
+
+def _ups_event(item):
+    milestone = item.get("milestoneName") or {}
+    return {
+        "source_time_text": " ".join(x for x in (
+            item.get("date") or "", item.get("time") or "") if x),
+        "occurred_at_utc": _ups_utc(item.get("gmtDate"), item.get("gmtTime")),
+        "timezone_offset": item.get("gmtOffset") or "",
+        "location": item.get("location") or "",
+        "status": milestone.get("name") or item.get("activityScan") or "",
+        "description": item.get("activityScan") or "",
+        "additional_description": item.get("activityAdditionalDescription") or "",
+        "code": item.get("actCode") or "",
+        "exception_code": item.get("exceptionCodes") or "",
+        "is_brokerage": bool(item.get("isBrokerageEvent")),
+    }
+
+
 def parse_tracking_response(tn, payload):
     if not isinstance(payload, dict):
         return None
@@ -52,19 +105,51 @@ def parse_tracking_response(tn, payload):
         return {"tracking": tn, "ok": False, "error": "unknown UPS status",
                 "status_en": status_text}
     milestones = detail.get("milestones") or []
-    latest = next((item for item in milestones if item.get("isCurrent")), None)
+    latest = detail.get("currentMilestone") or next(
+        (item for item in milestones if item.get("isCurrent")), None)
     if not latest and milestones:
         latest = milestones[-1]
     latest_text = ""
     if latest:
         latest_text = f"{latest.get('date','')} {latest.get('time','')} " \
                       f"{latest.get('location','')} {latest.get('name','')}".strip()
+    events = [_ups_event(item) for item in (detail.get("shipmentProgressActivities") or [])]
+    latest_event = events[0] if events else ({
+        "source_time_text": " ".join(x for x in (
+            latest.get("date") or "", latest.get("time") or "") if x),
+        "occurred_at_utc": "N/A", "timezone_offset": "",
+        "location": latest.get("location") or "", "status": latest.get("name") or "",
+        "description": "", "additional_description": "", "code": "",
+        "exception_code": "", "is_brokerage": False,
+    } if latest else None)
+    eta = None
+    if detail.get("sdd"):
+        offset = (detail.get("shipmentGMTInfo") or {}).get("shipToGMTOffset") or ""
+        eta = {"local_date_text": _compact_date(detail.get("sdd")),
+               "local_time_text": _compact_time(detail.get("sdt")),
+               "timezone_offset": offset,
+               "from_utc": _local_to_utc(detail.get("sdd"), detail.get("sdt"), offset)}
+    progress_steps = [{
+        "name": item.get("name") or "", "source_time_text": " ".join(x for x in (
+            item.get("date") or "", item.get("time") or "") if x),
+        "location": item.get("location") or "",
+        "completed": bool(item.get("isCompleted")), "current": bool(item.get("isCurrent")),
+        "future": bool(item.get("isFuture")),
+    } for item in milestones]
     return {
         "tracking": tn, "ok": True, "stage": stage,
         "status_en": status_text,
+        "source": "ups.com",
         "progress": detail.get("progressBarPercentage", ""),
+        "progress_type": detail.get("progressBarType") or "",
+        "progress_steps_availability": "available" if progress_steps else "N/A",
         "received_by": detail.get("receivedBy") or "",
         "detail": latest_text,
+        "estimated_delivery": eta,
+        "latest_event": latest_event,
+        "progress_steps": progress_steps,
+        "events": events,
+        # Compatibility for callers that already use the old key.
         "milestones": [{"date": item.get("date"), "time": item.get("time"),
                         "loc": item.get("location"), "name": item.get("name")}
                        for item in milestones],

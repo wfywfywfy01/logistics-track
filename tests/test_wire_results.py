@@ -28,3 +28,20 @@ def test_failed_result_for_missing_order_is_skipped_not_reingested(tmp_path):
 
     assert result == {"applied": 0, "failed": 0}
     assert calls == []
+
+
+def test_official_tracking_details_are_loaded_from_results_without_argv_payload(tmp_path):
+    store = Storage(tmp_path)
+    store.upsert_shipment("XSD1", {"orderNo": "XSD1", "intl": "A"})
+    store.put_document("ups_results", {"XSD1": {"package_results": {
+        "A": {"tracking": "A", "ok": True, "stage": "运输中",
+              "source": "ups.com", "estimated_delivery": {"date": "2026-09-15"},
+              "events": [{"status": "On the Way", "location": "Riga"}]},
+    }}})
+    calls = []
+
+    apply_results(store, lambda args: (calls.append(args) or (0, "ok")))
+
+    assert "--official-from-results" in calls[0]
+    assert len(calls[0][calls[0].index("--official-result-hash") + 1]) == 64
+    assert all("Riga" not in value for value in calls[0])

@@ -52,6 +52,137 @@ def test_package_status_does_not_move_backwards(monkeypatch, tmp_path):
     assert pipeline.STORE.get_shipment("XSD1")["packages"][0]["status"] == "运输中"
 
 
+def test_package_update_persists_normalized_official_tracking(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "已预报",
+        "history": [], "products": []})
+    pipeline.add_package("XSD1", "876543210123", "FedEx")
+    official = {"source": "fedex.com", "estimated_delivery": None,
+                "events": [{"occurred_at": "2026-09-10T01:00:00Z",
+                            "status": "On the way"}]}
+
+    pipeline.package_update("XSD1", "876543210123", "运输中",
+                            observed_at="2026-09-10T01:00:00Z",
+                            official_tracking=official)
+
+    package = pipeline.STORE.get_shipment("XSD1")["packages"][0]
+    assert package["official_tracking"] == official
+
+    pipeline.package_update("XSD1", "876543210123", "运输中",
+                            observed_at="2026-09-10T02:00:00Z")
+    package = pipeline.STORE.get_shipment("XSD1")["packages"][0]
+    assert package["official_tracking"] == official
+
+
+def test_official_tracking_snapshot_loads_from_results_with_provenance(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    package_result = {"tracking": "1Z1", "ok": True, "source": "ups.com",
+                      "observed_at": "2026-09-15T01:00:00Z", "status_en": "On the Way",
+                      "events": [], "progress_steps": []}
+    pipeline.STORE.put_document("ups_results", {"XSD1": {"package_results": {
+        "1Z1": package_result}}})
+    from official_tracking import result_hash
+
+    snapshot = pipeline.official_tracking_from_results(
+        "XSD1", "1Z1", expected_result_hash=result_hash(package_result))
+
+    assert snapshot["source"] == "ups.com"
+    assert snapshot["observed_at"] == "2026-09-15T01:00:00+00:00"
+    assert snapshot["events"] == []
+
+
+def test_same_stage_stale_observation_cannot_replace_new_official_snapshot(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "已预报",
+        "history": [], "products": []})
+    pipeline.add_package("XSD1", "1Z1", "UPS")
+    for observed, status in (("2026-09-15T01:00:00Z", "old"),
+                             ("2026-09-15T03:00:00Z", "new")):
+        pipeline.package_update("XSD1", "1Z1", "运输中", observed_at=observed,
+                                official_tracking={"observed_at": observed, "status_en": status})
+
+    result = pipeline.package_update(
+        "XSD1", "1Z1", "运输中", observed_at="2026-09-15T02:00:00Z",
+        official_tracking={"observed_at": "2026-09-15T02:00:00Z", "status_en": "stale"})
+
+    package = pipeline.STORE.get_shipment("XSD1")["packages"][0]
+    assert result["reason"] == "stale observation"
+    assert package["official_tracking"]["status_en"] == "new"
+    assert package["observation_observed_at"] == "2026-09-15T03:00:00+00:00"
+
+
+def test_official_snapshot_rejects_missing_or_changed_observation_time(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.put_document("ups_results", {"XSD1": {"package_results": {
+        "1Z1": {"tracking": "1Z1", "ok": True, "source": "ups.com",
+                "events": [], "progress_steps": []}}}})
+    import pytest
+    from official_tracking import result_hash
+    package_result = pipeline.STORE.get_document(
+        "ups_results", {})["XSD1"]["package_results"]["1Z1"]
+    with pytest.raises(ValueError, match="observed_at is required"):
+        pipeline.official_tracking_from_results(
+            "XSD1", "1Z1", expected_result_hash=result_hash(package_result))
+
+    result = pipeline.STORE.get_document("ups_results", {})
+    result["XSD1"]["package_results"]["1Z1"]["observed_at"] = "2026-09-15T03:00:00Z"
+    pipeline.STORE.put_document("ups_results", result)
+    with pytest.raises(ValueError, match="changed during apply"):
+        pipeline.official_tracking_from_results(
+            "XSD1", "1Z1", expected_observed_at="2026-09-15T02:00:00Z",
+            expected_result_hash=result_hash(
+                result["XSD1"]["package_results"]["1Z1"]))
+
+    old_hash = result_hash(result["XSD1"]["package_results"]["1Z1"])
+    result["XSD1"]["package_results"]["1Z1"]["status_en"] = "Exception"
+    pipeline.STORE.put_document("ups_results", result)
+    with pytest.raises(ValueError, match="changed during apply"):
+        pipeline.official_tracking_from_results(
+            "XSD1", "1Z1", expected_observed_at="2026-09-15T03:00:00Z",
+            expected_result_hash=old_hash)
+
+
+def test_same_watermark_only_allows_idempotent_official_snapshot(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "已预报",
+        "history": [], "products": []})
+    pipeline.add_package("XSD1", "1Z1", "UPS")
+    observed = "2026-09-15T01:00:00Z"
+    pipeline.package_update("XSD1", "1Z1", "运输中", observed_at=observed,
+                            official_tracking={"status_en": "On the Way"},
+                            official_result_hash="a" * 64)
+
+    result = pipeline.package_update(
+        "XSD1", "1Z1", "运输中", observed_at=observed,
+        official_tracking={"status_en": "Exception"}, official_result_hash="b" * 64)
+
+    assert result["reason"] == "conflicting observation"
+    assert pipeline.STORE.get_shipment("XSD1")["packages"][0][
+        "official_tracking"]["status_en"] == "On the Way"
+
+
+def test_api_snapshot_can_follow_dom_observation_at_same_new_watermark(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "已预报",
+        "history": [], "products": []})
+    pipeline.add_package("XSD1", "1Z1", "UPS")
+    pipeline.package_update(
+        "XSD1", "1Z1", "运输中", observed_at="2026-09-15T01:00:00Z",
+        official_tracking={"observed_at": "2026-09-15T01:00:00Z", "status_en": "old"},
+        official_result_hash="a" * 64)
+    pipeline.package_update(
+        "XSD1", "1Z1", "运输中", observed_at="2026-09-15T02:00:00Z")
+
+    result = pipeline.package_update(
+        "XSD1", "1Z1", "运输中", observed_at="2026-09-15T02:00:00Z",
+        official_tracking={"observed_at": "2026-09-15T02:00:00Z", "status_en": "new"},
+        official_result_hash="b" * 64)
+
+    assert result.get("reason") != "conflicting observation"
+    assert pipeline.STORE.get_shipment("XSD1")["packages"][0][
+        "official_tracking"]["status_en"] == "new"
+
+
 def test_legacy_unversioned_package_accepts_version_zero(monkeypatch, tmp_path):
     pipeline = load_pipeline(monkeypatch, tmp_path)
     pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "已预报",
