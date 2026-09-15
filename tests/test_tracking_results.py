@@ -38,3 +38,12 @@ def test_multiple_packages_roll_up_independent_of_completion_order(monkeypatch, 
     for row in reversed(rows): reverse = module.merge_package_result(reverse, row, expected)
     assert forward["stage"] == reverse["stage"] == "部分签收"
     assert forward["ok"] is reverse["ok"] is True
+
+
+def test_batch_reports_worker_exception(monkeypatch, tmp_path):
+    module = load_module(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, "one", lambda *_args: (_ for _ in ()).throw(RuntimeError("db failed")))
+
+    result = module.run_batch([("XSD1", {"tracking": "A"})])
+
+    assert result == {"expected": 1, "completed": 0, "failed": 1}

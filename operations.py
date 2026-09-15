@@ -16,6 +16,24 @@ def _datetime(value):
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
 
 
+def _latest_activity(current, package, shipment):
+    latest = current.get("latest_event") or {}
+    values = [latest.get(key) for key in ("occurred_at_utc", "occurred_at")]
+    for event in current.get("events") or []:
+        values.extend(event.get(key) for key in ("occurred_at_utc", "occurred_at"))
+    parsed = []
+    for value in values:
+        try:
+            timestamp = _datetime(value)
+        except (TypeError, ValueError):
+            timestamp = None
+        if timestamp:
+            parsed.append(timestamp)
+    if parsed:
+        return max(parsed)
+    return _datetime(package.get("status_observed_at") or shipment.get("status_observed_at"))
+
+
 def refresh_operational_tasks(store, now=None, thresholds=None, freshness_hours=None):
     now = (now or datetime.now(UTC)).astimezone(UTC)
     thresholds = {str(k).upper(): float(v) for k, v in (thresholds or {}).items() if v not in (None, "")}
@@ -92,25 +110,28 @@ def refresh_operational_tasks(store, now=None, thresholds=None, freshness_hours=
                 "stalled", order, [], "tracking unavailable or stale; stall decision blocked")
             continue
 
-        carrier = result.get("carrier") or detect_carrier(shipment.get("intl"), shipment.get("carrier"))
-        terminal = shipment.get("status") in ("签收", "退回")
-        threshold = thresholds.get(carrier)
-        changed_at = _datetime(shipment.get("status_observed_at"))
-        if threshold is None or changed_at is None or terminal:
-            store.sync_operational_tasks(
-                "stalled", order, [], "stall condition cleared or unavailable")
-            continue
-        if (now - changed_at).total_seconds() >= threshold * 3600:
-            key = f"stalled:{order}:{shipment.get('status_observed_at')}"
-            store.sync_operational_tasks("stalled", order, [(key, {
-                "order": order, "carrier": carrier,
-                "tracking": shipment.get("intl"), "reason": "logistics status has not moved",
-                "last_status_at": shipment.get("status_observed_at"),
-                "threshold_hours": threshold})], "logistics status moved within threshold")
-            created.append((order, "stalled"))
-        else:
-            store.sync_operational_tasks(
-                "stalled", order, [], "logistics status moved within threshold")
+        package_by_tracking = {item.get("tracking"): item for item in packages}
+        stalled_tasks = []
+        for current in evaluations:
+            tracking = current.get("tracking") or shipment.get("intl")
+            package = package_by_tracking.get(tracking) or shipment
+            carrier = current.get("carrier") or package.get("carrier") or detect_carrier(
+                tracking, shipment.get("carrier"))
+            threshold = thresholds.get(carrier)
+            terminal = (current.get("stage") or package.get("status") or shipment.get("status")) in (
+                "签收", "退回")
+            activity = _latest_activity(current, package, shipment)
+            if threshold is None or activity is None or terminal:
+                continue
+            if (now - activity).total_seconds() >= threshold * 3600:
+                key = f"stalled:{order}:{tracking or 'N/A'}:{activity.isoformat()}"
+                stalled_tasks.append((key, {
+                    "order": order, "carrier": carrier or "N/A", "tracking": tracking or "N/A",
+                    "reason": "logistics status has not moved", "last_status_at": activity.isoformat(),
+                    "threshold_hours": threshold}))
+                created.append((order, "stalled"))
+        store.sync_operational_tasks(
+            "stalled", order, stalled_tasks, "logistics status moved within threshold")
     for order in operational_orders - set(shipments):
         if order:
             clear_operational_tasks(order, "shipment no longer exists")

@@ -72,7 +72,7 @@ TRACK_TIMES="${TRACK_TIMES:-09:05,15:05}"
     HM=$(date +%H:%M)
     TODAY=$(date +%F)
     for T in $(echo "$TRACK_TIMES" | tr ',' ' '); do
-      if [ "$HM" = "$T" ]; then
+      if [[ "$HM" == "$T" || "$HM" > "$T" ]]; then
         MARK=/app/data/.tracked_$T
         if [ "$(cat "$MARK" 2>/dev/null)" != "$TODAY" ]; then
           echo "[scheduler] $T periodic track run"

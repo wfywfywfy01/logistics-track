@@ -109,10 +109,27 @@ def one(order, package):
         done_count[0] += 1
         print("[%d/%d] %s %s -> %s" % (done_count[0], len(pairs), order, tn,
                                        r.get("stage") or ("ERR:" + r.get("error", "")[:40])), flush=True)
+    return r
 
 
-# 2 个并发浏览器(容器内存 1.5G, 再多会 OOM)
-with ThreadPoolExecutor(max_workers=2) as ex:
-    for order, package in pairs:
-        ex.submit(one, order, package)
-print("DONE", flush=True)
+def run_batch(rows):
+    completed = 0
+    failed = 0
+    # 2 个并发浏览器(容器内存 1.5G, 再多会 OOM)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(one, order, package) for order, package in rows]
+        for future in futures:
+            try:
+                future.result()
+                completed += 1
+            except Exception as error:
+                failed += 1
+                print("worker failed: %s" % str(error)[:150], flush=True)
+    return {"expected": len(rows), "completed": completed, "failed": failed}
+
+
+batch = run_batch(pairs)
+print("DONE expected=%d completed=%d failed=%d" % (
+    batch["expected"], batch["completed"], batch["failed"]), flush=True)
+if batch["failed"]:
+    raise SystemExit(1)

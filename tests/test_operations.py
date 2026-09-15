@@ -270,3 +270,41 @@ def test_daily_freshness_counts_each_package_carrier(tmp_path):
     assert report["carrier_freshness"]["UPS"]["total"] == 1
     assert report["carrier_freshness"]["FEDEX"]["latest_observed_at"] == \
         "2026-09-08T00:00:00+00:00"
+
+
+def test_recent_official_scan_prevents_false_stall_when_stage_is_unchanged(tmp_path):
+    store = Storage(tmp_path)
+    store.upsert_shipment("XSD1", shipment(observed="2026-09-07T00:00:00+00:00"))
+    store.put_document("ups_results", {"XSD1": {"tracking": "1Z1", "carrier": "UPS",
+        "ok": True, "stage": "运输中", "observed_at": "2026-09-10T11:30:00+00:00",
+        "latest_event": {"occurred_at_utc": "2026-09-10T11:00:00Z"}}})
+
+    refresh_operational_tasks(
+        store, datetime(2026, 9, 10, 12, tzinfo=UTC), {"UPS": 48})
+
+    assert "stalled" not in store.task_counts()
+
+
+def test_stall_is_evaluated_per_package_and_carrier(tmp_path):
+    store = Storage(tmp_path)
+    item = shipment(observed="2026-09-10T11:00:00+00:00")
+    item["packages"] = [
+        {"tracking": "1Z1", "carrier": "UPS", "status": "运输中", "active": True},
+        {"tracking": "876543210123", "carrier": "FEDEX", "status": "运输中", "active": True},
+    ]
+    store.upsert_shipment("XSD1", item)
+    store.put_document("ups_results", {"XSD1": {"ok": True, "package_results": {
+        "1Z1": {"tracking": "1Z1", "carrier": "UPS", "ok": True, "stage": "运输中",
+                "observed_at": "2026-09-10T11:30:00+00:00",
+                "latest_event": {"occurred_at_utc": "2026-09-10T11:00:00Z"}},
+        "876543210123": {"tracking": "876543210123", "carrier": "FEDEX", "ok": True,
+                         "stage": "运输中", "observed_at": "2026-09-10T11:30:00+00:00",
+                         "latest_event": {"occurred_at_utc": "2026-09-07T00:00:00Z"}},
+    }}})
+
+    refresh_operational_tasks(
+        store, datetime(2026, 9, 10, 12, tzinfo=UTC), {"UPS": 48, "FEDEX": 48})
+
+    active = store.list_tasks(("pending",), kinds=("stalled",))
+    assert [(row["payload"]["tracking"], row["payload"]["carrier"])
+            for row in active] == [("876543210123", "FEDEX")]

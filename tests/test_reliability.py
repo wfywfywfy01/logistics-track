@@ -546,6 +546,16 @@ def test_notification_only_queue_is_drained(monkeypatch, tmp_path):
                       "--bot-app-id", "bot"]]
 
 
+def test_busy_auto_track_is_not_reported_as_success(monkeypatch, tmp_path):
+    auto_track = load_auto_track(monkeypatch, tmp_path)
+    monkeypatch.setattr(auto_track.robust, "FileLock", lambda *_args, **_kwargs:
+                        (_ for _ in ()).throw(TimeoutError("busy")))
+    monkeypatch.setattr(
+        sys, "argv", ["auto-track.py", "--channel-id", "channel", "--mode", "full"])
+
+    assert auto_track.main() == 75
+
+
 def test_message_completion_and_pipeline_task_are_atomic(tmp_path):
     from storage import Storage
     store = Storage(tmp_path)

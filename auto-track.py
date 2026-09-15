@@ -138,7 +138,7 @@ def main():
             return execute(options)
     except TimeoutError:
         print("auto-track already running", flush=True)
-        return 0
+        return 75
 
 if __name__ == "__main__":
     raise SystemExit(main())
