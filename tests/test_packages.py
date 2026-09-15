@@ -28,7 +28,8 @@ def test_package_replacement_keeps_history_and_rejects_stale_result(monkeypatch,
     pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "已预报",
         "history": [], "products": []})
     first = pipeline.add_package("XSD1", "876543210121", "FedEx")
-    replaced = pipeline.replace_package("XSD1", "876543210121", "876543210124", "ops")
+    replaced = pipeline.replace_package(
+        "XSD1", "876543210121", "876543210124", "ops", "carrier relabelled")
 
     stale = pipeline.package_update("XSD1", "876543210121", "签收",
                                     binding_version=first["binding_version"])
@@ -72,7 +73,8 @@ def test_package_replacement_rejects_tracking_already_on_order(monkeypatch, tmp_
     pipeline.add_package("XSD1", "876543210121", "FedEx")
     pipeline.add_package("XSD1", "876543210122", "FedEx")
 
-    result = pipeline.replace_package("XSD1", "876543210121", "876543210122", "ops")
+    result = pipeline.replace_package(
+        "XSD1", "876543210121", "876543210122", "ops", "carrier relabelled")
 
     assert result == {"replaced": False, "error": "duplicate tracking"}
 
@@ -94,6 +96,20 @@ def test_package_change_and_audit_are_atomic(monkeypatch, tmp_path):
     except sqlite3.IntegrityError:
         pass
     assert pipeline.STORE.get_shipment("XSD1")["packages"][0]["tracking"] == "876543210121"
+
+
+def test_package_replacement_requires_operator_and_reason(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中",
+        "history": [], "products": []})
+    pipeline.add_package("XSD1", "876543210121", "FedEx")
+
+    assert pipeline.replace_package(
+        "XSD1", "876543210121", "876543210124", "", "reason")["error"] == \
+        "operator and reason are required"
+    assert pipeline.replace_package(
+        "XSD1", "876543210121", "876543210124", "ops", "")["error"] == \
+        "operator and reason are required"
 
 
 def test_package_status_does_not_move_backwards(monkeypatch, tmp_path):

@@ -256,8 +256,35 @@ def test_secondary_package_staleness_blocks_order_stall_decision(tmp_path):
             for row in active] == [("tracking_stale", "876543210123", "FEDEX")]
 
 
+def test_failed_package_does_not_hide_another_package_stall(tmp_path):
+    store = Storage(tmp_path)
+    item = shipment(observed="2026-09-07T00:00:00+00:00")
+    item["packages"] = [
+        {"tracking": "1Z1", "carrier": "UPS", "status": "运输中", "active": True},
+        {"tracking": "876543210123", "carrier": "FEDEX", "status": "运输中", "active": True},
+    ]
+    store.upsert_shipment("XSD1", item)
+    store.put_document("ups_results", {"XSD1": {"package_results": {
+        "1Z1": {"tracking": "1Z1", "carrier": "UPS", "ok": False,
+                "observed_at": "2026-09-10T11:00:00Z", "error": "timeout"},
+        "876543210123": {"tracking": "876543210123", "carrier": "FEDEX", "ok": True,
+                         "stage": "运输中", "observed_at": "2026-09-10T11:00:00Z",
+                         "latest_event": {"occurred_at_utc": "2026-09-07T00:00:00Z"}},
+    }}})
+
+    refresh_operational_tasks(
+        store, datetime(2026, 9, 10, 12, tzinfo=UTC), {"UPS": 48, "FEDEX": 48})
+
+    active = store.list_tasks(("pending",))
+    assert {(row["kind"], row["payload"]["tracking"]) for row in active} == {
+        ("tracking_failure", "1Z1"), ("stalled", "876543210123")}
+
+
 def test_daily_freshness_counts_each_package_carrier(tmp_path):
     store = Storage(tmp_path)
+    store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中", "packages": [
+        {"tracking": "1Z1", "carrier": "UPS", "active": True},
+        {"tracking": "876543210123", "carrier": "FEDEX", "active": True}]})
     store.put_document("ups_results", {"XSD1": {"ok": True, "package_results": {
         "1Z1": {"tracking": "1Z1", "carrier": "UPS", "ok": True,
                 "observed_at": "2026-09-10T11:30:00+00:00"},
@@ -323,6 +350,10 @@ def test_daily_report_counts_all_unresolved_tasks_beyond_preview_limit(tmp_path)
 
 def test_daily_report_separates_status_history_and_eta_coverage(tmp_path):
     store = Storage(tmp_path)
+    store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中", "packages": [
+        {"tracking": "1Z1", "carrier": "UPS", "active": True},
+        {"tracking": "1Z2", "carrier": "UPS", "active": True},
+        {"tracking": "1Z3", "carrier": "UPS", "active": True}]})
     store.put_document("ups_results", {"XSD1": {"ok": True, "package_results": {
         "1Z1": {"tracking": "1Z1", "carrier": "UPS", "ok": True,
                 "observed_at": "2026-09-10T11:30:00+00:00", "events": [{}],
@@ -334,5 +365,6 @@ def test_daily_report_separates_status_history_and_eta_coverage(tmp_path):
     report = build_daily_report(store)
 
     assert report["carrier_freshness"]["UPS"] == {
-        "total": 2, "ok": 2, "with_events": 1, "with_estimated_delivery": 1,
+        "total": 3, "ok": 2, "missing_result": 1, "with_events": 1,
+        "with_estimated_delivery": 1,
         "latest_observed_at": "2026-09-10T11:30:00+00:00"}

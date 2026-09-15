@@ -39,17 +39,33 @@ def create_backup(output=None, data_dir=None, tmp_dir=None):
             target.close()
             source.close()
         check = sqlite3.connect(snapshot)
+        check.row_factory = sqlite3.Row
         try:
             if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise RuntimeError("SQLite backup integrity check failed")
+            inbox_rows = {row["id"]: dict(row) for row in check.execute(
+                "SELECT id,payload,status FROM inbox")}
+            protected_ids = {item_id for item_id, row in inbox_rows.items()
+                             if row["status"] in ("pending", "retry", "running", "dead")}
+            for row in check.execute(
+                    "SELECT payload FROM tasks WHERE status IN "
+                    "('pending','retry','running','dead','unknown')"):
+                payload = json.loads(row["payload"])
+                source_id = payload.get("source_inbox_id") or payload.get("inbox_id")
+                if source_id:
+                    protected_ids.add(str(source_id))
         finally:
             check.close()
         tmp_dir = Path(tmp_dir or os.environ.get("LOGIBOT_TMP_DIR") or
                        ("/app/tmp" if Path("/app/tmp").is_dir() else "tmp")).resolve()
         roots = {"data": store.data_dir.resolve(), "tmp": tmp_dir}
         evidence = []
-        for item in store.get_inbox(("pending", "retry", "running", "dead")):
-            raw = str((item.get("payload") or {}).get("path") or "")
+        for item_id in sorted(protected_ids):
+            item = inbox_rows.get(item_id)
+            if not item:
+                continue
+            payload = json.loads(item["payload"])
+            raw = str(payload.get("path") or "")
             if not raw:
                 continue
             path = Path(raw)
@@ -61,13 +77,13 @@ def create_backup(output=None, data_dir=None, tmp_dir=None):
                           for name, root in roots.items()
                           if candidate == root or candidate.is_relative_to(root)), None)
             if not match:
-                raise FileNotFoundError("required evidence is missing: inbox %s" % item["id"])
+                raise FileNotFoundError("required evidence is missing: inbox %s" % item_id)
             root_name, relative = match
             archive_name = "evidence/%s/%s/%s" % (
-                root_name, hashlib.sha256(str(item["id"]).encode()).hexdigest()[:16],
+                root_name, hashlib.sha256(item_id.encode()).hexdigest()[:16],
                 relative.as_posix())
             content = (roots[root_name] / relative).read_bytes()
-            evidence.append({"inbox_id": item["id"], "root": root_name,
+            evidence.append({"inbox_id": item_id, "root": root_name,
                              "path": relative.as_posix(), "archive": archive_name,
                              "sha256": hashlib.sha256(content).hexdigest()})
         manifest = {"created_at": iso(), "database": "shipments.db",

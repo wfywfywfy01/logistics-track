@@ -42,5 +42,11 @@ services:
 
 volumes:
   logistics-data:
+    name: logistics-data
+    external: true
   logistics-tmp:
+    name: logistics-tmp
+    external: true
   logistics-backups:
+    name: logistics-backups
+    external: true

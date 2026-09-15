@@ -89,6 +89,51 @@ def test_exception_uses_unified_group_notification(monkeypatch, tmp_path):
     assert task["payload"]["body"] == queued[0]["line"]
 
 
+def test_rapid_status_changes_persist_each_notification_in_same_transaction(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {
+        "orderNo": "XSD1", "status": "运输中", "intl": "1Z1", "history": [],
+        "products": [], "binding_version": 1,
+    })
+
+    pipeline.track_update("XSD1", "异常", observed_at="2026-09-10T01:00:00Z")
+    pipeline.track_update("XSD1", "运输中", observed_at="2026-09-10T02:00:00Z")
+
+    tasks = pipeline.STORE.list_tasks(("pending",), kinds=("notify_group",))
+    assert [task["payload"]["status"] for task in reversed(tasks)] == ["异常", "运输中"]
+
+
+def test_notification_enqueue_failure_rolls_back_status_change(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {
+        "orderNo": "XSD1", "status": "运输中", "intl": "1Z1", "history": [],
+        "products": [], "binding_version": 1,
+    })
+    with pipeline.STORE.connect() as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_notify BEFORE INSERT ON tasks
+               WHEN NEW.kind='notify_group' BEGIN SELECT RAISE(ABORT,'queue unavailable'); END""")
+
+    with pytest.raises(Exception, match="queue unavailable"):
+        pipeline.track_update("XSD1", "异常", observed_at="2026-09-10T01:00:00Z")
+
+    assert pipeline.STORE.get_shipment("XSD1")["status"] == "运输中"
+
+
+def test_cli_nonzero_delivery_is_a_retryable_rejection(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {
+        "orderNo": "XSD1", "status": "运输中", "intl": "1Z1", "history": [],
+        "products": [], "needs_notify": True, "binding_version": 1,
+    })
+    monkeypatch.setattr(pipeline.robust, "cli_run", lambda _args: (1, "", "rejected"))
+
+    result = pipeline.notify("channel")
+
+    assert result["failed"] == 1
+    assert pipeline.STORE.pending_task_count("notify_group") == 1
+
+
 def test_unknown_delivery_outcome_is_held_for_manual_review(monkeypatch, tmp_path):
     pipeline = load_pipeline(monkeypatch, tmp_path)
     pipeline.STORE.upsert_shipment("XSD1", {

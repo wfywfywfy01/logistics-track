@@ -1,7 +1,9 @@
 import os
+import gc
 import json
 import time
 import zipfile
+from pathlib import Path
 import pytest
 from backup import create_backup
 from restore_backup import restore
@@ -73,6 +75,99 @@ def test_backup_fails_when_required_evidence_is_missing(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="required evidence"):
         create_backup(tmp_path / "backup.zip", source, tmp_path / "source-tmp")
+
+
+def test_backup_includes_succeeded_inbox_referenced_by_open_review(tmp_path):
+    source = tmp_path / "source"
+    source_tmp = tmp_path / "source-tmp"
+    source_tmp.mkdir()
+    label = source_tmp / "review.png"
+    label.write_bytes(b"review-image")
+    store = Storage(source)
+    store.enqueue_inbox("label-review", {"path": str(label)})
+    store.complete_inbox_with_task(
+        "label-review", "review", "review:label-review",
+        {"source_inbox_id": "label-review", "reason": "manual review"})
+
+    archive = create_backup(tmp_path / "backup.zip", source, source_tmp)
+    restore(archive, tmp_path / "target", tmp_dir=tmp_path / "target-tmp")
+
+    assert (tmp_path / "target-tmp" / "review.png").read_bytes() == b"review-image"
+
+
+def test_backup_evidence_selection_comes_from_database_snapshot(monkeypatch, tmp_path):
+    source = tmp_path / "source"
+    source_tmp = tmp_path / "source-tmp"
+    source_tmp.mkdir()
+    label = source_tmp / "label.png"
+    label.write_bytes(b"image")
+    store = Storage(source)
+    store.enqueue_inbox("label-1", {"path": str(label)})
+    monkeypatch.setattr(Storage, "get_inbox",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("live read")))
+
+    archive = create_backup(tmp_path / "backup.zip", source, source_tmp)
+
+    assert archive.is_file()
+
+
+def test_restore_rolls_back_evidence_when_switch_fails(monkeypatch, tmp_path):
+    source = tmp_path / "source"
+    source_tmp = tmp_path / "source-tmp"
+    source_tmp.mkdir()
+    store = Storage(source)
+    store.upsert_shipment("NEW", {"orderNo": "NEW", "status": "已预报"})
+    for item_id, name, content in (("one", "one.png", b"new-one"),
+                                   ("two", "two.png", b"new-two")):
+        path = source_tmp / name
+        path.write_bytes(content)
+        store.enqueue_inbox(item_id, {"path": str(path)})
+    archive = create_backup(tmp_path / "backup.zip", source, source_tmp)
+
+    target = tmp_path / "target"
+    target_tmp = tmp_path / "target-tmp"
+    target_tmp.mkdir()
+    target_store = Storage(target)
+    target_store.upsert_shipment("OLD", {"orderNo": "OLD", "status": "已预报"})
+    del target_store
+    gc.collect()
+    (target_tmp / "one.png").write_bytes(b"old-one")
+    real_replace = os.replace
+    failed = False
+
+    def fail_second_evidence(src, dst):
+        nonlocal failed
+        if not failed and Path(dst).name == "two.png":
+            failed = True
+            raise OSError("evidence switch failed")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("restore_backup.os.replace", fail_second_evidence)
+
+    with pytest.raises(OSError, match="evidence switch failed"):
+        restore(archive, target, force=True, tmp_dir=target_tmp)
+
+    assert Storage(target).get_shipment("OLD") is not None
+    assert Storage(target).get_shipment("NEW") is None
+    assert (target_tmp / "one.png").read_bytes() == b"old-one"
+    assert not (target_tmp / "two.png").exists()
+
+
+def test_forced_restore_preserves_previous_database(tmp_path):
+    source = tmp_path / "source"
+    Storage(source).upsert_shipment("NEW", {"orderNo": "NEW", "status": "已预报"})
+    archive = create_backup(tmp_path / "backup.zip", source)
+    target = tmp_path / "target"
+    target_store = Storage(target)
+    target_store.upsert_shipment("OLD", {"orderNo": "OLD", "status": "已预报"})
+    del target_store
+    gc.collect()
+
+    restore(archive, target, force=True)
+
+    previous = Storage(target / "unused")
+    previous.path = target / "shipments.db.pre-restore"
+    assert previous.get_shipment("OLD") is not None
 
 
 def test_backup_prunes_only_expired_managed_archives(monkeypatch, tmp_path):

@@ -39,10 +39,19 @@ def cli(args):
         raise
     except Exception:
         return None
-    return out if rc == 0 else None
+    if rc != 0:
+        raise CliRejected((out or "command rejected")[:300])
+    return out
+
+
+class CliRejected(RuntimeError):
+    pass
 
 def cli_json(args):
-    out = cli(args)
+    try:
+        out = cli(args)
+    except CliRejected:
+        return None
     try: return json.loads(out) if out else None
     except Exception: return None
 
@@ -221,10 +230,13 @@ def _ingest_pair(order, intl, force=False):
             current["status"] = "已出国际单"
             current["status_observed_at"] = event_at
             current["needs_notify"] = True
+            tasks = _event_notification_tasks(order, current, current["history"][-1])
+        else:
+            tasks = []
         outcome.update({"paired": order, "intl": intl,
                         "salesperson": current.get("salesperson", ""),
                         "binding_version": current.get("binding_version", 0)})
-        return current, []
+        return current, tasks
 
     STORE.mutate_shipment(order, bind)
     return outcome
@@ -247,6 +259,34 @@ def norm_status(s):
     for k, v in ALIASES.items():
         if k in low: return v
     return None
+
+
+def _event_notification_tasks(order, shipment, event, channel_id=None, bot_app_id=None):
+    status = event.get("to") or shipment.get("status", "-")
+    event_key = event.get("at") or event.get("observed_at")
+    if not event_key:
+        return []
+    product = (shipment.get("products") or [""])[0]
+    prefix = "⚠️" if status in EXCEPTIONS else ""
+    line = prefix + "【物流小助手】%s %s→%s｜国际单 %s｜顺丰 %s｜%s｜录单人 %s" % (
+        order, event.get("from", "-"), status, shipment.get("intl") or "-",
+        shipment.get("domestic") or "-", product[:24], shipment.get("salesperson") or "未匹配")
+    tasks = [{"kind": "notify_group", "dedupe_key": f"group:{order}:{event_key}",
+              "payload": {"order": order, "status": status, "event_key": event_key,
+                          "dedupe_key": f"group:{order}:{event_key}",
+                          "channel_id": channel_id or os.environ.get("CHANNEL_ID") or "",
+                          "body": line}}]
+    if shipment.get("salesperson"):
+        dm = "你的订单 %s 物流更新：%s（国际单 %s）" % (
+            order, status, shipment.get("intl") or "-")
+        tasks.append({"kind": "notify_dm", "dedupe_key": f"dm:{order}:{event_key}",
+                      "payload": {"order": order, "status": status,
+                                  "name": shipment["salesperson"],
+                                  "uid": shipment.get("salesperson_id"),
+                                  "event_key": event_key,
+                                  "bot_app_id": bot_app_id or os.environ.get("BOT_APP_ID"),
+                                  "body": dm}})
+    return tasks
 
 
 def _packages(shipment):
@@ -300,8 +340,11 @@ def add_package(order, tracking, carrier="", operator=None, reason=None):
                  "detail": "package added"})
             shipment["status"] = new; shipment["status_observed_at"] = event_at
             shipment["needs_notify"] = True
+            tasks = _event_notification_tasks(order, shipment, shipment["history"][-1])
+        else:
+            tasks = []
         outcome.update({"added": True, "tracking": tracking, "binding_version": version})
-        return shipment, []
+        return shipment, tasks
     audit = ({"entity_type": "package", "entity_id": tracking, "action": "add",
               "operator": operator, "reason": reason}
              if operator and reason else None)
@@ -311,6 +354,8 @@ def add_package(order, tracking, carrier="", operator=None, reason=None):
 
 
 def replace_package(order, current_tracking, new_tracking, operator, reason=None):
+    if not trim(operator) or not trim(reason):
+        return {"replaced": False, "error": "operator and reason are required"}
     detected = detect_carrier(new_tracking)
     if not detected:
         return {"replaced": False, "error": "unknown carrier"}
@@ -350,7 +395,7 @@ def replace_package(order, current_tracking, new_tracking, operator, reason=None
         shipment["status_observed_at"] = event_at
         shipment["needs_notify"] = True
         outcome.update({"replaced": True, **package})
-        return shipment, []
+        return shipment, _event_notification_tasks(order, shipment, shipment["history"][-1])
     audit = ({"entity_type": "package", "entity_id": current_tracking, "action": "replace",
               "operator": operator, "reason": reason} if reason else None)
     if STORE.mutate_shipment(order, replace, audit=audit) is None:
@@ -418,8 +463,11 @@ def package_update(order, tracking, status, detail="", observed_at=None, binding
                 "detail": "package status rollup"})
             shipment["status"] = aggregate; shipment["status_observed_at"] = observed
             shipment["needs_notify"] = True
+            tasks = _event_notification_tasks(order, shipment, shipment["history"][-1])
+        else:
+            tasks = []
         outcome.update({"changed": changed, "status": aggregate, "tracking": tracking})
-        return shipment, []
+        return shipment, tasks
     if STORE.mutate_shipment(order, update) is None:
         return {"changed": False, "error": "unknown order"}
     return outcome
@@ -557,12 +605,15 @@ def _track_update(order, status, detail="", observed_at=None, tracking=None,
             it["status"] = ns
             it["needs_notify"] = True
             it["status_observed_at"] = seen_at
+            tasks = _event_notification_tasks(order, it, it["history"][-1])
+        else:
+            tasks = []
         it["last_observation"] = {"status": ns, "observed_at": seen_at,
                                   "tracking": tracking, "detail": detail[:200]}
         result.update({"order": order, "status": it["status"], "changed": changed})
         if not changed:
             result["reason"] = "no forward transition"
-        return it, []
+        return it, tasks
 
     if STORE.mutate_shipment(order, update) is None:
         return {"error": "unknown order", "order": order}
@@ -601,26 +652,17 @@ def _queue_notifications(channel_id, bot_app_id=None, enqueue=True):
     for order, it in STORE.get_shipments().items():
         if not it.get("needs_notify"):
             continue
-        status = it.get("status", "-")
-        version = int(it.get("binding_version") or 0)
         h = (it.get("history") or [{}])[-1]
-        event_key = h.get("at") or h.get("observed_at") or f"legacy:{status}:{version}"
-        product = (it.get("products") or [""])[0]
-        prefix = "⚠️" if status in EXCEPTIONS else ""
-        line = prefix + "【物流小助手】%s %s→%s｜国际单 %s｜顺丰 %s｜%s｜录单人 %s" % (
-            order, h.get("from", "-"), h.get("to", status), it.get("intl") or "-",
-            it.get("domestic") or "-", product[:24], it.get("salesperson") or "未匹配")
+        if not h.get("at") and not h.get("observed_at"):
+            h = {**h, "at": "legacy:%s:%s" % (
+                it.get("status", "-"), int(it.get("binding_version") or 0))}
+        tasks = _event_notification_tasks(order, it, h, channel_id, bot_app_id)
+        line = tasks[0]["payload"]["body"]
         if enqueue:
-            STORE.enqueue_task("notify_group", f"group:{order}:{event_key}",
-                               {"order": order, "status": status, "event_key": event_key,
-                                "dedupe_key": f"group:{order}:{event_key}",
-                                "channel_id": channel_id, "body": line})
-        if enqueue and it.get("salesperson") and it.get("dm_notified_event") != event_key:
-            dm = "你的订单 %s 物流更新：%s（国际单 %s）" % (order, status, it.get("intl") or "-")
-            STORE.enqueue_task("notify_dm", f"dm:{order}:{event_key}",
-                               {"order": order, "status": status, "name": it["salesperson"],
-                                "uid": it.get("salesperson_id"), "event_key": event_key,
-                                "bot_app_id": bot_app_id, "body": dm})
+            for task in tasks:
+                if (task["kind"] != "notify_dm" or
+                        it.get("dm_notified_event") != task["payload"]["event_key"]):
+                    STORE.enqueue_task(task["kind"], task["dedupe_key"], task["payload"])
         queued.append({"order": order, "line": line})
     return queued
 
@@ -636,12 +678,14 @@ def _delivery_outcome(output):
     return "accepted" if parsed.get("ok") is True else "rejected"
 
 
-def _drain_notification_kind(kind, worker):
+def _drain_notification_kind(kind, worker, channel_id=None, bot_app_id=None):
     results = []
-    while True:
+    remaining = STORE.pending_task_count(kind)
+    while remaining > 0:
         task = STORE.claim_task(worker, lease_seconds=120, kind=kind)
         if not task:
             break
+        remaining -= 1
         payload = task["payload"]
         delivery_started = False
         try:
@@ -653,7 +697,8 @@ def _drain_notification_kind(kind, worker):
                 delivery_started = True
                 out = cli(["im", "+agent-notify", "--target", "im", "--agent-slug", "logistics-track",
                            "--agent-name", "物流小助手", "--bot-name", "物流小助手",
-                           "--channel-id", payload["channel_id"], "--body", payload["body"], "--no-json"])
+                           "--channel-id", payload.get("channel_id") or channel_id,
+                           "--body", payload["body"], "--no-json"])
                 outcome = _delivery_outcome(out)
                 if outcome != "accepted":
                     if outcome == "rejected": delivery_started = False
@@ -664,7 +709,7 @@ def _drain_notification_kind(kind, worker):
             else:
                 uid = payload.get("uid") or resolve_user(payload["name"])
                 if not uid: raise RuntimeError("recipient is missing or ambiguous")
-                app_id = payload.get("bot_app_id")
+                app_id = payload.get("bot_app_id") or bot_app_id
                 args = (["im", "+bot-send-user", "--app-id", app_id, "--user-id", str(uid), "--body", payload["body"]]
                         if app_id else ["im", "+send-user", "--user-id", str(uid), "--body", payload["body"]])
                 STORE.mark_delivery_inflight(task["id"])
@@ -678,6 +723,10 @@ def _drain_notification_kind(kind, worker):
                                             {"dm_notified_status": payload["status"],
                                              "dm_notified_event": payload["event_key"]}, out)
             results.append({"order": payload["order"], "kind": kind, "ok": True})
+        except CliRejected as error:
+            STORE.fail_task(task["id"], str(error), max_attempts=10)
+            results.append({"order": payload.get("order"), "kind": kind, "ok": False,
+                            "unknown": False})
         except Exception as error:
             if delivery_started:
                 STORE.mark_task_unknown(task["id"], "delivery outcome unknown: " + str(error))
@@ -692,8 +741,8 @@ def notify(channel_id, bot_app_id=None, dry=False):
     if dry:
         return {"notified": 0, "items": queued, "dry": True}
     worker = f"notify:{os.getpid()}"
-    results = _drain_notification_kind("notify_group", worker)
-    results.extend(_drain_notification_kind("notify_dm", worker))
+    results = _drain_notification_kind("notify_group", worker, channel_id, bot_app_id)
+    results.extend(_drain_notification_kind("notify_dm", worker, channel_id, bot_app_id))
     return {"notified": sum(1 for row in results if row["ok"]), "items": results,
             "failed": sum(1 for row in results if not row["ok"]), "dry": False}
 
@@ -717,7 +766,7 @@ def main():
     b = sp.add_parser("ingest-pair"); b.add_argument("--order", required=True); b.add_argument("--intl", required=True); b.add_argument("--force", action="store_true")
     c = sp.add_parser("track-update"); c.add_argument("--order", required=True); c.add_argument("--status", required=True); c.add_argument("--detail", default=""); c.add_argument("--observed-at"); c.add_argument("--tracking"); c.add_argument("--binding-version", type=int)
     f = sp.add_parser("add-package"); f.add_argument("--order", required=True); f.add_argument("--tracking", required=True); f.add_argument("--carrier", default=""); f.add_argument("--operator"); f.add_argument("--reason")
-    g = sp.add_parser("replace-package"); g.add_argument("--order", required=True); g.add_argument("--tracking", required=True); g.add_argument("--new-tracking", required=True); g.add_argument("--operator", required=True); g.add_argument("--reason")
+    g = sp.add_parser("replace-package"); g.add_argument("--order", required=True); g.add_argument("--tracking", required=True); g.add_argument("--new-tracking", required=True); g.add_argument("--operator", required=True); g.add_argument("--reason", required=True)
     h = sp.add_parser("package-update"); h.add_argument("--order", required=True); h.add_argument("--tracking", required=True); h.add_argument("--status", required=True); h.add_argument("--detail", default=""); h.add_argument("--observed-at"); h.add_argument("--binding-version", type=int); h.add_argument("--official-from-results", action="store_true"); h.add_argument("--official-result-hash")
     c = sp.add_parser("rematch"); c.add_argument("--order", required=True)
     d = sp.add_parser("list"); d.add_argument("--need-review", action="store_true")

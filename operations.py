@@ -105,14 +105,15 @@ def refresh_operational_tasks(store, now=None, thresholds=None, freshness_hours=
         store.sync_operational_tasks(
             "tracking_stale", order, stale_tasks,
             "tracking data is current or shipment is terminal")
-        if failure_tasks or stale_tasks:
-            store.sync_operational_tasks(
-                "stalled", order, [], "tracking unavailable or stale; stall decision blocked")
-            continue
-
         package_by_tracking = {item.get("tracking"): item for item in packages}
         stalled_tasks = []
         for current in evaluations:
+            if not current.get("ok") or current.get("observed_at") in (None, "N/A"):
+                continue
+            result_observed = _datetime(current.get("observed_at"))
+            if (freshness_hours is not None and
+                    (now - result_observed).total_seconds() >= freshness_hours * 3600):
+                continue
             tracking = current.get("tracking") or shipment.get("intl")
             package = package_by_tracking.get(tracking) or shipment
             carrier = current.get("carrier") or package.get("carrier") or detect_carrier(
@@ -154,15 +155,27 @@ def build_daily_report(store, now=None, freshness_hours=None):
     unresolved = store.list_tasks(("pending", "retry", "dead", "unknown"))
     unresolved_count = store.task_count(("pending", "retry", "dead", "unknown"))
     freshness = {}
-    for result in results.values():
-        rows = list((result.get("package_results") or {}).values()) or [result]
-        for row in rows:
-            carrier = row.get("carrier") or detect_carrier(row.get("tracking")) or "N/A"
+    for order, shipment in shipments.items():
+        packages = [item for item in (shipment.get("packages") or []) if item.get("active", True)]
+        if not packages and shipment.get("intl"):
+            packages = [{"tracking": shipment.get("intl"), "carrier": shipment.get("carrier")}]
+        result = results.get(order) or {}
+        package_results = result.get("package_results") or {}
+        for package in packages:
+            tracking = package.get("tracking")
+            if package_results:
+                row = package_results.get(tracking) or {}
+            else:
+                row = result if result.get("tracking") in (None, tracking) else {}
+            carrier = (package.get("carrier") or row.get("carrier") or
+                       detect_carrier(tracking) or "N/A")
             bucket = freshness.setdefault(
                 carrier, {"total": 0, "ok": 0, "with_events": 0,
-                          "with_estimated_delivery": 0, "latest_observed_at": "N/A"})
+                          "with_estimated_delivery": 0, "missing_result": 0,
+                          "latest_observed_at": "N/A"})
             bucket["total"] += 1
             bucket["ok"] += int(bool(row.get("ok")))
+            bucket["missing_result"] += int(not bool(row))
             bucket["with_events"] += int(bool(row.get("events")))
             bucket["with_estimated_delivery"] += int(bool(row.get("estimated_delivery")))
             observed = row.get("observed_at")
