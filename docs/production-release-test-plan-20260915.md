@@ -4,11 +4,11 @@
 
 候选分支：`codex/production-readiness-fixes`
 
-代码范围：`e1adf41..e48fe06`
+代码范围：`e1adf41..0d60dfc`
 
 ## 当前状态
 
-候选代码已分五个提交完成，本地全量测试为 162 passed、1 skipped；跳过项是 Linux `SIGALRM` 总时限测试。Python 编译、`deploy/entrypoint.sh`、`deploy/deploy-from-git.sh`、Compose 配置和 diff 检查通过。候选尚未推送、构建服务器镜像或切换生产。
+候选代码已分六个功能提交完成，本地全量测试为 166 passed、1 skipped；跳过项是 Linux `SIGALRM` 总时限测试。Python 编译、`deploy/entrypoint.sh`、`deploy/deploy-from-git.sh`、Compose 配置和 diff 检查通过。候选尚未推送、构建服务器镜像或切换生产。
 
 以下测试分为本地、隔离候选、真实官网、灰度生产四层。故障注入、恢复和重复通知测试禁止直接操作生产台账或正式通知渠道。
 
@@ -60,6 +60,7 @@ git diff --check origin/master..HEAD
 | --- | --- |
 | 发送前参数、人员解析或明确拒绝失败 | 保持可重试；未写成功回执 |
 | 发送超时、空回执、未知回执 | 任务进入 unknown，不自动重发 |
+| CLI 非零退出但没有结构化明确拒绝 | 任务进入 unknown；只有 `ok=false` 才自动重试 |
 | 对端成功后本地回执写入失败 | 任务进入 unknown，后续接管不重发 |
 | 状态发送期间又产生新状态 | 旧回执不清除新状态通知标记 |
 | 人工确认 unknown | 当前事件才允许确认；操作者和原因有审计 |
