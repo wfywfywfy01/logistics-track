@@ -308,7 +308,7 @@ class Storage:
                     (order, json.dumps(payload, ensure_ascii=False), timestamp),
                 )
 
-    def mutate_shipment(self, order, mutator, create=False):
+    def mutate_shipment(self, order, mutator, create=False, audit=None):
         """Read and write one shipment under the same SQLite write transaction."""
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -318,6 +318,7 @@ class Storage:
             if not row and not create:
                 return None
             current = json.loads(row["payload"]) if row else None
+            original = json.dumps(current, ensure_ascii=False, sort_keys=True)
             payload, tasks = mutator(current)
             if payload is None:
                 return current
@@ -328,6 +329,13 @@ class Storage:
                    updated_at=excluded.updated_at""",
                 (order, json.dumps(payload, ensure_ascii=False), timestamp),
             )
+            if audit and json.dumps(payload, ensure_ascii=False, sort_keys=True) != original:
+                connection.execute(
+                    """INSERT INTO audit_log(order_no,entity_type,entity_id,action,operator,reason,created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (order, audit["entity_type"], str(audit["entity_id"]), audit["action"],
+                     audit["operator"], audit["reason"], timestamp),
+                )
             for task in tasks:
                 connection.execute(
                     """INSERT OR IGNORE INTO tasks

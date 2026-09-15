@@ -1,4 +1,5 @@
 from test_reliability import load_pipeline
+import sqlite3
 
 
 def test_three_packages_roll_up_to_partial_then_full_delivery(monkeypatch, tmp_path):
@@ -35,6 +36,64 @@ def test_package_replacement_keeps_history_and_rejects_stale_result(monkeypatch,
     assert stale["reason"] == "stale binding"
     assert replaced["binding_history"][0]["from"] == "876543210121"
     assert saved["packages"][0]["tracking"] == "876543210124"
+
+
+def test_signed_package_replacement_archives_old_tracking_and_restarts_order(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "签收",
+        "intl": "876543210121", "carrier": "FEDEX", "needs_notify": False,
+        "history": [], "products": [], "packages": [{
+            "tracking": "876543210121", "carrier": "FEDEX", "status": "签收",
+            "binding_version": 2, "history": [{"to": "签收"}],
+            "official_tracking": {"source": "fedex.com", "events": [{"status": "Delivered"}]},
+            "last_observation": {"status": "签收", "observed_at": "2026-09-10T01:00:00Z"},
+            "observation_observed_at": "2026-09-10T01:00:00Z",
+            "status_observed_at": "2026-09-10T01:00:00Z", "binding_history": []}]})
+
+    result = pipeline.replace_package(
+        "XSD1", "876543210121", "876543210124", "ops", "carrier relabelled")
+
+    saved = pipeline.STORE.get_shipment("XSD1")
+    package = saved["packages"][0]
+    assert result["replaced"] is True
+    assert saved["status"] == "已出国际单" and saved["needs_notify"] is True
+    assert package["tracking"] == "876543210124" and package["status"] == "已出国际单"
+    assert "official_tracking" not in package and "last_observation" not in package
+    assert package["history"] == []
+    assert package["binding_history"][-1]["snapshot"]["official_tracking"]["events"][0][
+        "status"] == "Delivered"
+    assert pipeline.STORE.list_audit("XSD1")[0]["reason"] == "carrier relabelled"
+
+
+def test_package_replacement_rejects_tracking_already_on_order(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中",
+        "history": [], "products": []})
+    pipeline.add_package("XSD1", "876543210121", "FedEx")
+    pipeline.add_package("XSD1", "876543210122", "FedEx")
+
+    result = pipeline.replace_package("XSD1", "876543210121", "876543210122", "ops")
+
+    assert result == {"replaced": False, "error": "duplicate tracking"}
+
+
+def test_package_change_and_audit_are_atomic(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中",
+        "history": [], "products": []})
+    pipeline.add_package("XSD1", "876543210121", "FedEx")
+    with pipeline.STORE.connect() as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_package_audit BEFORE INSERT ON audit_log
+               WHEN NEW.entity_type='package' BEGIN SELECT RAISE(ABORT,'audit unavailable'); END""")
+
+    try:
+        pipeline.replace_package(
+            "XSD1", "876543210121", "876543210124", "ops", "carrier relabelled")
+        assert False, "audit failure must abort package replacement"
+    except sqlite3.IntegrityError:
+        pass
+    assert pipeline.STORE.get_shipment("XSD1")["packages"][0]["tracking"] == "876543210121"
 
 
 def test_package_status_does_not_move_backwards(monkeypatch, tmp_path):

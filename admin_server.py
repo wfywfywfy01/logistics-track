@@ -578,18 +578,18 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                 if not tracking:
                     return self._json(400, {"error": "tracking is required"})
                 code, result = pipeline(["add-package", "--order", unquote(parts[2]),
-                                         "--tracking", tracking, "--carrier", carrier])
+                                         "--tracking", tracking, "--carrier", carrier,
+                                         "--operator", operator, "--reason", reason])
                 if code == 0:
-                    store.record_audit(unquote(parts[2]), "package", tracking, "add", operator, reason)
                     return self._json(200, result)
                 return self._json(400, result)
             if len(parts) == 4 and parts[:2] == ["api", "orders"] and parts[3] == "replace-package":
                 current = str(payload.get("tracking") or "").strip()
                 replacement = str(payload.get("new_tracking") or "").strip()
                 code, result = pipeline(["replace-package", "--order", unquote(parts[2]),
-                    "--tracking", current, "--new-tracking", replacement, "--operator", operator])
+                    "--tracking", current, "--new-tracking", replacement, "--operator", operator,
+                    "--reason", reason])
                 if code == 0:
-                    store.record_audit(unquote(parts[2]), "package", current, "replace", operator, reason)
                     return self._json(200, result)
                 return self._json(400, result)
             if len(parts) == 4 and parts[:2] == ["api", "tasks"]:

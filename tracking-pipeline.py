@@ -4,7 +4,7 @@
 子命令: ingest-forecast | ingest-pair | track-update | list | notify
 台账 data/shipments.json；录单人缓存 data/sales_map.json；定人缓存 data/users_map.json
 """
-import argparse, json, re, subprocess, sys, os
+import argparse, copy, json, re, subprocess, sys, os
 from datetime import datetime
 from pathlib import Path
 import openpyxl
@@ -273,7 +273,7 @@ def _package_rollup(packages):
     return min(statuses, key=lambda status: STAGES.index(status) if status in STAGES else -1)
 
 
-def add_package(order, tracking, carrier=""):
+def add_package(order, tracking, carrier="", operator=None, reason=None):
     detected = detect_carrier(tracking, carrier)
     if not detected:
         return {"added": False, "error": "unknown carrier"}
@@ -302,12 +302,15 @@ def add_package(order, tracking, carrier=""):
             shipment["needs_notify"] = True
         outcome.update({"added": True, "tracking": tracking, "binding_version": version})
         return shipment, []
-    if STORE.mutate_shipment(order, add) is None:
+    audit = ({"entity_type": "package", "entity_id": tracking, "action": "add",
+              "operator": operator, "reason": reason}
+             if operator and reason else None)
+    if STORE.mutate_shipment(order, add, audit=audit) is None:
         return {"added": False, "error": "unknown order"}
     return outcome
 
 
-def replace_package(order, current_tracking, new_tracking, operator):
+def replace_package(order, current_tracking, new_tracking, operator, reason=None):
     detected = detect_carrier(new_tracking)
     if not detected:
         return {"replaced": False, "error": "unknown carrier"}
@@ -317,18 +320,40 @@ def replace_package(order, current_tracking, new_tracking, operator):
         package = next((item for item in packages if item.get("tracking") == current_tracking), None)
         if not package:
             outcome.update({"replaced": False, "error": "package not found"}); return shipment, []
-        event = {"from": current_tracking, "to": new_tracking, "at": iso(), "operator": operator}
+        if new_tracking == current_tracking or any(
+                item is not package and item.get("tracking") == new_tracking for item in packages):
+            outcome.update({"replaced": False, "error": "duplicate tracking"}); return shipment, []
+        snapshot = {key: copy.deepcopy(package[key]) for key in (
+            "tracking", "carrier", "status", "history", "official_tracking", "last_observation",
+            "observation_observed_at", "status_observed_at") if key in package}
+        event_at = iso()
+        event = {"from": current_tracking, "to": new_tracking, "at": event_at,
+                 "operator": operator, "snapshot": snapshot}
         package.setdefault("binding_history", []).append(event)
         package["binding_version"] = int(package.get("binding_version") or 0) + 1
         package["tracking"] = new_tracking
         package["carrier"] = detected
         package["status"] = "已出国际单"
+        package["history"] = []
+        for key in ("official_tracking", "last_observation", "observation_observed_at",
+                    "status_observed_at"):
+            package.pop(key, None)
         if shipment.get("intl") == current_tracking:
             shipment["intl"] = new_tracking; shipment["carrier"] = package["carrier"]
         shipment["binding_version"] = int(shipment.get("binding_version") or 0) + 1
+        old_order = shipment.get("status", "已预报")
+        aggregate = _package_rollup(packages)
+        shipment.setdefault("history", []).append({
+            "from": old_order, "to": aggregate, "at": event_at, "observed_at": event_at,
+            "tracking": new_tracking, "detail": "package replaced"})
+        shipment["status"] = aggregate
+        shipment["status_observed_at"] = event_at
+        shipment["needs_notify"] = True
         outcome.update({"replaced": True, **package})
         return shipment, []
-    if STORE.mutate_shipment(order, replace) is None:
+    audit = ({"entity_type": "package", "entity_id": current_tracking, "action": "replace",
+              "operator": operator, "reason": reason} if reason else None)
+    if STORE.mutate_shipment(order, replace, audit=audit) is None:
         return {"replaced": False, "error": "unknown order"}
     return outcome
 
@@ -581,7 +606,8 @@ def _queue_notifications(channel_id, bot_app_id=None, enqueue=True):
         h = (it.get("history") or [{}])[-1]
         event_key = h.get("at") or h.get("observed_at") or f"legacy:{status}:{version}"
         product = (it.get("products") or [""])[0]
-        line = "【物流小助手】%s %s→%s｜国际单 %s｜顺丰 %s｜%s｜录单人 %s" % (
+        prefix = "⚠️" if status in EXCEPTIONS else ""
+        line = prefix + "【物流小助手】%s %s→%s｜国际单 %s｜顺丰 %s｜%s｜录单人 %s" % (
             order, h.get("from", "-"), h.get("to", status), it.get("intl") or "-",
             it.get("domestic") or "-", product[:24], it.get("salesperson") or "未匹配")
         if enqueue:
@@ -598,14 +624,16 @@ def _queue_notifications(channel_id, bot_app_id=None, enqueue=True):
         queued.append({"order": order, "line": line})
     return queued
 
-def _delivery_ok(output):
+def _delivery_outcome(output):
     if output is None or not str(output).strip():
-        return False
+        return "unknown"
     try:
         parsed = json.loads(output)
     except (TypeError, json.JSONDecodeError):
-        return str(output).strip().lower() in {"ok", "sent", "success"}
-    return isinstance(parsed, dict) and parsed.get("ok") is True
+        return "accepted" if str(output).strip().lower() in {"ok", "sent", "success"} else "unknown"
+    if not isinstance(parsed, dict) or "ok" not in parsed:
+        return "unknown"
+    return "accepted" if parsed.get("ok") is True else "rejected"
 
 
 def _drain_notification_kind(kind, worker):
@@ -615,16 +643,21 @@ def _drain_notification_kind(kind, worker):
         if not task:
             break
         payload = task["payload"]
+        delivery_started = False
         try:
             if kind == "notify_group":
                 body = payload["body"]
                 if body.encode("utf-8").decode("utf-8") != body or "?" in body or "�" in body:
                     raise ValueError("group message failed UTF-8 validation")
                 STORE.mark_delivery_inflight(task["id"])
+                delivery_started = True
                 out = cli(["im", "+agent-notify", "--target", "im", "--agent-slug", "logistics-track",
                            "--agent-name", "物流小助手", "--bot-name", "物流小助手",
                            "--channel-id", payload["channel_id"], "--body", payload["body"], "--no-json"])
-                if not _delivery_ok(out): raise RuntimeError("group notification failed")
+                outcome = _delivery_outcome(out)
+                if outcome != "accepted":
+                    if outcome == "rejected": delivery_started = False
+                    raise RuntimeError("group notification " + outcome)
                 STORE.complete_notification(task["id"], payload["order"], payload["event_key"],
                                             {"needs_notify": False,
                                              "notified_status": payload["status"]}, out)
@@ -635,19 +668,23 @@ def _drain_notification_kind(kind, worker):
                 args = (["im", "+bot-send-user", "--app-id", app_id, "--user-id", str(uid), "--body", payload["body"]]
                         if app_id else ["im", "+send-user", "--user-id", str(uid), "--body", payload["body"]])
                 STORE.mark_delivery_inflight(task["id"])
+                delivery_started = True
                 out = cli(args)
-                if not _delivery_ok(out): raise RuntimeError("direct notification failed")
+                outcome = _delivery_outcome(out)
+                if outcome != "accepted":
+                    if outcome == "rejected": delivery_started = False
+                    raise RuntimeError("direct notification " + outcome)
                 STORE.complete_notification(task["id"], payload["order"], payload["event_key"],
                                             {"dm_notified_status": payload["status"],
                                              "dm_notified_event": payload["event_key"]}, out)
             results.append({"order": payload["order"], "kind": kind, "ok": True})
-        except subprocess.TimeoutExpired as error:
-            STORE.mark_task_unknown(task["id"], "delivery outcome unknown: " + str(error))
-            results.append({"order": payload.get("order"), "kind": kind,
-                            "ok": False, "unknown": True})
         except Exception as error:
-            STORE.fail_task(task["id"], str(error), max_attempts=10)
-            results.append({"order": payload.get("order"), "kind": kind, "ok": False})
+            if delivery_started:
+                STORE.mark_task_unknown(task["id"], "delivery outcome unknown: " + str(error))
+            else:
+                STORE.fail_task(task["id"], str(error), max_attempts=10)
+            results.append({"order": payload.get("order"), "kind": kind, "ok": False,
+                            "unknown": delivery_started})
     return results
 
 def notify(channel_id, bot_app_id=None, dry=False):
@@ -679,8 +716,8 @@ def main():
     a = sp.add_parser("ingest-forecast"); a.add_argument("--file", required=True)
     b = sp.add_parser("ingest-pair"); b.add_argument("--order", required=True); b.add_argument("--intl", required=True); b.add_argument("--force", action="store_true")
     c = sp.add_parser("track-update"); c.add_argument("--order", required=True); c.add_argument("--status", required=True); c.add_argument("--detail", default=""); c.add_argument("--observed-at"); c.add_argument("--tracking"); c.add_argument("--binding-version", type=int)
-    f = sp.add_parser("add-package"); f.add_argument("--order", required=True); f.add_argument("--tracking", required=True); f.add_argument("--carrier", default="")
-    g = sp.add_parser("replace-package"); g.add_argument("--order", required=True); g.add_argument("--tracking", required=True); g.add_argument("--new-tracking", required=True); g.add_argument("--operator", required=True)
+    f = sp.add_parser("add-package"); f.add_argument("--order", required=True); f.add_argument("--tracking", required=True); f.add_argument("--carrier", default=""); f.add_argument("--operator"); f.add_argument("--reason")
+    g = sp.add_parser("replace-package"); g.add_argument("--order", required=True); g.add_argument("--tracking", required=True); g.add_argument("--new-tracking", required=True); g.add_argument("--operator", required=True); g.add_argument("--reason")
     h = sp.add_parser("package-update"); h.add_argument("--order", required=True); h.add_argument("--tracking", required=True); h.add_argument("--status", required=True); h.add_argument("--detail", default=""); h.add_argument("--observed-at"); h.add_argument("--binding-version", type=int); h.add_argument("--official-from-results", action="store_true"); h.add_argument("--official-result-hash")
     c = sp.add_parser("rematch"); c.add_argument("--order", required=True)
     d = sp.add_parser("list"); d.add_argument("--need-review", action="store_true")
@@ -701,10 +738,10 @@ def main():
         result = rematch(args.order); rc = 0 if result.get("matched") else 2
         print(json.dumps(result, ensure_ascii=False))
     elif args.cmd == "add-package":
-        result = add_package(args.order, args.tracking, args.carrier); rc = 0 if result.get("added") else 2
+        result = add_package(args.order, args.tracking, args.carrier, args.operator, args.reason); rc = 0 if result.get("added") else 2
         print(json.dumps(result, ensure_ascii=False))
     elif args.cmd == "replace-package":
-        result = replace_package(args.order, args.tracking, args.new_tracking, args.operator); rc = 0 if result.get("replaced") else 2
+        result = replace_package(args.order, args.tracking, args.new_tracking, args.operator, args.reason); rc = 0 if result.get("replaced") else 2
         print(json.dumps(result, ensure_ascii=False))
     elif args.cmd == "package-update":
         official_tracking = None

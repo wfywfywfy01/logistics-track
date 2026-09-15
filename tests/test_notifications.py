@@ -2,7 +2,7 @@ from test_reliability import load_pipeline
 import subprocess
 import pytest
 
-def test_failed_notification_stays_queued_and_does_not_ack(monkeypatch, tmp_path):
+def test_empty_delivery_receipt_is_held_unknown_and_does_not_ack(monkeypatch, tmp_path):
     pipeline = load_pipeline(monkeypatch, tmp_path)
     pipeline.STORE.upsert_shipment("XSD1", {
         "orderNo": "XSD1", "status": "运输中", "intl": "1Z1", "history": [],
@@ -12,7 +12,8 @@ def test_failed_notification_stays_queued_and_does_not_ack(monkeypatch, tmp_path
     result = pipeline.notify("channel")
     assert result["failed"] == 1
     assert pipeline.STORE.get_shipment("XSD1")["needs_notify"] is True
-    assert pipeline.STORE.pending_task_count("notify_group") == 1
+    assert pipeline.STORE.pending_task_count("notify_group") == 0
+    assert pipeline.STORE.task_counts()["notify_group"]["unknown"] == 1
 
 def test_successful_notification_is_acknowledged(monkeypatch, tmp_path):
     pipeline = load_pipeline(monkeypatch, tmp_path)
@@ -40,6 +41,52 @@ def test_business_failure_response_is_not_acknowledged(monkeypatch, tmp_path):
     assert result["failed"] == 1
     assert pipeline.STORE.get_shipment("XSD1")["needs_notify"] is True
     assert pipeline.STORE.pending_task_count("notify_group") == 1
+
+
+def test_unrecognized_receipt_is_held_unknown_without_automatic_retry(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {
+        "orderNo": "XSD1", "status": "异常", "intl": "1Z1", "history": [],
+        "products": [], "needs_notify": True, "binding_version": 1,
+    })
+    monkeypatch.setattr(pipeline, "cli", lambda _args: "gateway accepted")
+
+    result = pipeline.notify("channel")
+
+    assert result["failed"] == 1
+    assert pipeline.STORE.task_counts()["notify_group"]["unknown"] == 1
+    assert pipeline.STORE.pending_task_count("notify_group") == 0
+
+
+def test_receipt_commit_failure_is_held_unknown_without_resend(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {
+        "orderNo": "XSD1", "status": "运输中", "intl": "1Z1", "history": [],
+        "products": [], "needs_notify": True, "binding_version": 1,
+    })
+    monkeypatch.setattr(pipeline, "cli", lambda _args: "ok")
+    monkeypatch.setattr(pipeline.STORE, "complete_notification",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("db busy")))
+
+    result = pipeline.notify("channel")
+
+    assert result["failed"] == 1
+    assert pipeline.STORE.task_counts()["notify_group"]["unknown"] == 1
+
+
+def test_exception_uses_unified_group_notification(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {
+        "orderNo": "XSD1", "status": "异常", "intl": "1Z1",
+        "history": [{"from": "运输中", "to": "异常", "at": "event-1"}],
+        "products": [], "needs_notify": True, "binding_version": 1,
+    })
+
+    queued = pipeline._queue_notifications("channel")
+    task = pipeline.STORE.list_tasks(kinds=("notify_group",))[0]
+
+    assert queued[0]["line"].startswith("⚠️")
+    assert task["payload"]["body"] == queued[0]["line"]
 
 
 def test_unknown_delivery_outcome_is_held_for_manual_review(monkeypatch, tmp_path):

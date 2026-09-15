@@ -105,7 +105,6 @@ def execute(a):
     steps.extend([
         (["wire_results.py"], "回填台账", True),
         (["operations.py", "refresh"], "刷新异常待办", True),
-        (["alert.py"], "异常提醒", True),
         (["sync_sheet.py"], "同步云表格", False),
         (["backup.py"], "台账备份", True),
         (["tracking-pipeline.py", "notify", "--channel-id", a.channel_id,
