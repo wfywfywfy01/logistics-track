@@ -651,6 +651,21 @@ class Storage:
             result.setdefault(row["kind"], {})[row["status"]] = row["count"]
         return result
 
+    def task_count(self, statuses=None, kinds=None):
+        sql = "SELECT COUNT(*) AS count FROM tasks"
+        params = []
+        clauses = []
+        if statuses:
+            clauses.append("status IN (%s)" % ",".join("?" for _ in statuses))
+            params.extend(statuses)
+        if kinds:
+            clauses.append("kind IN (%s)" % ",".join("?" for _ in kinds))
+            params.extend(kinds)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        with self.connect() as connection:
+            return connection.execute(sql, params).fetchone()["count"]
+
     def list_tasks(self, statuses=None, limit=500, kinds=None):
         sql = "SELECT * FROM tasks"
         params = []

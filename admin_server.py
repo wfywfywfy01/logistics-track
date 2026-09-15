@@ -91,6 +91,34 @@ def _orders(store, query="", status=""):
     return sorted(rows, key=lambda row: str(row.get("orderNo") or ""))
 
 
+def _official_tracking_html(shipment):
+    sections = []
+    for package in shipment.get("packages") or []:
+        official = package.get("official_tracking") or {}
+        if not official:
+            continue
+        latest = official.get("latest_event") or {}
+        eta = official.get("estimated_delivery")
+        eta_text = json.dumps(eta, ensure_ascii=False) if isinstance(eta, (dict, list)) else str(eta or "N/A")
+        rows = []
+        for event in official.get("events") or []:
+            occurred = str(event.get("occurred_at_utc") or event.get("source_time_text") or "N/A")
+            rows.append("<tr><td><time datetime='%s'>%s</time></td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                html.escape(occurred, quote=True), html.escape(occurred),
+                html.escape(str(event.get("status") or "N/A")),
+                html.escape(str(event.get("location") or "N/A")),
+                html.escape(str(event.get("description") or ""))))
+        sections.append(
+            "<section class=tracking><h3>%s · %s</h3><p>状态：%s｜预计送达：%s｜最后位置：%s｜来源：%s</p>"
+            "<table><tr><th>时间</th><th>状态</th><th>地点</th><th>详情</th></tr>%s</table></section>" % (
+                html.escape(str(package.get("carrier") or "N/A")),
+                html.escape(str(package.get("tracking") or "N/A")),
+                html.escape(str(latest.get("status") or official.get("status_en") or package.get("status") or "N/A")),
+                html.escape(eta_text), html.escape(str(latest.get("location") or "N/A")),
+                html.escape(str(official.get("source") or "N/A")), "".join(rows)))
+    return "<h2>官网轨迹</h2>" + "".join(sections) if sections else ""
+
+
 def create_server(store, token, host="127.0.0.1", port=8080):
     if not token:
         raise ValueError("ADMIN_TOKEN is required")
@@ -415,8 +443,9 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                 endpoint = "/api/orders/" + quote(order, safe="")
                 evidence = store.evidence_for_order(order)
                 fields = "<input name=reason required placeholder='原因'>"
-                body = "<h1>%s</h1><pre>%s</pre>" % (
-                    html.escape(order), html.escape(json.dumps(shipment, ensure_ascii=False, indent=2)))
+                body = "<h1>%s</h1>%s<pre>%s</pre>" % (
+                    html.escape(order), _official_tracking_html(shipment),
+                    html.escape(json.dumps(shipment, ensure_ascii=False, indent=2)))
                 if principal["role"] in ("admin", "operator"):
                     body += ("<h2>补录人员</h2><form class=api-form action='%s/salesperson'>"
                              "<input name=salesperson required placeholder='姓名'><input name=user_id required "

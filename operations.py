@@ -152,15 +152,19 @@ def build_daily_report(store, now=None, freshness_hours=None):
             delivered.append(order)
     missing = [order for order, shipment in shipments.items() if not shipment.get("intl")]
     unresolved = store.list_tasks(("pending", "retry", "dead", "unknown"))
+    unresolved_count = store.task_count(("pending", "retry", "dead", "unknown"))
     freshness = {}
     for result in results.values():
         rows = list((result.get("package_results") or {}).values()) or [result]
         for row in rows:
             carrier = row.get("carrier") or detect_carrier(row.get("tracking")) or "N/A"
             bucket = freshness.setdefault(
-                carrier, {"total": 0, "ok": 0, "latest_observed_at": "N/A"})
+                carrier, {"total": 0, "ok": 0, "with_events": 0,
+                          "with_estimated_delivery": 0, "latest_observed_at": "N/A"})
             bucket["total"] += 1
             bucket["ok"] += int(bool(row.get("ok")))
+            bucket["with_events"] += int(bool(row.get("events")))
+            bucket["with_estimated_delivery"] += int(bool(row.get("estimated_delivery")))
             observed = row.get("observed_at")
             if observed and (bucket["latest_observed_at"] == "N/A" or
                              observed > bucket["latest_observed_at"]):
@@ -168,7 +172,8 @@ def build_daily_report(store, now=None, freshness_hours=None):
     freshness_hours = float(freshness_hours) if freshness_hours not in (None, "") else "N/A"
     return {"date": str(local_day), "denominator": len(shipments),
             "missing_label": {"count": len(missing), "orders": missing},
-            "unresolved": {"count": len(unresolved), "task_ids": [row["id"] for row in unresolved]},
+            "unresolved": {"count": unresolved_count,
+                           "task_ids": [row["id"] for row in unresolved]},
             "delivered_today": {"count": len(delivered), "orders": delivered},
             "carrier_freshness": freshness,
             "tracking_data_max_age_hours": freshness_hours,

@@ -308,3 +308,31 @@ def test_stall_is_evaluated_per_package_and_carrier(tmp_path):
     active = store.list_tasks(("pending",), kinds=("stalled",))
     assert [(row["payload"]["tracking"], row["payload"]["carrier"])
             for row in active] == [("876543210123", "FEDEX")]
+
+
+def test_daily_report_counts_all_unresolved_tasks_beyond_preview_limit(tmp_path):
+    store = Storage(tmp_path)
+    for number in range(501):
+        store.enqueue_task("review", "review:%d" % number, {"order": "XSD%d" % number})
+
+    report = build_daily_report(store)
+
+    assert report["unresolved"]["count"] == 501
+    assert len(report["unresolved"]["task_ids"]) == 500
+
+
+def test_daily_report_separates_status_history_and_eta_coverage(tmp_path):
+    store = Storage(tmp_path)
+    store.put_document("ups_results", {"XSD1": {"ok": True, "package_results": {
+        "1Z1": {"tracking": "1Z1", "carrier": "UPS", "ok": True,
+                "observed_at": "2026-09-10T11:30:00+00:00", "events": [{}],
+                "estimated_delivery": {"date": "2026-09-11"}},
+        "1Z2": {"tracking": "1Z2", "carrier": "UPS", "ok": True,
+                "observed_at": "2026-09-10T11:30:00+00:00"},
+    }}})
+
+    report = build_daily_report(store)
+
+    assert report["carrier_freshness"]["UPS"] == {
+        "total": 2, "ok": 2, "with_events": 1, "with_estimated_delivery": 1,
+        "latest_observed_at": "2026-09-10T11:30:00+00:00"}

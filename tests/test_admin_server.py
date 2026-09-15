@@ -275,6 +275,24 @@ def test_order_detail_can_open_registered_original_file(tmp_path):
         server.shutdown()
 
 
+def test_order_detail_renders_official_tracking_timeline(tmp_path):
+    store, server, base = run_server(tmp_path)
+    store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中",
+        "packages": [{"tracking": "1Z1", "carrier": "UPS", "status": "运输中",
+            "official_tracking": {"source": "ups.com", "status_en": "On the Way",
+                "estimated_delivery": {"date": "2026-09-15"},
+                "latest_event": {"location": "Riga", "status": "On the Way"},
+                "events": [{"occurred_at_utc": "2026-09-14T13:00:00Z",
+                            "status": "Import Scan", "location": "Riga"}]}}]})
+    try:
+        _, page = request_text(base + "/orders/XSD1", "secret-token")
+        assert "官网轨迹" in page and "预计送达" in page
+        assert "On the Way" in page and "Riga" in page
+        assert "<time datetime='2026-09-14T13:00:00Z'>" in page
+    finally:
+        server.shutdown()
+
+
 def test_order_evidence_requires_exact_order_match(tmp_path):
     store, server, base = run_server(tmp_path)
     wrong = tmp_path / "wrong.png"
