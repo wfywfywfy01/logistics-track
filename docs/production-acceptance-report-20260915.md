@@ -4,7 +4,7 @@
 
 候选分支：`codex/production-readiness-fixes`
 
-验收对象：`4e061da`（业务代码范围 `e1adf41..f05cf7b`）
+验收对象：`95d51c9`（业务代码范围 `e1adf41..95d51c9`）
 
 ## 结论
 
@@ -14,7 +14,7 @@
 
 第一层提交门禁：
 
-- `python -m pytest -q`：166 passed，1 skipped。跳过项为 Windows 不执行的 Linux `SIGALRM` 测试。
+- `python -m pytest -q`：167 passed，1 skipped。跳过项为 Windows 不执行的 Linux `SIGALRM` 测试。
 - `python -m compileall -q .`：退出 0。
 - `bash -n deploy/entrypoint.sh`：退出 0。
 - `bash -n deploy/deploy-from-git.sh`：退出 0。
@@ -38,11 +38,13 @@
 
 | 承运商 | 样本 | 结果 | 验收状态 |
 | --- | --- | --- | --- |
-| UPS | `1ZC23W53D4…` | 未收到 `GetStatus` 官方响应，返回 `no GetStatus data` | 未通过；需服务器代理/授权出口复测 |
+| UPS | `1ZC23W53D4…` | 代理直连三家官网首页均 HTTP 200；Chromium 不能直接使用带认证 SOCKS5，已加入 Xray 上游配置但尚未在服务器运行 | 待服务器 Xray 验证 |
 | FedEx | `888000505999` | 官网明确返回 tracking number not found；`not_found` 分类正确 | 解析链路通过；有效实票未验收 |
 | DHL | 未提供授权样本 | 未执行 | 待验收 |
 
 按计划要求的每家至少 5 条有效运单、在途/异常/签收覆盖、完整事件对照和成功率分母记录尚未具备，不能把官网层标为生产通过。
+
+代理只读连通性：使用用户提供的 SOCKS5 出口访问 UPS、DHL、FedEx 页面均返回 HTTP 200。该账号未写入仓库或 `.env`；项目入口新增 `XRAY_PROTOCOL=socks5`、`XRAY_USER` 配置，把认证放在 Xray 上游，浏览器继续连接本地无认证 SOCKS 端口。服务器部署后必须重新跑 UPS/DHL/FedEx 实票，不能以首页 200 代替追踪接口验收。
 
 ## 上线前未完成项
 

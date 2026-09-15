@@ -4,11 +4,11 @@
 
 候选分支：`codex/production-readiness-fixes`
 
-代码范围：`e1adf41..f05cf7b`
+代码范围：`e1adf41..95d51c9`
 
 ## 当前状态
 
-候选代码已分七个功能提交完成，本地全量测试为 166 passed、1 skipped；跳过项是 Linux `SIGALRM` 总时限测试。Python 编译、`deploy/entrypoint.sh`、`deploy/deploy-from-git.sh`、Compose 配置和 diff 检查通过。候选尚未推送、构建服务器镜像或切换生产。
+候选代码已分八个功能提交完成，本地全量测试为 167 passed、1 skipped；跳过项是 Linux `SIGALRM` 总时限测试。Python 编译、`deploy/entrypoint.sh`、`deploy/deploy-from-git.sh`、Compose 配置和 diff 检查通过。候选尚未推送、构建服务器镜像或切换生产。
 
 以下测试分为本地、隔离候选、真实官网、灰度生产四层。故障注入、恢复和重复通知测试禁止直接操作生产台账或正式通知渠道。
 
