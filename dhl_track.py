@@ -5,6 +5,24 @@
 用法: from dhl_track import track_dhl; track_dhl("9941305430")
 """
 import json, os, sys, time
+from datetime import datetime, timezone
+
+
+def _location(value):
+    address = (value or {}).get("address") or {}
+    return " ".join(str(address.get(key) or "").strip() for key in
+                    ("addressLocality", "countryCode") if address.get(key))
+
+
+def _utc_timestamp(value):
+    raw = str(value or "")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return "N/A"
+        return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except ValueError:
+        return "N/A"
 
 def classify_status(code, description):
     code = (code or "").lower()
@@ -16,6 +34,50 @@ def classify_status(code, description):
     if "transit" in code or any(k in low for k in ("processed", "departed", "arrived")): return "运输中"
     if "picked" in code or "pickup" in low or "received" in low: return "已出国际单"
     return None
+
+
+def _event(item):
+    return {
+        "source_time_text": item.get("timestamp") or "",
+        "occurred_at_utc": _utc_timestamp(item.get("timestamp")),
+        "location": _location(item.get("location")),
+        "status": item.get("description") or "",
+        "description": item.get("remark") or item.get("nextSteps") or "",
+        "code": item.get("status") or item.get("statusCode") or "",
+        "exception_code": "",
+    }
+
+
+def parse_tracking_response(tn, shipment):
+    if not isinstance(shipment, dict):
+        return None
+    st = shipment.get("status") or {}
+    code = (st.get("statusCode") or "").lower()
+    desc = st.get("description") or ""
+    stage = classify_status(code, desc)
+    if not stage:
+        return {"tracking": tn, "ok": False, "error": "unknown DHL status",
+                "status_en": desc}
+    events = [_event(item) for item in (shipment.get("events") or [])]
+    latest_event = events[0] if events else _event(st)
+    frame = shipment.get("estimatedDeliveryTimeFrame") or {}
+    eta = None
+    if frame.get("estimatedFrom") or frame.get("estimatedThrough"):
+        eta = {"local_from_text": frame.get("estimatedFrom") or "",
+               "local_through_text": frame.get("estimatedThrough") or "",
+               "from_utc": _utc_timestamp(frame.get("estimatedFrom")),
+               "through_utc": _utc_timestamp(frame.get("estimatedThrough"))}
+    elif shipment.get("estimatedTimeOfDelivery"):
+        eta = {"local_from_text": shipment.get("estimatedTimeOfDelivery"),
+               "local_through_text": "",
+               "from_utc": _utc_timestamp(shipment.get("estimatedTimeOfDelivery")),
+               "through_utc": "N/A"}
+    detail = " ".join(x for x in (
+        st.get("timestamp") or "", _location(st.get("location")), desc) if x).strip()
+    return {"tracking": tn, "ok": True, "stage": stage, "status_en": desc,
+            "detail": detail, "source": "dhl.com", "estimated_delivery": eta,
+            "latest_event": latest_event, "progress_steps": [],
+            "progress_steps_availability": "N/A", "events": events}
 
 def track_dhl(tn, timeout_nav=60000, wait_ms=25000, proxy=None):
     if proxy is None:
@@ -32,18 +94,28 @@ def track_dhl(tn, timeout_nav=60000, wait_ms=25000, proxy=None):
         ctx = b.new_context(**kw)
         pg = ctx.new_page()
         got = {}
+        responses, parse_errors = [], []
 
         def on_resp(r):
             if "utapi" in r.url and ("trackingNumber=" + tn) in r.url:
-                try:
-                    d = r.json()
-                    for s in (d.get("shipments") or []):
-                        if s.get("id") == tn:
-                            got["data"] = s
-                except Exception:
-                    pass
+                responses.append(r)
 
         pg.on("response", on_resp)
+        processed = 0
+
+        def drain_responses():
+            nonlocal processed
+            while processed < len(responses) and "data" not in got:
+                response = responses[processed]
+                processed += 1
+                try:
+                    data = response.json()
+                    for shipment in (data.get("shipments") or []):
+                        if shipment.get("id") == tn:
+                            got["data"] = shipment
+                            break
+                except Exception as error:
+                    parse_errors.append(type(error).__name__)
         try:
             pg.goto("https://www.dhl.com/us-en/home/tracking.html",
                     timeout=timeout_nav, wait_until="domcontentloaded")
@@ -65,7 +137,9 @@ def track_dhl(tn, timeout_nav=60000, wait_ms=25000, proxy=None):
                 el.press("Enter")
             deadline = time.time() + wait_ms / 1000
             while time.time() < deadline and "data" not in got:
+                drain_responses()
                 pg.wait_for_timeout(1000)
+            drain_responses()
             if "data" not in got:
                 # 重试一次: 重新填单号提交
                 try:
@@ -75,25 +149,20 @@ def track_dhl(tn, timeout_nav=60000, wait_ms=25000, proxy=None):
                         el.press("Enter")
                     deadline = time.time() + wait_ms / 1000
                     while time.time() < deadline and "data" not in got:
+                        drain_responses()
                         pg.wait_for_timeout(1000)
+                    drain_responses()
                 except Exception:
                     pass
         finally:
             b.close()
     s = got.get("data")
     if not s:
+        if parse_errors:
+            return {"tracking": tn, "ok": False,
+                    "error": "DHL response parse failed: " + parse_errors[-1]}
         return {"tracking": tn, "ok": False, "error": "no utapi data"}
-    st = s.get("status") or {}
-    code = (st.get("statusCode") or "").lower()
-    desc = st.get("description") or ""
-    loc = ((st.get("location") or {}).get("address") or {}).get("addressLocality") or ""
-    stage = classify_status(code, desc)
-    if not stage:
-        return {"tracking": tn, "ok": False, "error": "unknown DHL status",
-                "status_en": desc}
-    detail = "%s %s %s" % ((st.get("timestamp") or "")[:10], loc, desc)
-    return {"tracking": tn, "ok": True, "stage": stage,
-            "status_en": desc, "detail": detail.strip()}
+    return parse_tracking_response(tn, s)
 
 
 if __name__ == "__main__":

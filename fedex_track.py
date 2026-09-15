@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit
 
 
@@ -33,6 +34,45 @@ def _location(value):
                     ("city", "stateOrProvinceCode", "countryCode") if address.get(k))
 
 
+def _utc_timestamp(value):
+    raw = str(value or "")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return "N/A"
+        return parsed.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except ValueError:
+        return "N/A"
+
+
+def _event(item, fallback_location=None):
+    return {
+        "source_time_text": item.get("date") or item.get("dateAndTime") or "",
+        "occurred_at_utc": _utc_timestamp(item.get("date") or item.get("dateAndTime")),
+        "location": _location(item.get("scanLocation") or fallback_location),
+        "status": item.get("eventDescription") or item.get("derivedStatus") or "",
+        "description": item.get("exceptionDescription") or "",
+        "code": item.get("eventType") or item.get("derivedStatusCode") or "",
+        "exception_code": item.get("exceptionCode") or "",
+    }
+
+
+def _estimated_delivery(match):
+    window = match.get("estimatedDeliveryTimeWindow") or {}
+    values = window.get("window") or window
+    begins = values.get("begins") or values.get("begin") or ""
+    ends = values.get("ends") or values.get("end") or ""
+    if begins or ends:
+        return {"local_from_text": begins, "local_through_text": ends,
+                "from_utc": _utc_timestamp(begins), "through_utc": _utc_timestamp(ends)}
+    for item in match.get("dateAndTimes") or []:
+        if str(item.get("type") or "").upper() in {"ESTIMATED_DELIVERY", "ESTIMATED_DELIVERY_DATE"}:
+            value = item.get("dateTime") or ""
+            return {"local_from_text": value, "local_through_text": "",
+                    "from_utc": _utc_timestamp(value), "through_utc": "N/A"}
+    return None
+
+
 def parse_tracking_response(tracking, payload):
     output = (payload or {}).get("output") or payload or {}
     groups = output.get("completeTrackResults") or output.get("CompleteTrackResults") or []
@@ -57,8 +97,17 @@ def parse_tracking_response(tracking, payload):
         _location(scan.get("scanLocation") or latest.get("scanLocation")),
         scan.get("eventDescription") or description,
     ) if x).strip()
+    events = [_event(item, latest.get("scanLocation")) for item in scans]
+    latest_event = events[0] if events else {
+        "source_time_text": "", "occurred_at_utc": "N/A",
+        "location": _location(latest.get("scanLocation")),
+        "status": description, "description": "", "code": latest.get("code") or "",
+        "exception_code": ""}
     return {"tracking": tracking, "ok": True, "stage": stage,
-            "status_en": description, "detail": detail}
+            "status_en": description, "detail": detail, "source": "fedex.com",
+            "estimated_delivery": _estimated_delivery(match),
+            "latest_event": latest_event, "progress_steps": [],
+            "progress_steps_availability": "N/A", "events": events}
 
 
 DOM_STAGES = (

@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 import openpyxl
 from storage import Storage, iso
+from official_tracking import result_hash
 from carriers import detect_carrier
 
 DATA = Path((os.environ.get("LOGIBOT_DATA_DIR") or "data")); DATA.mkdir(parents=True, exist_ok=True)
@@ -332,7 +333,8 @@ def replace_package(order, current_tracking, new_tracking, operator):
     return outcome
 
 
-def package_update(order, tracking, status, detail="", observed_at=None, binding_version=None):
+def package_update(order, tracking, status, detail="", observed_at=None, binding_version=None,
+                   official_tracking=None, official_result_hash=None):
     observed = parse_observed_at(observed_at)
     normalized = norm_status(status)
     outcome = {}
@@ -350,9 +352,20 @@ def package_update(order, tracking, status, detail="", observed_at=None, binding
             outcome.update({"changed": False, "reason": "stale binding"}); return shipment, []
         if normalized is None:
             outcome.update({"changed": False, "reason": "unknown status"}); return shipment, []
-        previous_observed = _datetime_value(package.get("status_observed_at"))
+        watermarks = [value for value in (
+            package.get("observation_observed_at"), package.get("status_observed_at"),
+            (package.get("last_observation") or {}).get("observed_at"),
+            (package.get("official_tracking") or {}).get("observed_at")) if value]
+        previous_observed = max((_datetime_value(value) for value in watermarks), default=None)
         if previous_observed and observed < previous_observed:
             outcome.update({"changed": False, "reason": "stale observation"}); return shipment, []
+        previous_hash = (package.get("official_tracking") or {}).get("result_hash")
+        official_watermark = (package.get("official_tracking") or {}).get("observed_at")
+        previous_official_observed = _datetime_value(official_watermark) if official_watermark else None
+        if (previous_official_observed and observed == previous_official_observed and
+                previous_hash and official_result_hash and previous_hash != official_result_hash):
+            outcome.update({"changed": False, "reason": "conflicting observation"})
+            return shipment, []
         old_package = package.get("status", "已出国际单")
         if old_package in ("签收", "退回") and normalized != old_package:
             outcome.update({"changed": False, "reason": "terminal status"}); return shipment, []
@@ -367,6 +380,11 @@ def package_update(order, tracking, status, detail="", observed_at=None, binding
             package["status"] = normalized; package["status_observed_at"] = observed
         package["last_observation"] = {"status": normalized, "observed_at": observed,
                                        "detail": detail[:200]}
+        package["observation_observed_at"] = observed
+        if official_tracking is not None:
+            official_tracking["observed_at"] = observed
+            official_tracking["result_hash"] = official_result_hash
+            package["official_tracking"] = official_tracking
         aggregate = _package_rollup(packages)
         old_order = shipment.get("status", "已预报")
         if aggregate != old_order:
@@ -390,6 +408,86 @@ def parse_observed_at(value):
         return iso()
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return iso(parsed)
+
+
+def _strict_observed_at(value):
+    if not value:
+        raise ValueError("official tracking observed_at is required")
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("official tracking observed_at is invalid") from error
+    if parsed.tzinfo is None:
+        raise ValueError("official tracking observed_at must include a timezone")
+    return iso(parsed)
+
+
+def _snapshot_object(value, allowed, label):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("official %s must be an object or null" % label)
+    result = {key: value.get(key) for key in allowed if key in value}
+    if any(isinstance(item, (dict, list)) for item in result.values()):
+        raise ValueError("official %s fields must be scalar" % label)
+    return result
+
+
+def official_tracking_from_results(order, tracking, expected_observed_at=None,
+                                   expected_binding_version=None, expected_result_hash=None):
+    result = (STORE.get_document("ups_results", {}) or {}).get(order) or {}
+    package_results = result.get("package_results") or {}
+    package = package_results.get(tracking)
+    if package is None and result.get("tracking") == tracking:
+        package = result
+    if not isinstance(package, dict) or not package.get("ok") or "events" not in package:
+        raise ValueError("authoritative official tracking result is unavailable")
+    current_hash = result_hash(package)
+    if not expected_result_hash or current_hash != expected_result_hash:
+        raise ValueError("official tracking result changed during apply")
+    allowed = ("source", "status_en", "progress", "progress_type", "received_by",
+               "estimated_delivery", "latest_event", "progress_steps",
+               "progress_steps_availability", "events")
+    observed_at = _strict_observed_at(package.get("observed_at"))
+    if expected_observed_at and observed_at != _strict_observed_at(expected_observed_at):
+        raise ValueError("official tracking result changed during apply")
+    if expected_binding_version is not None and int(package.get("binding_version") or 0) != int(
+            expected_binding_version or 0):
+        raise ValueError("official tracking binding changed during apply")
+    snapshot = {key: package.get(key) for key in allowed}
+    snapshot["observed_at"] = observed_at
+    snapshot["result_hash"] = current_hash
+    if snapshot["source"] not in ("ups.com", "dhl.com", "fedex.com"):
+        raise ValueError("official tracking source is invalid")
+    for key in ("status_en", "progress_type", "received_by",
+                "progress_steps_availability"):
+        if snapshot[key] is not None and not isinstance(snapshot[key], str):
+            raise ValueError("official tracking field %s must be text" % key)
+    if snapshot["progress"] is not None and not isinstance(snapshot["progress"], (str, int, float)):
+        raise ValueError("official tracking progress has invalid type")
+    event_fields = ("source_time_text", "occurred_at_utc", "timezone_offset", "location",
+                    "status", "description", "additional_description", "code",
+                    "exception_code", "is_brokerage")
+    eta_fields = ("local_date_text", "local_time_text", "local_from_text",
+                  "local_through_text", "timezone_offset", "from_utc", "through_utc")
+    progress_fields = ("name", "source_time_text", "location", "completed", "current", "future")
+    snapshot["estimated_delivery"] = _snapshot_object(
+        snapshot["estimated_delivery"], eta_fields, "estimated delivery")
+    snapshot["latest_event"] = _snapshot_object(
+        snapshot["latest_event"], event_fields, "latest event")
+    if not isinstance(snapshot["events"], list) or len(snapshot["events"]) > 1000:
+        raise ValueError("official tracking events must be a list of at most 1000 items")
+    if not isinstance(snapshot["progress_steps"], list) or len(snapshot["progress_steps"]) > 20:
+        raise ValueError("official progress steps must be a list of at most 20 items")
+    if any(not isinstance(item, dict) for item in snapshot["events"] + snapshot["progress_steps"]):
+        raise ValueError("official tracking entries must be objects")
+    snapshot["events"] = [_snapshot_object(item, event_fields, "event")
+                          for item in snapshot["events"]]
+    snapshot["progress_steps"] = [_snapshot_object(item, progress_fields, "progress step")
+                                  for item in snapshot["progress_steps"]]
+    if len(json.dumps(snapshot, ensure_ascii=False).encode("utf-8")) > 1024 * 1024:
+        raise ValueError("official tracking snapshot exceeds 1 MiB")
+    return snapshot
 
 
 def track_update(order, status, detail="", observed_at=None, tracking=None,
@@ -583,7 +681,7 @@ def main():
     c = sp.add_parser("track-update"); c.add_argument("--order", required=True); c.add_argument("--status", required=True); c.add_argument("--detail", default=""); c.add_argument("--observed-at"); c.add_argument("--tracking"); c.add_argument("--binding-version", type=int)
     f = sp.add_parser("add-package"); f.add_argument("--order", required=True); f.add_argument("--tracking", required=True); f.add_argument("--carrier", default="")
     g = sp.add_parser("replace-package"); g.add_argument("--order", required=True); g.add_argument("--tracking", required=True); g.add_argument("--new-tracking", required=True); g.add_argument("--operator", required=True)
-    h = sp.add_parser("package-update"); h.add_argument("--order", required=True); h.add_argument("--tracking", required=True); h.add_argument("--status", required=True); h.add_argument("--detail", default=""); h.add_argument("--observed-at"); h.add_argument("--binding-version", type=int)
+    h = sp.add_parser("package-update"); h.add_argument("--order", required=True); h.add_argument("--tracking", required=True); h.add_argument("--status", required=True); h.add_argument("--detail", default=""); h.add_argument("--observed-at"); h.add_argument("--binding-version", type=int); h.add_argument("--official-from-results", action="store_true"); h.add_argument("--official-result-hash")
     c = sp.add_parser("rematch"); c.add_argument("--order", required=True)
     d = sp.add_parser("list"); d.add_argument("--need-review", action="store_true")
     e = sp.add_parser("notify"); e.add_argument("--channel-id", required=True); e.add_argument("--bot-app-id"); e.add_argument("--dry", action="store_true")
@@ -609,9 +707,19 @@ def main():
         result = replace_package(args.order, args.tracking, args.new_tracking, args.operator); rc = 0 if result.get("replaced") else 2
         print(json.dumps(result, ensure_ascii=False))
     elif args.cmd == "package-update":
+        official_tracking = None
+        if args.official_from_results:
+            try:
+                official_tracking = official_tracking_from_results(
+                    args.order, args.tracking, args.observed_at, args.binding_version,
+                    args.official_result_hash)
+            except ValueError as error:
+                print(json.dumps({"error": str(error)}, ensure_ascii=False)); return 2
         result = package_update(args.order, args.tracking, args.status, args.detail,
-                                args.observed_at, args.binding_version)
-        rc = 2 if result.get("error") or result.get("reason") in ("unknown status", "stale binding") else 0
+                                args.observed_at, args.binding_version, official_tracking,
+                                args.official_result_hash)
+        rc = 2 if result.get("error") or result.get("reason") in (
+            "unknown status", "stale binding", "conflicting observation") else 0
         print(json.dumps(result, ensure_ascii=False))
     elif args.cmd == "list": print(json.dumps(list_cmd(args.need_review), ensure_ascii=False))
     elif args.cmd == "notify":
