@@ -203,9 +203,9 @@ class Storage:
     def put_admin_user(self, username, password, role, active=None, operator=None, reason=None):
         username = str(username or "").strip()
         if not (3 <= len(username) <= 64) or any(
-                character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+                character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-@"
                 for character in username):
-            raise ValueError("username must be 3-64 letters, digits, dot, underscore or hyphen")
+            raise ValueError("username must be 3-64 letters, digits, dot, underscore, hyphen or @")
         if role not in ADMIN_ROLES:
             raise ValueError("role must be admin, operator or viewer")
         if password and len(password) < 12:

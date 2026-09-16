@@ -355,6 +355,23 @@ def test_admin_can_create_users_without_exposing_password_hash(tmp_path):
         server.shutdown()
 
 
+def test_admin_can_create_email_username(tmp_path):
+    store, server, base = run_server(tmp_path)
+    username = "frank.fu@vertu.cn"
+    password = "email-admin-password-1"
+    try:
+        status, created = request(base + "/api/users", "secret-token", "POST",
+                                  {"username": username, "password": password, "role": "admin",
+                                   "active": True, "reason": "email administrator"},
+                                  server.csrf_token)
+        assert status == 200
+        assert created == {"username": username, "role": "admin", "active": True}
+        assert store.authenticate_admin(username, password) == {
+            "username": username, "role": "admin"}
+    finally:
+        server.shutdown()
+
+
 def test_viewer_is_read_only_and_does_not_see_action_forms(tmp_path):
     store, server, base = run_server(tmp_path)
     store.put_admin_user("viewer1", "viewer-password-1", "viewer")
