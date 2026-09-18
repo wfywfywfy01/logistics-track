@@ -5,7 +5,10 @@
 - 新增只读查询接口：`GET /api/track/{order}`、`GET /api/track?tracking=`、`GET /api/shipments`、`GET /api/stats`，均基于既有 `official_tracking` 官网快照；群通知与私聊带上官网最新节点（一行）；云表格"最新节点"改用官网事件文本并新增"轨迹节点数"列。代码 `ed371f7`/`8d947cf`，测试 173 passed。
 - 接口文档 `API.md`（含字段字典、错误码、PowerShell/Python 示例、对外开通运维节）。
 - 对外开通第一步：容器端口由 `127.0.0.1:18080` 改绑 `10.100.0.176:18080`，新建只读账号 `logistics-viewer`（role=viewer，密码走交接消息，未落文档）。
-- 实测结论：云安全组仅放行 22/80/443/2375/5432，18080 与任意临时端口均不通（宿主机 iptables 已允许容器端口，DOCKER-USER 为空）。同事访问需二选一：安全组放行 TCP 18080（限公司内网来源），或按现有 PDCA 做法经宿主机 Caddy 加域名反代（需先加 DNS 记录）。
+- 实测结论：云安全组仅放行 22/80/443/2375/5432，18080 与任意临时端口均不通（宿主机 iptables 已允许容器端口，DOCKER-USER 为空）。
+- 对外访问落地：在宿主机 Caddy 的 `pdca-workbench.vertu.cn` 站点内新增 `handle_path /logistics-api/*` → `10.100.0.176:18080`（原 Caddyfile 备份 `Caddyfile.bak-logistics-20260918-173506`），`caddy validate` 通过后热加载。对外地址：`https://pdca-workbench.vertu.cn/logistics-api`。
+- 线上验收（从办公网实测）：`/api/stats` total=180、有轨迹 56、缺面单 112；`/api/shipments` 分页正常；`/api/track/{order}` 返回签收与最新官网事件；按国际单号反查命中订单；未带凭证 401、错误密码 401；PDCA 工作台首页回归 200。
+- 待办：IT 加 DNS `logistics.vertu.cn` 后可切换独立域名（Caddy 增一个站点块即可，路径前缀可去掉）；云表格同步仍待平台侧恢复"企业成员身份"绑定。代（需先加 DNS 记录）。
 
 ## 2026-09-15：上线可靠性修复候选
 
