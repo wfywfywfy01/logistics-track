@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+from carriers import detect_carrier
 from storage import Storage, TaskConflict
 from operations import build_daily_report
 
@@ -117,6 +118,108 @@ def _official_tracking_html(shipment):
                 html.escape(eta_text), html.escape(str(latest.get("location") or "N/A")),
                 html.escape(str(official.get("source") or "N/A")), "".join(rows)))
     return "<h2>官网轨迹</h2>" + "".join(sections) if sections else ""
+
+
+def official_view(package):
+    """官网快照视图(official_tracking)。"""
+    official = package.get("official_tracking") or {}
+    events = official.get("events") or []
+    return {
+        "source": official.get("source"),
+        "observed_at": official.get("observed_at"),
+        "status_en": official.get("status_en"),
+        "progress": official.get("progress"),
+        "estimated_delivery": official.get("estimated_delivery"),
+        "latest_event": official.get("latest_event"),
+        "events": events,
+        "event_count": len(events),
+        "progress_steps": official.get("progress_steps") or [],
+    }
+
+
+def event_text(event):
+    if not isinstance(event, dict):
+        return ""
+    parts = [event.get("occurred_at_utc"), event.get("source_time_text"),
+             event.get("location"), event.get("status"), event.get("description")]
+    seen, ordered = set(), []
+    for part in parts:
+        text = " ".join(str(part or "").split())
+        if text and text != "N/A" and text not in seen:
+            seen.add(text)
+            ordered.append(text)
+    return " ".join(ordered)[:200]
+
+
+def package_views(shipment):
+    """包裹视图;没有 packages 结构的历史订单按 intl/alt_intl 合成。"""
+    packages = shipment.get("packages")
+    if not packages:
+        packages = []
+        for role, field in (("primary", "intl"), ("alternate", "alt_intl")):
+            tracking = shipment.get(field)
+            if not tracking:
+                continue
+            packages.append({"tracking": tracking, "role": role,
+                             "carrier": detect_carrier(tracking, shipment.get("carrier")) or "N/A",
+                             "status": shipment.get("status", "已预报")})
+    views = []
+    for package in packages:
+        view = {key: package.get(key) for key in (
+            "tracking", "carrier", "role", "status", "binding_version",
+            "status_observed_at", "last_observation")}
+        view["official"] = official_view(package)
+        views.append(view)
+    return views
+
+
+def track_view(shipment):
+    packages = package_views(shipment)
+    latest = next((item["official"]["latest_event"] for item in packages
+                   if item["official"]["latest_event"]), None)
+    return {
+        "order": shipment.get("orderNo"),
+        "status": shipment.get("status", "已预报"),
+        "salesperson": shipment.get("salesperson") or "未匹配",
+        "salesperson_id": shipment.get("salesperson_id"),
+        "carrier": shipment.get("carrier") or "",
+        "intl": shipment.get("intl") or "",
+        "alt_intl": shipment.get("alt_intl") or "",
+        "domestic": shipment.get("domestic") or "",
+        "products": shipment.get("products") or [],
+        "status_observed_at": shipment.get("status_observed_at"),
+        "latest_event": latest,
+        "latest_event_text": event_text(latest),
+        "packages": packages,
+        "history": shipment.get("history") or [],
+    }
+
+
+def find_by_tracking(store, number):
+    matches = []
+    for order, shipment in store.get_shipments().items():
+        for package in package_views(shipment):
+            if package.get("tracking") == number:
+                matches.append({"order": order, "status": shipment.get("status", "已预报"),
+                                "salesperson": shipment.get("salesperson") or "未匹配",
+                                "package": package})
+    return matches
+
+
+def stats_view(store):
+    counts = {}
+    missing_intl = 0
+    with_events = 0
+    for shipment in store.get_shipments().values():
+        status = shipment.get("status") or "已预报"
+        counts[status] = counts.get(status, 0) + 1
+        if not shipment.get("intl"):
+            missing_intl += 1
+        if any((package.get("official_tracking") or {}).get("events")
+               for package in shipment.get("packages") or []):
+            with_events += 1
+    return {"total": sum(counts.values()), "by_status": counts,
+            "missing_intl": missing_intl, "with_official_events": with_events}
 
 
 def create_server(store, token, host="127.0.0.1", port=8080):
@@ -404,6 +507,55 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                               {"Content-Length": str(len(content)),
                                "Content-Disposition": 'inline; filename="%s"' % path.name.replace('"', '')})
                 return self.wfile.write(content)
+            if parsed.path == "/api/track":
+                order = (params.get("order") or [""])[0].strip()
+                number = (params.get("tracking") or [""])[0].strip()
+                if order:
+                    shipment = store.get_shipment(order)
+                    if not shipment:
+                        return self._json(404, {"ok": False, "error": "order not found"})
+                    return self._json(200, {"ok": True, "shipment": track_view(shipment)})
+                if not number:
+                    return self._json(400, {"ok": False, "error": "order or tracking is required"})
+                matches = find_by_tracking(store, number)
+                if not matches:
+                    return self._json(404, {"ok": False, "tracking": number, "count": 0,
+                                           "matches": [], "error": "tracking number not found"})
+                return self._json(200, {"ok": True, "tracking": number,
+                                        "count": len(matches), "matches": matches})
+            if parsed.path.startswith("/api/track/"):
+                order = unquote(parsed.path.removeprefix("/api/track/"))
+                shipment = store.get_shipment(order)
+                if not shipment:
+                    return self._json(404, {"ok": False, "error": "order not found"})
+                return self._json(200, {"ok": True, "shipment": track_view(shipment)})
+            if parsed.path == "/api/stats":
+                return self._json(200, {"ok": True, **stats_view(store)})
+            if parsed.path == "/api/shipments":
+                rows = _orders(store, (params.get("q") or [""])[0], (params.get("status") or [""])[0])
+                total = len(rows)
+                try:
+                    limit = max(1, min(1000, int((params.get("limit") or ["200"])[0])))
+                    offset = max(0, int((params.get("offset") or ["0"])[0]))
+                except ValueError:
+                    return self._json(400, {"ok": False, "error": "limit/offset must be integers"})
+                items = []
+                for shipment in rows[offset:offset + limit]:
+                    view = track_view(shipment)
+                    items.append({
+                        "order": view["order"], "status": view["status"],
+                        "carrier": view["carrier"], "intl": view["intl"],
+                        "alt_intl": view["alt_intl"], "domestic": view["domestic"],
+                        "salesperson": view["salesperson"],
+                        "product": (view["products"] or [""])[0],
+                        "latest_event": view["latest_event"],
+                        "latest_event_text": view["latest_event_text"],
+                        "event_count": sum(item["official"]["event_count"]
+                                           for item in view["packages"]),
+                        "status_observed_at": view["status_observed_at"],
+                    })
+                return self._json(200, {"ok": True, "total": total, "count": len(items),
+                                        "offset": offset, "limit": limit, "items": items})
             if parsed.path == "/api/orders":
                 return self._json(200, {"items": _orders(store,
                     (params.get("q") or [""])[0], (params.get("status") or [""])[0])})
