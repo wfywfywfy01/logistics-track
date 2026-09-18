@@ -1,6 +1,6 @@
 # 物流小助手 · 查询接口文档
 
-> 版本 v1 · 2026-09-18 · 分支 `feature/track-api`(基于 master `d52389b`)
+> 版本 v1 · 2026-09-18 · 代码版本:master `ed371f7`(线上镜像 `candidate-trackapi-20260918`)
 > 提供方:物流追踪系统(云容器 `logistics-track`)
 > 数据源:UPS / DHL / FedEx 官网快照 + 本地 SQLite 台账
 
