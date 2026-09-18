@@ -28,6 +28,35 @@ def test_successful_notification_is_acknowledged(monkeypatch, tmp_path):
     assert pipeline.STORE.pending_task_count("notify_group") == 0
 
 
+def test_group_and_dm_body_carry_official_node(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    pipeline.STORE.upsert_shipment("XSD1", {
+        "orderNo": "XSD1", "status": "运输中", "intl": "1Z1", "history": [
+            {"from": "已预报", "to": "运输中", "at": "2026-09-11T06:20:00+00:00",
+             "observed_at": "2026-09-11T06:20:00+00:00", "tracking": "1Z1"}],
+        "products": [], "needs_notify": True, "binding_version": 1,
+        "salesperson": "周佳丽", "salesperson_id": 12545,
+        "packages": [{"tracking": "1Z1", "carrier": "UPS", "status": "运输中",
+                      "official_tracking": {
+                          "source": "ups.com", "observed_at": "2026-09-11T06:20:00+00:00",
+                          "latest_event": {"source_time_text": "09/11/2026 14:20",
+                                           "occurred_at_utc": "2026-09-11T06:20:00Z",
+                                           "location": "ANCHORAGE, AK, US",
+                                           "status": "Arrived at facility",
+                                           "description": ""},
+                          "events": []}}]})
+    sent = []
+    monkeypatch.setattr(pipeline, "cli", lambda args: sent.append(args) or "ok")
+
+    result = pipeline.notify("channel")
+
+    assert result["notified"] == 2
+    bodies = [args[args.index("--body") + 1] for args in sent if "--body" in args]
+    assert len(bodies) == 2
+    assert all("ANCHORAGE" in body for body in bodies)
+    assert all("\n" not in body for body in bodies)
+
+
 def test_business_failure_response_is_not_acknowledged(monkeypatch, tmp_path):
     pipeline = load_pipeline(monkeypatch, tmp_path)
     pipeline.STORE.upsert_shipment("XSD1", {

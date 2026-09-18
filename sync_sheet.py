@@ -2,14 +2,33 @@
 # -*- coding: utf-8 -*-
 """台账 -> 云文档智能表格 同步。
 用法: python sync_sheet.py
-环境: SHEET_DOC_ID (默认物流追踪表), 表格列 A-I
+环境: SHEET_DOC_ID (默认物流追踪表), 表格列 A-K
 """
 import json, os, re, tempfile, time
 import robust
 from storage import Storage
 
 DOC_ID = (os.environ.get("SHEET_DOC_ID") or "3e553a37-880d-4c72-873a-fa7caa3aef9c")
-HEADERS = ["订单号", "录单人", "国际单号", "承运商", "顺丰单号", "产品", "状态", "最新节点", "签收时间", "更新时间"]
+HEADERS = ["订单号", "录单人", "国际单号", "承运商", "顺丰单号", "产品", "状态", "最新节点", "签收时间", "更新时间", "轨迹节点数"]
+
+
+def official_node_text(shipment):
+    """官网最新事件压成一行:时间 地点 状态 描述。"""
+    for package in shipment.get("packages") or []:
+        event = (package.get("official_tracking") or {}).get("latest_event") or {}
+        parts = []
+        for key in ("source_time_text", "location", "status", "description"):
+            text = " ".join(str(event.get(key) or "").split())
+            if text and text != "N/A" and text not in parts:
+                parts.append(text)
+        if parts:
+            return " ".join(parts)[:120]
+    return ""
+
+
+def official_event_count(shipment):
+    return sum(len((package.get("official_tracking") or {}).get("events") or [])
+               for package in shipment.get("packages") or [])
 
 
 def col_letter(i):
@@ -38,9 +57,12 @@ def main():
         if it.get("alt_intl") and it.get("alt_intl") != intl:
             intl = intl + " / " + it.get("alt_intl")
         carrier = r.get("carrier") or ("UPS" if (it.get("intl") or "").startswith("1Z") else ("DHL" if it.get("intl") else ""))
-        detail = r.get("detail") or ""
+        detail = official_node_text(it)
+        if not detail:
+            detail = r.get("detail") or ""
         if not detail and it.get("history"):
             detail = (it["history"][-1] or {}).get("detail", "")
+        event_count = official_event_count(it)
         delivered_at = ""
         if (r.get("stage") or it.get("status")) == "签收":
             d = r.get("detail") or ""
@@ -65,15 +87,17 @@ def main():
             it.get("domestic") or "",
             ((it.get("products") or [""])[0] or "")[:60],
             it.get("status") or "已预报",
-            (detail or "")[:60],
+            (detail or "")[:80],
             delivered_at,
             now,
+            event_count or "",
         ]
         for ci, v in enumerate(vals):
             cells.append({"cell": "%s%d" % (col_letter(ci), ri), "value": v or ""})
     # 清掉旧的残留行
     for ri in range(len(rows) + 2, len(rows) + 60):
         cells.append({"cell": "A%d" % ri, "value": None})
+        cells.append({"cell": "K%d" % ri, "value": None})
     fd, path = tempfile.mkstemp(suffix=".json", prefix="sheetupd_")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(cells, f, ensure_ascii=False)

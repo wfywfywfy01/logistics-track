@@ -272,6 +272,33 @@ def norm_status(s):
     return None
 
 
+def _event_text(official_event):
+    """官网事件压成一行(时间 地点 状态 描述),给通知用。"""
+    if not isinstance(official_event, dict):
+        return ""
+    seen, ordered = set(), []
+    for part in (official_event.get("source_time_text"), official_event.get("location"),
+                 official_event.get("status"), official_event.get("description")):
+        text = " ".join(str(part or "").split())
+        if text and text != "N/A" and text not in seen:
+            seen.add(text)
+            ordered.append(text)
+    return " ".join(ordered)[:120]
+
+
+def _official_node_text(shipment, event):
+    """通知里带最新官网节点:优先本次事件对应的包裹,其次任一有官网快照的包裹。"""
+    tracking = (event or {}).get("tracking")
+    packages = shipment.get("packages") or []
+    ordered = ([item for item in packages if item.get("tracking") == tracking] +
+               [item for item in packages if item.get("tracking") != tracking])
+    for package in ordered:
+        text = _event_text((package.get("official_tracking") or {}).get("latest_event"))
+        if text:
+            return text
+    return " ".join(str((event or {}).get("detail") or "").split())[:120]
+
+
 def _event_notification_tasks(order, shipment, event, channel_id=None, bot_app_id=None):
     status = event.get("to") or shipment.get("status", "-")
     event_key = event.get("at") or event.get("observed_at")
@@ -279,8 +306,9 @@ def _event_notification_tasks(order, shipment, event, channel_id=None, bot_app_i
         return []
     product = (shipment.get("products") or [""])[0]
     prefix = "⚠️" if status in EXCEPTIONS else ""
-    line = prefix + "【物流小助手】%s %s→%s｜国际单 %s｜顺丰 %s｜%s｜录单人 %s" % (
-        order, event.get("from", "-"), status, shipment.get("intl") or "-",
+    node = _official_node_text(shipment, event) or "官网节点待更新"
+    line = prefix + "【物流小助手】%s %s→%s｜%s｜国际单 %s｜顺丰 %s｜%s｜录单人 %s" % (
+        order, event.get("from", "-"), status, node, shipment.get("intl") or "-",
         shipment.get("domestic") or "-", product[:24], shipment.get("salesperson") or "未匹配")
     tasks = [{"kind": "notify_group", "dedupe_key": f"group:{order}:{event_key}",
               "payload": {"order": order, "status": status, "event_key": event_key,
@@ -288,8 +316,8 @@ def _event_notification_tasks(order, shipment, event, channel_id=None, bot_app_i
                           "channel_id": channel_id or os.environ.get("CHANNEL_ID") or "",
                           "body": line}}]
     if shipment.get("salesperson"):
-        dm = "你的订单 %s 物流更新：%s（国际单 %s）" % (
-            order, status, shipment.get("intl") or "-")
+        dm = "你的订单 %s 物流更新：%s｜%s（国际单 %s）" % (
+            order, status, node, shipment.get("intl") or "-")
         tasks.append({"kind": "notify_dm", "dedupe_key": f"dm:{order}:{event_key}",
                       "payload": {"order": order, "status": status,
                                   "name": shipment["salesperson"],
