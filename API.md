@@ -10,28 +10,27 @@
 
 | 项 | 值 |
 |---|---|
-| 服务地址 | 服务器内网 `http://10.100.0.176:18080`;服务器本机亦可用 `http://127.0.0.1:18080` |
-| 协议 | HTTP/1.1,UTF-8 JSON |
+| 服务地址 | **`https://pdca-workbench.vertu.cn/logistics-api`**(对外,已上线);服务器内网 `http://10.100.0.176:18080`;本机 `http://127.0.0.1:18080` |
+| 协议 | HTTPS(对外,自动证书)/ HTTP(内网),UTF-8 JSON |
 | 鉴权 | HTTP Basic(推荐)或登录会话 Cookie |
 | 权限 | 全部只读,不改台账、不触发抓取 |
 | 数据新鲜度 | 官网轨迹每天 09:05(全量)、15:05(增量)刷新;新面单入群后约 1 分钟内刷新 |
 
 ### 1.1 怎么访问
 
-**方式一(同事/系统对接)**:端口已绑到服务器内网地址 `10.100.0.176:18080`,同网段(VPN/办公网)可直接访问:
+**对外地址(推荐,同事/系统对接用)**:宿主机 Caddy 已把该域名下的 `/logistics-api/` 路径反代到本服务,自动 HTTPS:
 
 ```bash
-curl -u <用户名>:<密码> "http://10.100.0.176:18080/api/stats"
+curl -u <用户名>:<密码> "https://pdca-workbench.vertu.cn/logistics-api/api/stats"
+curl -u <用户名>:<密码> "https://pdca-workbench.vertu.cn/logistics-api/api/track/XSD260901141252"
 ```
 
-> 若从外部网络访问不通,说明云安全组未放行 18080;需运维放行,或改走 Caddy 域名反代(见 §13)。
+> 说明:独立域名 `logistics.vertu.cn` 待 IT 加 DNS 记录后切换(见 §13.2),切换时只需在 Caddy 增加一个站点块,路径不变。
 
-**方式二(仅服务器本机)**:
+**内网地址**:`http://10.100.0.176:18080`(需云安全组放行 18080,当前未放行)。
 
-```bash
-ssh -L 18080:127.0.0.1:18080 root@10.100.0.176   # 隧道
-curl -u <用户名>:<密码> "http://127.0.0.1:18080/api/stats"
-```
+**本机**:`ssh -L 18080:127.0.0.1:18080 root@10.100.0.176` 后用 `http://127.0.0.1:18080`。
+
 
 ---
 
@@ -363,28 +362,37 @@ for event in shipment["packages"][0]["official"]["events"]:
 | 只读账号 | `logistics-viewer`(角色 `viewer`),密码走交接消息,不写入文档 |
 | 后台入口 | 同一端口可登录工作台(`http://10.100.0.176:18080/`),viewer 只能看 |
 
-### 13.2 已知限制:云安全组只放行部分端口
+### 13.2 对外访问:已上线 Caddy 路径反代
 
-实测外部只能通 **22 / 80 / 443 / 2375 / 5432**,**18080 未放行**(连临时端口 19999 也不通 → 是云侧安全组白名单,不是服务器 iptables;宿主机 iptables 已允许容器端口)。
+云安全组实测只放行 **22 / 80 / 443 / 2375 / 5432**(临时端口 19999 亦不通 → 是云侧白名单,不是服务器 iptables;宿主机 iptables 已允许容器端口)。因此对外访问改走宿主机 Caddy(80/443):
 
-要让同事访问,二选一:
-
-**方案 A:安全组放行 18080(最简单)**
-- 运维在云控制台为安全组加一条:TCP 18080,来源填公司内网网段(不要 0.0.0.0/0)
-- 之后同事直接 `http://10.100.0.176:18080` + 只读账号
-- 前提:同事电脑能路由到 10.100.0.176(同一 VPN/办公网)
-
-**方案 B:Caddy 域名反代(与现有 PDCA 服务一致)**
-- 宿主机 Caddy 已按域名反代(`pdca-workbench.vertu.cn` → 127.0.0.1:8769 等)
-- IT 先加 DNS 记录(如 `logistics.vertu.cn` → 本机),然后在 `/etc/caddy/Caddyfile` 加:
+在 `/etc/caddy/Caddyfile` 的 `pdca-workbench.vertu.cn` 站点内新增路径(2026-09-18 已生效,原配置备份为 `Caddyfile.bak-logistics-20260918-173506`):
 
 ```caddy
-logistics.vertu.cn {
-    reverse_proxy 127.0.0.1:18080
+pdca-workbench.vertu.cn {
+    handle_path /logistics-api/* {
+        reverse_proxy 10.100.0.176:18080
+    }
+    handle {
+        reverse_proxy 127.0.0.1:8769
+    }
 }
 ```
 
-- 之后同事用 `https://logistics.vertu.cn/api/track/...`,自动 HTTPS,Basic 不再明文
+生效后同事即可用 `https://pdca-workbench.vertu.cn/logistics-api/...`(自动 HTTPS,Basic 凭证不再明文)。回归验证:PDCA 工作台首页仍 200,未带凭证 401,错误密码 401,`/logistics-api/healthz` 200。
+
+**后续可切换独立域名**:IT 添加 DNS 记录(`logistics.vertu.cn` → 本机公网 IP)后,在 Caddyfile 增加:
+
+```caddy
+logistics.vertu.cn {
+    reverse_proxy 10.100.0.176:18080
+}
+```
+
+即可用 `https://logistics.vertu.cn/api/...`(路径无需前缀),原路径可保留或移除。
+
+**备选:安全组放行 18080** —— 运维在云控制台加 TCP 18080(来源限公司内网网段),之后同网段可直接 `http://10.100.0.176:18080`。
+
 
 ### 13.3 开新账号
 
