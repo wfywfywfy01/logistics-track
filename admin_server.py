@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict
+from datetime import UTC, datetime
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -151,7 +152,26 @@ def event_text(event):
     return " ".join(ordered)[:200]
 
 
-def package_views(shipment):
+def _tracking_attempt(result, tracking):
+    result = result or {}
+    current = (result.get("package_results") or {}).get(tracking)
+    if current is None and result.get("tracking") == tracking:
+        current = result
+    if not current:
+        return None
+    return {"observed_at": current.get("observed_at") or "N/A",
+            "ok": bool(current.get("ok")), "error": current.get("error") or ""}
+
+
+def _timestamp(value):
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    except (TypeError, ValueError):
+        return None
+
+
+def package_views(shipment, tracking_result=None, max_age_hours=None, now=None):
     """包裹视图;没有 packages 结构的历史订单按 intl/alt_intl 合成。"""
     packages = shipment.get("packages")
     if not packages:
@@ -169,14 +189,39 @@ def package_views(shipment):
             "tracking", "carrier", "role", "status", "binding_version",
             "status_observed_at", "last_observation")}
         view["official"] = official_view(package)
+        view["last_tracking_attempt"] = _tracking_attempt(
+            tracking_result, package.get("tracking"))
+        observed = _timestamp(view["official"].get("observed_at"))
+        if max_age_hours is None or observed is None:
+            view["tracking_data_stale"] = "N/A"
+        else:
+            reference = (now or datetime.now(UTC)).astimezone(UTC)
+            view["tracking_data_stale"] = (
+                reference - observed.astimezone(UTC)).total_seconds() >= max_age_hours * 3600
         views.append(view)
     return views
 
 
-def track_view(shipment):
-    packages = package_views(shipment)
-    latest = next((item["official"]["latest_event"] for item in packages
-                   if item["official"]["latest_event"]), None)
+def track_view(shipment, tracking_result=None, max_age_hours=None, now=None):
+    packages = package_views(shipment, tracking_result, max_age_hours, now)
+    latest_item = None
+    latest_timestamp = None
+    for item in packages:
+        event = item["official"]["latest_event"]
+        if not event:
+            continue
+        parsed_timestamp = _timestamp(event.get("occurred_at_utc"))
+        timestamp = parsed_timestamp.timestamp() if parsed_timestamp else None
+        if latest_item is None or (timestamp is not None and
+                                   (latest_timestamp is None or timestamp > latest_timestamp)):
+            latest_item, latest_timestamp = item, timestamp
+    latest = latest_item["official"]["latest_event"] if latest_item else None
+    attempts = [item["last_tracking_attempt"] for item in packages
+                if item["last_tracking_attempt"]]
+    latest_attempt = max(attempts, key=lambda item: (
+        _timestamp(item["observed_at"]) or datetime.min.replace(tzinfo=UTC))) if attempts else None
+    stale_values = [item["tracking_data_stale"] for item in packages
+                    if item["tracking_data_stale"] != "N/A"]
     return {
         "order": shipment.get("orderNo"),
         "status": shipment.get("status", "已预报"),
@@ -189,16 +234,21 @@ def track_view(shipment):
         "products": shipment.get("products") or [],
         "status_observed_at": shipment.get("status_observed_at"),
         "latest_event": latest,
+        "latest_event_tracking": latest_item.get("tracking") if latest_item else None,
         "latest_event_text": event_text(latest),
+        "last_tracking_attempt": latest_attempt,
+        "tracking_data_max_age_hours": max_age_hours if max_age_hours is not None else "N/A",
+        "tracking_data_stale": any(stale_values) if stale_values else "N/A",
         "packages": packages,
         "history": shipment.get("history") or [],
     }
 
 
-def find_by_tracking(store, number):
+def find_by_tracking(store, number, results=None, max_age_hours=None):
     matches = []
     for order, shipment in store.get_shipments().items():
-        for package in package_views(shipment):
+        for package in package_views(
+                shipment, (results or {}).get(order), max_age_hours):
             if package.get("tracking") == number:
                 matches.append({"order": order, "status": shipment.get("status", "已预报"),
                                 "salesperson": shipment.get("salesperson") or "未匹配",
@@ -235,6 +285,10 @@ def create_server(store, token, host="127.0.0.1", port=8080):
     request_timeout = float(os.environ.get("ADMIN_REQUEST_TIMEOUT_SECONDS") or 15)
     if request_timeout <= 0:
         raise ValueError("ADMIN_REQUEST_TIMEOUT_SECONDS must be positive")
+    max_age_value = os.environ.get("TRACKING_DATA_MAX_AGE_HOURS")
+    tracking_max_age_hours = float(max_age_value) if max_age_value else None
+    if tracking_max_age_hours is not None and tracking_max_age_hours <= 0:
+        raise ValueError("TRACKING_DATA_MAX_AGE_HOURS must be positive")
     sessions = {}
     sessions_lock = threading.Lock()
     auth_slots = threading.BoundedSemaphore(4)
@@ -507,6 +561,9 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                               {"Content-Length": str(len(content)),
                                "Content-Disposition": 'inline; filename="%s"' % path.name.replace('"', '')})
                 return self.wfile.write(content)
+            tracking_results = store.get_document("ups_results", {}) if (
+                parsed.path == "/api/track" or parsed.path.startswith("/api/track/") or
+                parsed.path == "/api/shipments") else {}
             if parsed.path == "/api/track":
                 order = (params.get("order") or [""])[0].strip()
                 number = (params.get("tracking") or [""])[0].strip()
@@ -514,10 +571,12 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                     shipment = store.get_shipment(order)
                     if not shipment:
                         return self._json(404, {"ok": False, "error": "order not found"})
-                    return self._json(200, {"ok": True, "shipment": track_view(shipment)})
+                    return self._json(200, {"ok": True, "shipment": track_view(
+                        shipment, tracking_results.get(order), tracking_max_age_hours)})
                 if not number:
                     return self._json(400, {"ok": False, "error": "order or tracking is required"})
-                matches = find_by_tracking(store, number)
+                matches = find_by_tracking(
+                    store, number, tracking_results, tracking_max_age_hours)
                 if not matches:
                     return self._json(404, {"ok": False, "tracking": number, "count": 0,
                                            "matches": [], "error": "tracking number not found"})
@@ -526,9 +585,15 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             if parsed.path.startswith("/api/track/"):
                 order = unquote(parsed.path.removeprefix("/api/track/"))
                 shipment = store.get_shipment(order)
-                if not shipment:
-                    return self._json(404, {"ok": False, "error": "order not found"})
-                return self._json(200, {"ok": True, "shipment": track_view(shipment)})
+                if shipment:
+                    return self._json(200, {"ok": True, "shipment": track_view(
+                        shipment, tracking_results.get(order), tracking_max_age_hours)})
+                matches = find_by_tracking(
+                    store, order, tracking_results, tracking_max_age_hours)
+                if matches:
+                    return self._json(200, {"ok": True, "tracking": order,
+                                            "count": len(matches), "matches": matches})
+                return self._json(404, {"ok": False, "error": "order or tracking number not found"})
             if parsed.path == "/api/stats":
                 return self._json(200, {"ok": True, **stats_view(store)})
             if parsed.path == "/api/shipments":
@@ -541,7 +606,9 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                     return self._json(400, {"ok": False, "error": "limit/offset must be integers"})
                 items = []
                 for shipment in rows[offset:offset + limit]:
-                    view = track_view(shipment)
+                    view = track_view(
+                        shipment, tracking_results.get(shipment.get("orderNo")),
+                        tracking_max_age_hours)
                     items.append({
                         "order": view["order"], "status": view["status"],
                         "carrier": view["carrier"], "intl": view["intl"],
@@ -550,6 +617,8 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                         "product": (view["products"] or [""])[0],
                         "latest_event": view["latest_event"],
                         "latest_event_text": view["latest_event_text"],
+                        "last_tracking_attempt": view["last_tracking_attempt"],
+                        "tracking_data_stale": view["tracking_data_stale"],
                         "event_count": sum(item["official"]["event_count"]
                                            for item in view["packages"]),
                         "status_observed_at": view["status_observed_at"],

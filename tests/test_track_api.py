@@ -1,5 +1,6 @@
 from urllib.error import HTTPError
 from urllib.parse import quote
+from datetime import UTC, datetime
 
 from test_admin_server import request, run_server
 
@@ -70,6 +71,69 @@ def test_track_by_tracking_number_and_missing_number(tmp_path):
         server.shutdown()
 
 
+def test_track_path_falls_back_to_tracking_number_for_legacy_callers(tmp_path):
+    store, server, base = run_server(tmp_path)
+    seed(store)
+    try:
+        status, payload = request(base + "/api/track/1ZC23W53D441751825", "secret-token")
+    finally:
+        server.shutdown()
+
+    assert status == 200
+    assert payload["tracking"] == "1ZC23W53D441751825"
+    assert payload["count"] == 1
+    assert payload["matches"][0]["order"] == "XSD1"
+
+
+def test_track_view_uses_latest_event_across_packages():
+    from admin_server import track_view
+
+    shipment = {"orderNo": "XSD1", "packages": [
+        {"tracking": "876543210121", "official_tracking": {"latest_event": {
+            "occurred_at_utc": "2026-09-20T08:00:00Z", "status": "In transit"}}},
+        {"tracking": "876543210122", "official_tracking": {"latest_event": {
+            "occurred_at_utc": "2026-09-22T08:00:00Z", "status": "Delivered"}}},
+    ]}
+
+    view = track_view(shipment)
+
+    assert view["latest_event"]["status"] == "Delivered"
+    assert view["latest_event_tracking"] == "876543210122"
+
+
+def test_track_api_exposes_latest_failed_carrier_attempt(tmp_path):
+    store, server, base = run_server(tmp_path)
+    seed(store)
+    store.put_document("ups_results", {"XSD1": {
+        "tracking": "1ZC23W53D441751825", "carrier": "UPS", "ok": False,
+        "observed_at": "2026-09-22T09:00:00+00:00", "error": "no GetStatus data",
+    }})
+    try:
+        status, payload = request(base + "/api/track/XSD1", "secret-token")
+    finally:
+        server.shutdown()
+
+    attempt = payload["shipment"]["packages"][0]["last_tracking_attempt"]
+    assert status == 200
+    assert attempt == {"observed_at": "2026-09-22T09:00:00+00:00", "ok": False,
+                       "error": "no GetStatus data"}
+
+
+def test_track_view_reports_stale_official_snapshot():
+    from admin_server import track_view
+
+    shipment = {"orderNo": "XSD1", "packages": [{
+        "tracking": "876543210123", "official_tracking": {
+            "observed_at": "2026-09-20T08:00:00+00:00", "events": []}}]}
+
+    view = track_view(
+        shipment, max_age_hours=18,
+        now=datetime(2026, 9, 22, 8, 0, tzinfo=UTC))
+
+    assert view["tracking_data_max_age_hours"] == 18
+    assert view["tracking_data_stale"] is True
+
+
 def test_stats_and_shipment_list(tmp_path):
     store, server, base = run_server(tmp_path)
     seed(store)
@@ -86,6 +150,8 @@ def test_stats_and_shipment_list(tmp_path):
         row = listing["items"][0]
         assert row["order"] == "XSD1" and row["event_count"] == 2
         assert "ANCHORAGE" in row["latest_event_text"]
+        assert "last_tracking_attempt" in row
+        assert "tracking_data_stale" in row
 
         status, limited = request(base + "/api/shipments?limit=1&offset=1", "secret-token")
         assert status == 200 and limited["count"] == 1 and limited["total"] == 2

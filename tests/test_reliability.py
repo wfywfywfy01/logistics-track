@@ -556,6 +556,36 @@ def test_busy_auto_track_is_not_reported_as_success(monkeypatch, tmp_path):
     assert auto_track.main() == 75
 
 
+def test_tracking_step_has_a_separate_batch_timeout(monkeypatch, tmp_path):
+    auto_track = load_auto_track(monkeypatch, tmp_path)
+    seen = {}
+
+    def completed(*_args, **kwargs):
+        seen["timeout"] = kwargs["timeout"]
+        return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.delenv("STEP_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("TRACK_STEP_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.setattr(auto_track.subprocess, "run", completed)
+
+    assert auto_track.run(["track_all_ups.py", "--mode", "full"], "抓官网") is True
+    assert seen["timeout"] == 7200
+
+
+def test_durable_notification_failure_does_not_repeat_carrier_batch(monkeypatch, tmp_path):
+    auto_track = load_auto_track(monkeypatch, tmp_path)
+    options = types.SimpleNamespace(
+        channel_id="channel", bot_app_id="bot", skip_track=False,
+        queued_only=False, mode="full")
+
+    def step(args, _description):
+        return args[0] != "tracking-pipeline.py" or "notify" not in args
+
+    monkeypatch.setattr(auto_track, "run", step)
+
+    assert auto_track.execute(options) == 0
+
+
 def test_message_completion_and_pipeline_task_are_atomic(tmp_path):
     from storage import Storage
     store = Storage(tmp_path)
@@ -572,10 +602,21 @@ def test_forced_rebinding_updates_carrier(monkeypatch, tmp_path):
     pipeline = load_pipeline(monkeypatch, tmp_path)
     pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1",
         "intl": "1Z999AA10123456784", "carrier": "UPS", "status": "运输中",
-        "history": [], "products": []})
+        "history": [], "products": [], "binding_version": 1,
+        "packages": [{"tracking": "1Z999AA10123456784", "carrier": "UPS",
+                      "role": "primary", "status": "运输中", "binding_version": 1,
+                      "history": [], "binding_history": []}]})
     monkeypatch.setattr(pipeline, "match_sales", lambda *_args, **_kwargs: {})
 
     result = pipeline.ingest_pair("XSD1", "876543210123", force=True)
 
     assert result["paired"] == "XSD1"
-    assert pipeline.STORE.get_shipment("XSD1")["carrier"] == "FEDEX"
+    saved = pipeline.STORE.get_shipment("XSD1")
+    assert saved["carrier"] == "FEDEX"
+    assert saved["packages"][0]["tracking"] == "876543210123"
+    assert saved["packages"][0]["carrier"] == "FEDEX"
+    assert saved["packages"][0]["binding_history"][-1]["from"] == "1Z999AA10123456784"
+    assert saved["packages"][0]["binding_history"][-1]["to"] == "876543210123"
+    assert saved["packages"][0]["binding_history"][-1]["snapshot"]["tracking"] == "1Z999AA10123456784"
+    assert saved["packages"][0]["binding_version"] == 2
+    assert saved["binding_version"] == 2

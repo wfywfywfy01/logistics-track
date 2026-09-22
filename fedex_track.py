@@ -162,16 +162,16 @@ def parse_dom_status(tracking, body):
 
 
 def page_failure(tracking, statuses, body):
+    text = (body or "").lower().replace("’", "'")
+    if "can't find that tracking number" in text or "tracking number cannot be found" in text:
+        return {"tracking": tracking, "ok": False,
+                "error": "FedEx tracking number not found", "not_found": True}
     dom = parse_dom_status(tracking, body)
     if dom:
         return dom
     if 403 in statuses:
         return {"tracking": tracking, "ok": False,
                 "error": "FedEx official site access denied (HTTP 403)"}
-    text = (body or "").lower().replace("’", "'")
-    if "can't find that tracking number" in text or "tracking number cannot be found" in text:
-        return {"tracking": tracking, "ok": False,
-                "error": "FedEx tracking number not found", "not_found": True}
     return {"tracking": tracking, "ok": False,
             "error": "no official FedEx tracking data"}
 

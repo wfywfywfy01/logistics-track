@@ -192,6 +192,16 @@ def inherit_parent(it, db):
 
 def ingest_pair(order, intl, force=False):
     with LEDGER_LOCK:
+        if force:
+            current = STORE.get_shipment(order) or {}
+            previous = current.get("intl") or ""
+            if previous and previous != intl and current.get("packages"):
+                replaced = replace_package(
+                    order, previous, intl, "system:ingest-pair", "forced tracking rebind")
+                if not replaced.get("replaced"):
+                    return {"paired": False, "needs_review": True,
+                            "reason": replaced.get("error") or "tracking replacement failed",
+                            "order": order, "intl": intl}
         return _ingest_pair(order, intl, force)
 
 def _ingest_pair(order, intl, force=False):
