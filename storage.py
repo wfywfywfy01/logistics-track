@@ -769,6 +769,48 @@ class Storage:
                 resolved += 1
         return resolved
 
+    def resolve_task_by_dedupe(self, dedupe_key, order, reason, operator="system"):
+        timestamp = iso()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT id,status FROM tasks WHERE dedupe_key=?", (dedupe_key,)
+            ).fetchone()
+            if not row or row["status"] == "succeeded":
+                return False
+            connection.execute(
+                """UPDATE tasks SET status='succeeded',lease_owner=NULL,lease_until=NULL,
+                   last_error=NULL,updated_at=? WHERE id=?""", (timestamp, row["id"])
+            )
+            connection.execute(
+                """INSERT INTO audit_log(order_no,entity_type,entity_id,action,operator,reason,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (order or None, "task", str(row["id"]), "auto_resolve",
+                 operator, reason, timestamp),
+            )
+        return True
+
+    def resolve_dead_tasks(self, kind, reason, operator="system"):
+        timestamp = iso()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT id,payload FROM tasks WHERE kind=? AND status='dead'", (kind,)
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row["payload"])
+                connection.execute(
+                    """UPDATE tasks SET status='succeeded',lease_owner=NULL,lease_until=NULL,
+                       last_error=NULL,updated_at=? WHERE id=?""", (timestamp, row["id"])
+                )
+                connection.execute(
+                    """INSERT INTO audit_log(order_no,entity_type,entity_id,action,operator,reason,created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (payload.get("order"), "task", str(row["id"]), "auto_resolve",
+                     operator, reason, timestamp),
+                )
+        return len(rows)
+
     def list_audit(self, order=None, limit=200):
         sql = "SELECT * FROM audit_log"
         params = []

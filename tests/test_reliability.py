@@ -206,6 +206,42 @@ def test_watcher_processes_distinct_message_with_same_timestamp(monkeypatch, tmp
     assert processed == ["XSD1==1Z1234567890"]
 
 
+def test_watcher_acknowledges_pair_already_preserved_for_review(monkeypatch, tmp_path):
+    watcher = load_watcher(monkeypatch, tmp_path)
+    timestamp = "2026-09-08T01:00:00Z"
+    message = {"id": "message-review", "created_at": timestamp,
+               "body": "XSD-MISSING==1Z1234567890"}
+    monkeypatch.setattr(watcher, "cli_json", lambda args, timeout=None: {"messages": [message]})
+    monkeypatch.setattr(watcher, "process_text", lambda *_args: [{
+        "kind": "pair", "ok": False, "needs_review": True,
+        "order": "XSD-MISSING", "intl": "1Z1234567890",
+    }])
+
+    watcher.watch_once("channel", "bot", timestamp)
+
+    assert watcher.STORE.pending_messages("channel") == []
+    with watcher.STORE.connect() as connection:
+        row = connection.execute(
+            "SELECT status,attempts FROM incoming_messages WHERE message_id='message-review'"
+        ).fetchone()
+    assert tuple(row) == ("succeeded", 0)
+
+
+def test_watcher_marks_deterministic_pair_failure_for_review(monkeypatch, tmp_path):
+    watcher = load_watcher(monkeypatch, tmp_path)
+    completed = types.SimpleNamespace(
+        returncode=2,
+        stdout=json.dumps({"paired": False, "needs_review": True,
+                           "reason": "unknown order"}).encode(),
+    )
+    monkeypatch.setattr(watcher.subprocess, "run", lambda *_args, **_kwargs: completed)
+
+    result = watcher.process_text("XSD-MISSING==1Z1234567890", "channel")
+
+    assert result[0]["ok"] is False
+    assert result[0]["needs_review"] is True
+
+
 def test_watcher_history_retries_same_page_before_advancing(monkeypatch, tmp_path):
     watcher = load_watcher(monkeypatch, tmp_path)
     timestamp = "2026-09-08T01:00:00Z"

@@ -119,8 +119,13 @@ def process_text(body, channel_id):
                             "--order", order, "--intl", intl], capture_output=True)
         ok = r.returncode == 0
         txt = r.stdout.decode("utf-8", errors="replace").strip()
+        try:
+            parsed = json.loads(txt)
+        except json.JSONDecodeError:
+            parsed = {}
         out.append({"kind": "pair", "order": order, "intl": intl, "ok": ok,
-                  "result": txt[:200].encode("ascii", "replace").decode()})
+                    "needs_review": bool(parsed.get("needs_review")),
+                    "result": txt[:200].encode("ascii", "replace").decode()})
     return out
 
 def spawn_auto_track(channel_id, bot_app_id, skip_track=False):
@@ -204,7 +209,8 @@ def watch_once(channel_id, bot_app_id, since_ts):
         body_low = (m.get("body") or "").lower()
         mentions = ((m.get("metadata") or {}).get("mentions") or [])
         mentioned = any(x.get("type") == "bot" and x.get("bot_id") == AGENT_BOT_ID for x in mentions) or any(k in body_low for k in ("@物流小助手", "@hermes logistics-track", "@物流追踪机器人"))
-        failed = [r for r in msg_items if r and not r.get("ok")]
+        failed = [r for r in msg_items if r and not r.get("ok") and
+                  not r.get("needs_review")]
         if failed:
             state = STORE.fail_message(channel_id, message_id,
                                        json.dumps(failed, ensure_ascii=False))
