@@ -369,6 +369,17 @@ def test_fedex_page_failure_distinguishes_not_found_from_access_denied():
     assert result["not_found"] is True
 
 
+def test_fedex_not_found_wins_over_unrelated_page_status_text():
+    from fedex_track import page_failure
+
+    result = page_failure(
+        "876543210123", [],
+        "We can't find that tracking number.\nHelp: My package says DELIVERED.")
+
+    assert result["ok"] is False
+    assert result["not_found"] is True
+
+
 def test_fedex_dom_success_wins_over_late_api_parse_error(monkeypatch):
     import fedex_track
     response = _LateResponse(

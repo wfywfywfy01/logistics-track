@@ -1,6 +1,6 @@
 # 物流小助手 · 查询接口文档
 
-> 版本 v1 · 2026-09-18 · 代码版本:master `ed371f7`(线上镜像 `candidate-trackapi-20260918`)
+> 版本 v1.2 · 2026-09-22
 > 提供方:物流追踪系统(云容器 `logistics-track`)
 > 数据源:UPS / DHL / FedEx 官网快照 + 本地 SQLite 台账
 
@@ -10,7 +10,7 @@
 
 | 项 | 值 |
 |---|---|
-| 服务地址 | **`https://pdca-workbench.vertu.cn/logistics-api`**(对外,已上线);服务器内网 `http://10.100.0.176:18080`;本机 `http://127.0.0.1:18080` |
+| 服务地址 | **`https://pdca-workbench.vertu.cn/logistics-api`**（对外）；服务器本机 `http://127.0.0.1:18080` |
 | 协议 | HTTPS(对外,自动证书)/ HTTP(内网),UTF-8 JSON |
 | 鉴权 | HTTP Basic(推荐)或登录会话 Cookie |
 | 权限 | 全部只读,不改台账、不触发抓取 |
@@ -26,8 +26,6 @@ curl -u <用户名>:<密码> "https://pdca-workbench.vertu.cn/logistics-api/api/
 ```
 
 > 说明:独立域名 `logistics.vertu.cn` 待 IT 加 DNS 记录后切换(见 §13.2),切换时只需在 Caddy 增加一个站点块,路径不变。
-
-**内网地址**:`http://10.100.0.176:18080`(需云安全组放行 18080,当前未放行)。
 
 **本机**:`ssh -L 18080:127.0.0.1:18080 root@10.100.0.176` 后用 `http://127.0.0.1:18080`。
 
@@ -113,7 +111,7 @@ curl -u <用户名>:<密码> "https://pdca-workbench.vertu.cn/logistics-api/api/
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/healthz` | 健康检查(免鉴权) |
-| GET | `/api/track/{order}` | **按订单号查一票**(含全部包裹与官网轨迹) |
+| GET | `/api/track/{order}` | **按订单号查一票**；兼容旧调用方传入国际单号 |
 | GET | `/api/track?tracking=<单号>` | **按国际单号反查订单** |
 | GET | `/api/shipments` | 台账列表(筛选/分页),批量拉取用 |
 | GET | `/api/stats` | 统计(状态分布、缺国际单、有轨迹数) |
@@ -188,8 +186,12 @@ curl -u admin:<ADMIN_TOKEN> "http://127.0.0.1:18080/api/track/XSD260901141252"
 | 字段 | 说明 |
 |---|---|
 | `status` | 订单聚合状态(多包裹按"部分签收/异常优先"汇总) |
-| `latest_event` | 全订单最新官网事件(取第一个有快照的包裹) |
+| `latest_event` | 按 `occurred_at_utc` 比较得到的全订单最新官网事件 |
+| `latest_event_tracking` | 最新事件所属国际运单号 |
 | `latest_event_text` | 最新事件一行文本,可直接展示/推送 |
+| `last_tracking_attempt` | 最近一次官网抓取结果：时间、成功标记与错误；与最后成功快照分开 |
+| `tracking_data_stale` | 最后成功快照是否超过配置的最大时效；阈值或时间缺失时为 `N/A` |
+| `tracking_data_max_age_hours` | 本次判断使用的数据时效阈值 |
 | `packages[].official.events` | 该包裹**完整官网轨迹**(最新在前) |
 | `packages[].official.event_count` | 轨迹条数;本次升级前入库的历史订单可能为 0 |
 | `packages[].official.estimated_delivery` | 官网预计到达(有则给) |
@@ -198,6 +200,10 @@ curl -u admin:<ADMIN_TOKEN> "http://127.0.0.1:18080/api/track/XSD260901141252"
 | `history` | 状态变化历史(阶段跳变,非全量轨迹) |
 
 **404**:`{"ok": false, "error": "order not found"}`
+
+兼容说明：若路径值不是订单号、但能匹配国际运单号，返回结构与
+`GET /api/track?tracking=` 相同，即 `tracking/count/matches[]`。新调用方按运单号查询时
+仍应使用显式查询参数，且必须处理一个运单号匹配多个订单的情况。
 
 ---
 
@@ -248,6 +254,8 @@ curl -u admin:<ADMIN_TOKEN> "http://127.0.0.1:18080/api/shipments?status=%E7%AD%
       "salesperson": "周佳丽", "product": "VERTU PHANTOM-深咖色基础款",
       "latest_event": { "...": "最新官网事件" },
       "latest_event_text": "09/11/2026 14:20 ANCHORAGE, AK, US Arrived at facility",
+      "last_tracking_attempt": {"observed_at": "2026-09-22T09:00:00+00:00", "ok": true, "error": ""},
+      "tracking_data_stale": false,
       "event_count": 12,
       "status_observed_at": "2026-09-11T06:20:00+00:00" }
   ]
@@ -350,6 +358,7 @@ for event in shipment["packages"][0]["official"]["events"]:
 |---|---|---|
 | 2026-09-18 | v1 | 新增 `/api/track`、`/api/shipments`、`/api/stats`(只读,基于 `official_tracking` 官网快照);群通知与私聊带上最新官网节点;云表格新增"轨迹节点数"列,最新节点改为官网事件文本 |
 | 2026-09-18 | v1.1 | 端口改绑内网 `10.100.0.176:18080`,新建只读账号 `logistics-viewer`;补充第 13 节(对外开通常见问题与安全组/Caddy 两种方案) |
+| 2026-09-22 | v1.2 | 路径接口兼容国际运单号；修复多包裹最新事件、强制换单和 FedEx 不存在误判；固化私有网络、抓取超时与时效阈值 |
 ---
 
 ## 13. 给同事开通访问(运维向)
@@ -358,9 +367,9 @@ for event in shipment["packages"][0]["official"]["events"]:
 
 | 项 | 值 |
 |---|---|
-| 端口绑定 | 容器 8080 → 服务器 `10.100.0.176:18080`(原来只绑 127.0.0.1) |
+| 端口绑定 | 容器 8080 → 服务器 `127.0.0.1:18080`，公网只经过 Caddy |
 | 只读账号 | `logistics-viewer`(角色 `viewer`),密码走交接消息,不写入文档 |
-| 后台入口 | 同一端口可登录工作台(`http://10.100.0.176:18080/`),viewer 只能看 |
+| 后台入口 | PDCA `/logistics-admin/` 同源代理，viewer 只能看 |
 
 ### 13.2 对外访问:已上线 Caddy 路径反代
 
@@ -371,7 +380,7 @@ for event in shipment["packages"][0]["official"]["events"]:
 ```caddy
 pdca-workbench.vertu.cn {
     handle_path /logistics-api/* {
-        reverse_proxy 10.100.0.176:18080
+        reverse_proxy 127.0.0.1:18080
     }
     handle {
         reverse_proxy 127.0.0.1:8769
@@ -385,13 +394,14 @@ pdca-workbench.vertu.cn {
 
 ```caddy
 logistics.vertu.cn {
-    reverse_proxy 10.100.0.176:18080
+    reverse_proxy 127.0.0.1:18080
 }
 ```
 
 即可用 `https://logistics.vertu.cn/api/...`(路径无需前缀),原路径可保留或移除。
 
-**备选:安全组放行 18080** —— 运维在云控制台加 TCP 18080(来源限公司内网网段),之后同网段可直接 `http://10.100.0.176:18080`。
+管理端口保持仅服务器本机监听，不在云安全组开放 18080。PDCA 与物流容器通过
+`dealer-knowledge` 私有 Docker 网络通信。
 
 
 ### 13.3 开新账号

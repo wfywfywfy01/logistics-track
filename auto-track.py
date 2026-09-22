@@ -16,9 +16,12 @@ STORE.migrate_legacy_json()
 
 def run(args, desc):
     t0 = time.time()
+    timeout_name = "TRACK_STEP_TIMEOUT_SECONDS" if args[0] == "track_all_ups.py" else \
+        "STEP_TIMEOUT_SECONDS"
+    default_timeout = 7200 if timeout_name == "TRACK_STEP_TIMEOUT_SECONDS" else 900
     try:
         r = subprocess.run([sys.executable] + args, capture_output=True,
-                           timeout=int(os.environ.get("STEP_TIMEOUT_SECONDS") or 900))
+                           timeout=int(os.environ.get(timeout_name) or default_timeout))
     except subprocess.TimeoutExpired:
         print(f"[{desc}] timed out", flush=True)
         return False
@@ -108,7 +111,7 @@ def execute(a):
         (["sync_sheet.py"], "同步云表格", False),
         (["backup.py"], "台账备份", True),
         (["tracking-pipeline.py", "notify", "--channel-id", a.channel_id,
-          "--bot-app-id", a.bot_app_id], "通知", True),
+          "--bot-app-id", a.bot_app_id], "通知", False),
     ])
     ok = True
     for args, description, required in steps:

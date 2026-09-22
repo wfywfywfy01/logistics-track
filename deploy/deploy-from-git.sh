@@ -10,11 +10,16 @@
 #      docker -H tcp://10.100.0.176:2375 build "https://github.com/wfywfywfy01/logistics-track.git#$(git rev-parse HEAD)" -f deploy/Dockerfile -t logistics-track:latest
 #      备选(ghfast, 可能拿到旧代码): docker -H ... build "https://ghfast.top/https://github.com/wfywfywfy01/logistics-track.git#master" -f deploy/Dockerfile -t logistics-track:latest
 #   3. 部署:
+#      docker -H tcp://10.100.0.176:2375 network inspect dealer-knowledge >/dev/null 2>&1 || \
+#        docker -H tcp://10.100.0.176:2375 network create dealer-knowledge
 #      docker -H tcp://10.100.0.176:2375 rm -f logistics-track
 #      docker -H tcp://10.100.0.176:2375 run -d --name logistics-track --restart unless-stopped \
 #        --shm-size=1g --memory=1536m --memory-swap=2048m --env-file deploy/.env \
 #        --log-opt max-size=20m --log-opt max-file=3 \
-#        -p 127.0.0.1:18080:8080 \
+#        --network dealer-knowledge -p 127.0.0.1:18080:8080 \
+#        -e ADMIN_COOKIE_SECURE=1 -e TRACK_STEP_TIMEOUT_SECONDS=7200 \
+#        -e TRACKING_DATA_MAX_AGE_HOURS=18 \
+#        -e STALL_HOURS_UPS=48 -e STALL_HOURS_DHL=48 -e STALL_HOURS_FEDEX=48 \
 #        -e BACKUP_DIR=/app/backups -v logistics-data:/app/data -v logistics-tmp:/app/tmp \
 #        -v logistics-backups:/app/backups logistics-track:latest
 #   回滚: rm -f 后用 logistics-track:prev 跑同一条 run
