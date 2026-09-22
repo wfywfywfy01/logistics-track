@@ -125,6 +125,10 @@ def execute(a):
     if not ok:
         print("AUTO-TRACK FAILED", flush=True)
         return 1
+    resolved = STORE.resolve_dead_tasks(
+        "pipeline", "superseded by successful full pipeline run")
+    if resolved:
+        print(f"resolved {resolved} superseded pipeline dead letters", flush=True)
     print("AUTO-TRACK DONE", flush=True)
     return 0
 

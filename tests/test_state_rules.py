@@ -18,6 +18,20 @@ def test_unknown_order_pair_enters_review_queue(monkeypatch, tmp_path):
     assert pipeline.STORE.pending_task_count("review") == 1
 
 
+def test_successful_retry_closes_exact_pair_review(monkeypatch, tmp_path):
+    pipeline = load_pipeline(monkeypatch, tmp_path)
+    monkeypatch.setattr(pipeline, "match_sales", lambda *args, **kwargs: {})
+    pipeline.ingest_pair("XSD-LATE", "1Z1234567890")
+    pipeline.STORE.upsert_shipment(
+        "XSD-LATE", shipment(orderNo="XSD-LATE", binding_version=0)
+    )
+
+    result = pipeline.ingest_pair("XSD-LATE", "1Z1234567890")
+
+    assert result["paired"] == "XSD-LATE"
+    assert pipeline.STORE.pending_task_count("review") == 0
+
+
 def test_conflicting_tracking_number_requires_review(monkeypatch, tmp_path):
     pipeline = load_pipeline(monkeypatch, tmp_path)
     pipeline.STORE.upsert_shipment(

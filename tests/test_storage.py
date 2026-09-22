@@ -84,3 +84,17 @@ def test_failed_task_retries_then_moves_to_dead_letter(tmp_path):
 
     assert state == "dead"
     assert store.claim_task("worker", now=now + timedelta(days=1)) is None
+
+
+def test_successful_global_run_resolves_pipeline_dead_letters(tmp_path):
+    now = datetime(2026, 9, 8, tzinfo=UTC)
+    store = Storage(tmp_path)
+    task_id = store.enqueue_task("pipeline", "pipeline:old", {"order": "XSD1"}, now=now)
+    store.claim_task("worker", now=now, kind="pipeline")
+    store.fail_task(task_id, "old run failed", max_attempts=1, now=now)
+
+    resolved = store.resolve_dead_tasks("pipeline", "superseded")
+
+    assert resolved == 1
+    assert store.list_tasks(statuses=("succeeded",), kinds=("pipeline",))[0]["id"] == task_id
+    assert store.list_audit("XSD1")[0]["reason"] == "superseded"

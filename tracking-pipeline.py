@@ -260,6 +260,9 @@ def _ingest_pair(order, intl, force=False):
         return current, tasks
 
     STORE.mutate_shipment(order, bind)
+    if outcome.get("paired"):
+        STORE.resolve_task_by_dedupe(
+            f"pair-review:{order}:{intl}", order, "tracking pair is now bound")
     return outcome
 
 # ---------- 轨迹落台 ----------
