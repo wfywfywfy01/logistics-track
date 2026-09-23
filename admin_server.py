@@ -155,11 +155,14 @@ def official_view(package):
         "observed_at": official.get("observed_at"),
         "status_en": official.get("status_en"),
         "progress": official.get("progress"),
+        "progress_type": official.get("progress_type"),
+        "received_by": official.get("received_by"),
         "estimated_delivery": official.get("estimated_delivery"),
         "latest_event": official.get("latest_event"),
         "events": events,
         "event_count": len(events),
         "progress_steps": official.get("progress_steps") or [],
+        "progress_steps_availability": official.get("progress_steps_availability"),
     }
 
 
@@ -671,21 +674,36 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                 evidence = store.evidence_for_order(order)
                 view = track_view(shipment,
                     store.get_document("ups_results", {}).get(order), tracking_max_age_hours)
+                linked, linked_total = store.issues_page(order=order, limit=500)
                 body = admin_ui.order_detail(shipment, view, evidence, store.list_audit(order),
-                                             store.list_issues(limit=100000), principal["role"])
+                                             linked, principal["role"], linked_total)
                 return self._html(200, body, "orders")
             if parsed.path == "/tasks":
                 try: page_number = int((params.get("page") or ["1"])[0])
                 except ValueError: page_number = 1
                 filters = {key: (params.get(key) or [""])[0] for key in ("kind", "status", "order")}
-                return self._html(200, admin_ui.tasks(store.list_issues(limit=100000),
-                    principal["role"], filters, page_number), "tasks")
+                page_number = max(1, page_number)
+                rows, total = store.issues_page(kind=filters["kind"], status=filters["status"],
+                    order=filters["order"], limit=25, offset=(page_number - 1) * 25)
+                if total and not rows:
+                    page_number = (total + 24) // 25
+                    rows, _ = store.issues_page(kind=filters["kind"], status=filters["status"],
+                        order=filters["order"], limit=25, offset=(page_number - 1) * 25)
+                return self._html(200, admin_ui.tasks(rows, principal["role"], filters,
+                    page_number, total_override=total), "tasks")
             if parsed.path == "/notifications":
-                rows = store.list_tasks(limit=100000, kinds=("notify_group", "notify_dm"))
                 try: page_number = int((params.get("page") or ["1"])[0])
                 except ValueError: page_number = 1
+                page_number = max(1, page_number)
+                status = (params.get("status") or [""])[0]
+                kinds = ("notify_group", "notify_dm")
+                statuses = (status,) if status else None
+                total = store.task_count(statuses=statuses, kinds=kinds)
+                page_number = min(page_number, max(1, (total + 24) // 25))
+                rows = store.list_tasks(statuses=statuses, limit=25, kinds=kinds,
+                    offset=(page_number - 1) * 25)
                 return self._html(200, admin_ui.notifications(rows,
-                    {"status": (params.get("status") or [""])[0]}, page_number), "notifications")
+                    {"status": status}, page_number, total_override=total), "notifications")
             if parsed.path == "/reports/daily":
                 report = build_daily_report(
                     store, freshness_hours=os.environ.get("TRACKING_DATA_MAX_AGE_HOURS"))

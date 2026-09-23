@@ -19,7 +19,7 @@
   /* ---- 文字 ---- */
   --text: #e2e8f0;
   --text-muted: #94a3b8;
-  --text-faint: #64748b;
+  --text-faint: #93a4ba;
   --text-disabled: #475569;
 
   /* ---- 描边 ---- */
@@ -1345,6 +1345,8 @@ pre.code {
 .doc-list .doc + .doc { margin-top: var(--sp-2); }
 .card .state { padding: var(--sp-4); }
 .focus { border: 1px solid var(--amber-line); border-radius: var(--r-lg); }
+.progress-steps { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin: 0; padding: 0; list-style: none; }
+.progress-steps li { display: grid; gap: var(--sp-1); min-width: 150px; padding: var(--sp-3); border: 1px solid var(--border); border-radius: var(--r-sm); }
 .grid td, .grid th { vertical-align: top; }
 .pager { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
 .pager__btn[aria-current=page] { border-color: var(--blue); color: var(--blue); }

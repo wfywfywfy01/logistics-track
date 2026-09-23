@@ -82,9 +82,16 @@ def _state(view):
         return "抓取失败", "bad"
     if any(p.get("tracking_data_stale") is True for p in packages):
         return "数据过期", "warn"
-    if any((p.get("official") or {}).get("events") for p in packages):
-        return "官网已更新", "ok"
-    return "暂无官网数据", "missing"
+    present = [any((p.get("official") or {}).get(key) not in (None, "", "N/A", [])
+                   for key in ("observed_at", "status_en", "latest_event", "events"))
+               for p in packages]
+    if any(present) and not all(present):
+        return "部分缺官网数据", "warn"
+    if not any(present):
+        return "暂无官网数据", "missing"
+    if any(p.get("tracking_data_stale") in (None, "N/A") for p in packages):
+        return "官网时效未知", "warn"
+    return "官网已更新", "ok"
 
 
 def orders(views, counts, query="", status="", carrier="", page_number=1, per_page=25):
@@ -113,7 +120,7 @@ def orders(views, counts, query="", status="", carrier="", page_number=1, per_pa
     if not shown:
         return body + empty("没有符合条件的订单")
     body += ("<div class='card table-scroll'><table class='grid'><thead><tr><th>订单</th><th>包裹</th>"
-             "<th>承运商</th><th>状态</th><th>官网数据</th><th>最新节点</th></tr></thead><tbody>")
+             "<th>承运商</th><th>状态</th><th>官网数据</th><th>最新节点</th><th>更新时间</th></tr></thead><tbody>")
     for view in shown:
         order = str(view.get("order") or "")
         label, tone = _state(view)
@@ -126,7 +133,8 @@ def orders(views, counts, query="", status="", carrier="", page_number=1, per_pa
                  f"<td data-m='label' data-label='承运商'>{h(carriers)}</td>"
                  f"<td data-m='label' data-label='状态'>{badge(view.get('status') or 'N/A')}</td>"
                  f"<td data-m='label' data-label='官网数据'>{badge(label, tone)}</td>"
-                 f"<td data-m='label' data-label='最新节点'>{h(latest)}</td></tr>")
+                 f"<td data-m='label' data-label='最新节点'>{h(latest)}</td>"
+                 f"<td data-m='label' data-label='更新时间'>{display(view.get('status_observed_at'))}</td></tr>")
     body += "</tbody></table></div>"
     base = {"q": query, "status": status, "carrier": carrier}
     pager = []
@@ -144,8 +152,12 @@ def _package(package, number):
     latest = official.get("latest_event") or {}
     eta = official.get("estimated_delivery")
     if isinstance(eta, dict):
-        eta_text = " ".join(str(eta[key]) for key in ("date", "time", "timezone", "text")
-                            if eta.get(key)) or json.dumps(eta, ensure_ascii=False)
+        eta_text = " ".join(str(eta[key]) for key in (
+            "local_date_text", "local_time_text", "local_from_text", "local_through_text",
+            "timezone_offset", "date", "time", "timezone", "text") if eta.get(key))
+        if not eta_text:
+            eta_text = " ".join(str(eta[key]) for key in ("from_utc", "through_utc")
+                                if eta.get(key))
     else:
         eta_text = json.dumps(eta, ensure_ascii=False) if isinstance(eta, list) else eta
     events = official.get("events") or []
@@ -154,24 +166,45 @@ def _package(package, number):
             f"<span>{h(package.get('carrier') or '承运商未知')}</span>"
             f"<div class='pkg__head-right'>{badge(label, tone)}</div></header>"
             "<div class='pkg__body'><div class='dl dl--3'>"
-            f"<div><span class='label'>当前状态</span><div>{display(latest.get('status') or official.get('status_en') or package.get('status'), '状态未知')}</div></div>"
+            f"<div><span class='label'>官网状态</span><div>{display(latest.get('status') or official.get('status_en'), '官网状态未知')}</div></div>"
             f"<div><span class='label'>预计送达</span><div>{display(eta_text)}</div></div>"
             f"<div><span class='label'>最后位置</span><div>{display(latest.get('location'))}</div></div>"
             f"<div><span class='label'>官网来源</span><div>{display(official.get('source'), '非官网数据')}</div></div>"
             f"<div><span class='label'>官网观察时间</span><div>{display(official.get('observed_at'), '从未抓取')}</div></div>"
-            f"<div><span class='label'>包裹状态</span><div>{display(package.get('status'))}</div></div></div>")
+            f"<div><span class='label'>包裹状态</span><div>{display(package.get('status'))}</div></div>"
+            f"<div><span class='label'>签收人</span><div>{display(official.get('received_by'))}</div></div></div>")
     if attempt and not attempt.get("ok"):
         body += f"<div class='freshness-panel freshness-panel--failed'>抓取失败：{display(attempt.get('error'), '原因未记录')}</div>"
+    steps = official.get("progress_steps") or []
+    if official.get("progress") not in (None, ""):
+        body += f"<p>官网进度：{h(official['progress'])} {h(official.get('progress_type') or '')}</p>"
+    if steps:
+        body += "<section><h3 class='h3'>官网进度</h3><ol class='progress-steps'>"
+        for step in steps:
+            state = "当前" if step.get("current") else "已完成" if step.get("completed") else "后续"
+            body += (f"<li>{badge(state, 'info' if step.get('current') else 'ok' if step.get('completed') else 'idle')} "
+                     f"{display(step.get('name'))} <span class='sub'>{display(step.get('source_time_text'))} "
+                     f"{display(step.get('location'))}</span></li>")
+        body += "</ol></section>"
     if not events:
         body += "<div class='track-empty'><strong class='track-empty__title'>官网暂无轨迹节点</strong><span class='track-empty__desc'>无法据此判断包裹进度。</span></div>"
     else:
         body += "<h3 class='h3'>官网轨迹</h3><div class='table-scroll'><table class='grid'><thead><tr><th>时间</th><th>状态</th><th>地点</th><th>详情</th></tr></thead><tbody>"
         for event in events:
-            when = event.get("occurred_at_utc") or event.get("source_time_text") or "N/A"
-            body += (f"<tr><td data-m='label' data-label='时间'><time datetime='{h(when)}'>{h(when)}</time></td>"
+            when = event.get("occurred_at_utc")
+            source_time = event.get("source_time_text") or when
+            event_time = (f"<time datetime='{h(when)}'>{h(source_time)}</time>" if when else
+                          display(source_time))
+            extra = " · ".join(str(value) for value in (
+                event.get("additional_description"), event.get("code"),
+                event.get("exception_code")) if value)
+            if event.get("is_brokerage"):
+                extra = (extra + " · " if extra else "") + "清关事件"
+            body += (f"<tr><td data-m='label' data-label='时间'>{event_time}</td>"
                      f"<td data-m='label' data-label='状态'>{display(event.get('status'))}</td>"
                      f"<td data-m='label' data-label='地点'>{display(event.get('location'))}</td>"
-                     f"<td data-m='label' data-label='详情'>{display(event.get('description'))}</td></tr>")
+                     f"<td data-m='label' data-label='详情'>{display(event.get('description'))}"
+                     f"{'<div class=sub>' + h(extra) + '</div>' if extra else ''}</td></tr>")
         body += "</tbody></table></div>"
     return body + "</div></section>"
 
@@ -184,7 +217,7 @@ def _action_form(title, endpoint, fields, button, confirm=""):
             "</form></details>")
 
 
-def order_detail(shipment, view, evidence, audit, issues, role):
+def order_detail(shipment, view, evidence, audit, issues, role, issue_count=None):
     order = str(shipment.get("orderNo") or "")
     endpoint = "/api/orders/" + quote(order, safe="")
     body = page(order, "按包裹核对官网轨迹、原件和处理记录。",
@@ -194,7 +227,7 @@ def order_detail(shipment, view, evidence, audit, issues, role):
     attention = []
     for index, package in enumerate(packages, 1):
         state, _ = _state({"packages": [package]})
-        if state in ("抓取失败", "数据过期", "暂无官网数据"):
+        if state in ("抓取失败", "数据过期", "官网时效未知", "暂无官网数据"):
             attention.append(f"包裹 {index}（{h(package.get('carrier') or 'N/A')}）：{state}")
     delivered = sum(str(package.get("status") or "") == "签收" for package in packages)
     if delivered and delivered < len(packages):
@@ -231,7 +264,8 @@ def order_detail(shipment, view, evidence, audit, issues, role):
                for item in package.get("binding_history") or []]
     body += card("换单历史", "".join(
         f"<div class='waybill-change'><div class='waybill-change__flow'>{display(item.get('from'))} → {display(item.get('to'))}</div>"
-        f"<span class='sub'>{display(item.get('at'))} · {display(item.get('reason'), '未记录原因')}</span></div>"
+        f"<span class='sub'>{display(item.get('at'))} · {display(item.get('reason'), '未记录原因')}</span>"
+        f"<details><summary>查看旧运单归档轨迹</summary>{_package({**(item.get('snapshot') or {}), 'official': (item.get('snapshot') or {}).get('official_tracking') or {}}, '旧')}</details></div>"
         for item in changes)
                  if changes else empty("暂无换单记录"))
     audit_rows = "".join(
@@ -241,8 +275,13 @@ def order_detail(shipment, view, evidence, audit, issues, role):
         for row in audit)
     body += card("操作审计", "<div class='audit'>" + audit_rows + "</div>" if audit_rows else empty("暂无操作记录"))
     body += "</div><aside class='detail-side'>"
-    linked = [item for item in issues if str((item.get("payload") or {}).get("order") or "") == order]
+    linked = [item for item in issues if order in (
+        [str((item.get("payload") or {}).get("order") or "")] +
+        [str(value) for value in (item.get("payload") or {}).get("orders") or []])]
     issue_content = "".join(f"<a class='doc' href='/tasks?order={quote(order, safe='')}'>{h(item.get('kind'))} · {h(item.get('status'))}</a>" for item in linked)
+    if issue_count is not None and issue_count > len(linked):
+        issue_content += (f"<p>仅展示最近 {len(linked)} 条。"
+                          f"<a href='/tasks?order={quote(order, safe='')}'>查看全部 {issue_count} 条</a></p>")
     body += card("关联待办", issue_content or empty("暂无关联待办"))
     if role in ("admin", "operator"):
         actions = _action_form("补录人员", endpoint + "/salesperson",
@@ -265,14 +304,15 @@ KIND_LABELS = {"review": "人工复核", "tracking_failure": "官网抓取失败
                "incoming_message": "消息处理", "notify_group": "群通知", "notify_dm": "私聊通知"}
 
 
-def tasks(rows, role, filters, page_number=1, per_page=25):
+def tasks(rows, role, filters, page_number=1, per_page=25, total_override=None):
     kind, status, order = (filters.get(k, "").strip() for k in ("kind", "status", "order"))
     rows = [r for r in rows if (not kind or r.get("kind") == kind) and
             (not status or r.get("status") == status) and
-            (not order or str((r.get("payload") or {}).get("order") or "") == order)]
-    total = len(rows)
+            (not order or order in ([str((r.get("payload") or {}).get("order") or "")] +
+                                     [str(value) for value in (r.get("payload") or {}).get("orders") or []]))]
+    total = len(rows) if total_override is None else total_override
     page_number = min(max(1, page_number), max(1, (total + per_page - 1) // per_page))
-    shown = rows[(page_number - 1) * per_page:page_number * per_page]
+    shown = rows[(page_number - 1) * per_page:page_number * per_page] if total_override is None else rows
     body = page("异常待办", "先核实依据，再认领、重试或结案；操作原因会进入审计。")
     body += "<form class='toolbar' action='/tasks' method='get'>"
     body += f"<label>订单<input class='input' name='order' value='{h(order)}'></label>"
@@ -322,12 +362,12 @@ def tasks(rows, role, filters, page_number=1, per_page=25):
     return body
 
 
-def notifications(rows, filters, page_number=1, per_page=25):
+def notifications(rows, filters, page_number=1, per_page=25, total_override=None):
     status = filters.get("status", "").strip()
     rows = [r for r in rows if not status or r.get("status") == status]
-    total = len(rows)
+    total = len(rows) if total_override is None else total_override
     page_number = min(max(1, page_number), max(1, (total + per_page - 1) // per_page))
-    shown = rows[(page_number - 1) * per_page:page_number * per_page]
+    shown = rows[(page_number - 1) * per_page:page_number * per_page] if total_override is None else rows
     body = page("通知中心", "查看发送状态与回执；结果不确定时先人工核实。")
     body += "<form class='toolbar' method='get' action='/notifications'><label>状态<select class='select' name='status'><option value=''>全部</option>" + "".join(
         f"<option {'selected' if x == status else ''}>{x}</option>" for x in ("pending", "retry", "running", "unknown", "dead", "succeeded")) + "</select></label><button class='btn'>筛选</button></form>"
@@ -367,18 +407,23 @@ def report(data):
     body = page("运营日报 " + str(data.get("date") or ""), "数字来自物流台账与任务记录，可下钻核对。")
     body += "<div class='stat-grid mb-5'>" + "".join((
         stat("订单总数", data.get("denominator", 0), "/orders"),
-        stat("缺面单", data["missing_label"]["count"], "/orders", "查看订单"),
-        stat("今日签收", data["delivered_today"]["count"], "/orders"),
+        stat("缺面单", data["missing_label"]["count"], "#missing-label", "查看订单"),
+        stat("今日签收", data["delivered_today"]["count"], "#delivered-today"),
         stat("未结案", data["unresolved"]["count"], "/tasks"))) + "</div>"
-    body += card("缺面单：" + str(data["missing_label"]["count"]), order_links(data["missing_label"]["orders"]))
-    body += card("今日签收：" + str(data["delivered_today"]["count"]), order_links(data["delivered_today"]["orders"]))
+    body += "<div id='missing-label'>" + card("缺面单：" + str(data["missing_label"]["count"]), order_links(data["missing_label"]["orders"])) + "</div>"
+    body += "<div id='delivered-today'>" + card("今日签收：" + str(data["delivered_today"]["count"]), order_links(data["delivered_today"]["orders"])) + "</div>"
     body += card("未结案：" + str(data["unresolved"]["count"]), "<a href='/tasks'>进入异常待办</a>")
     rows = ""
     for carrier, item in sorted((data.get("carrier_freshness") or {}).items()):
-        rows += (f"<tr><td>{h(carrier)}</td><td>{h(item.get('total'))}</td>"
-                 f"<td>{h(item.get('ok'))}</td><td>{h(item.get('with_events'))}</td>"
-                 f"<td>{display(item.get('latest_observed_at'))}</td></tr>")
-    body += card("承运商数据新鲜度", "<div class='table-scroll'><table class='grid'><thead><tr><th>承运商</th><th>包裹</th><th>成功抓取</th><th>有轨迹</th><th>最后抓取</th></tr></thead><tbody>" + rows + "</tbody></table></div>" if rows else empty("暂无承运商数据"))
+        rows += (f"<tr><td data-m='label' data-label='承运商'>{h(carrier)}</td>"
+                 f"<td data-m='label' data-label='包裹'>{h(item.get('total'))}</td>"
+                 f"<td data-m='label' data-label='成功抓取'>{h(item.get('ok'))}</td>"
+                 f"<td data-m='label' data-label='缺抓取结果'>{h(item.get('missing_result'))}</td>"
+                 f"<td data-m='label' data-label='无观察时间'>{h(item.get('missing_observed_at'))}</td>"
+                 f"<td data-m='label' data-label='已过期'>{display(item.get('stale'), 'N/A')}</td>"
+                 f"<td data-m='label' data-label='有轨迹'>{h(item.get('with_events'))}</td>"
+                 f"<td data-m='label' data-label='最近一次抓取'>{display(item.get('latest_observed_at'))}</td></tr>")
+    body += card("承运商数据新鲜度", "<div class='table-scroll'><table class='grid'><thead><tr><th>承运商</th><th>包裹</th><th>成功抓取</th><th>缺抓取结果</th><th>无观察时间</th><th>已过期</th><th>有轨迹</th><th>最近一次抓取</th></tr></thead><tbody>" + rows + "</tbody></table></div>" if rows else empty("暂无承运商数据"))
     return body + f"<p class='sub mt-4'>数据过期阈值：{h(data.get('tracking_data_max_age_hours', 'N/A'))}</p>"
 
 
@@ -396,8 +441,10 @@ def users(items, audit):
         endpoint = "/api/users/" + quote(username, safe="")
         options = "".join(f"<option {'selected' if user.get('role') == x else ''}>{x}</option>" for x in ("viewer", "operator", "admin"))
         active = "true" if user.get("active") else "false"
-        rows += (f"<tr><td>{h(username)}</td><td>{h(user.get('role'))}</td>"
-                 f"<td>{h('启用' if user.get('active') else '停用')}</td><td>"
+        rows += (f"<tr><td data-m='label' data-label='用户名'>{h(username)}</td>"
+                 f"<td data-m='label' data-label='角色'>{h(user.get('role'))}</td>"
+                 f"<td data-m='label' data-label='状态'>{h('启用' if user.get('active') else '停用')}</td>"
+                 f"<td data-m='full'>"
                  f"<form class=api-form action='{endpoint}'><label>新密码<input class='input' name='password' type='password' minlength='12' placeholder='留空不改'></label>"
                  f"<label>角色<select class='select' name='role'>{options}</select></label>"
                  f"<label>状态<select class='select' name='active'><option value='true' {'selected' if active == 'true' else ''}>启用</option>"

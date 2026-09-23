@@ -317,6 +317,49 @@ def test_admin_ui_searches_all_package_numbers_and_escapes_official_text(tmp_pat
         server.shutdown()
 
 
+def test_official_status_without_events_and_archived_waybill_are_visible(tmp_path):
+    store, server, base = run_server(tmp_path)
+    store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中",
+        "packages": [{"tracking": "NEW", "carrier": "UPS", "status": "运输中",
+            "official_tracking": {"source": "ups.com", "status_en": "On the Way",
+                "observed_at": "2026-09-22T08:00:00Z",
+                "progress_steps": [{"name": "We Have Your Package", "completed": True}],
+                "received_by": "Jane"},
+            "binding_history": [{"from": "OLD", "to": "NEW", "at": "2026-09-22T07:00:00Z",
+                "snapshot": {"tracking": "OLD", "carrier": "UPS", "status": "签收",
+                    "official_tracking": {"source": "ups.com", "status_en": "Delivered",
+                        "events": [{"status": "Delivered", "description": "Old proof"}]}}}]}]})
+    try:
+        _, listing = request_text(base + "/orders", "secret-token")
+        assert "官网时效未知" in listing and "暂无官网数据" not in listing
+        _, detail = request_text(base + "/orders/XSD1", "secret-token")
+        assert "官网状态</span><div>On the Way" in detail
+        assert "We Have Your Package" in detail and "Jane" in detail
+        assert "查看旧运单归档轨迹" in detail and "Old proof" in detail
+    finally:
+        server.shutdown()
+
+
+def test_issue_and_notification_pages_filter_before_pagination(tmp_path):
+    store, server, base = run_server(tmp_path)
+    store.upsert_shipment("XSD2", {"orderNo": "XSD2", "status": "已预报"})
+    for number in range(55):
+        store.enqueue_task("review", f"review:{number}", {"order": "XSD1"})
+        store.enqueue_task("notify_group", f"notify:{number}", {"order": "XSD1"})
+    store.enqueue_task("review", "review:target", {"orders": ["XSD1", "XSD2"]})
+    try:
+        _, first = request_text(base + "/tasks?order=XSD1&kind=review", "secret-token")
+        _, third = request_text(base + "/tasks?order=XSD1&kind=review&page=3", "secret-token")
+        assert "符合条件：56 条" in first and "符合条件：56 条" in third
+        assert third.count("class='todo'") == 6
+        _, order = request_text(base + "/orders/XSD2", "secret-token")
+        assert "关联待办" in order and "review · pending" in order
+        _, notifications = request_text(base + "/notifications?page=3", "secret-token")
+        assert "符合条件：55 条" in notifications and "尝试 0 次" in notifications
+    finally:
+        server.shutdown()
+
+
 def test_unknown_notification_is_visible_but_has_no_one_click_action(tmp_path):
     store, server, base = run_server(tmp_path)
     task_id = store.enqueue_task("notify_group", "group:XSD1:event", {"order": "XSD1"})
