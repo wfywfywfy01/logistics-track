@@ -148,6 +148,7 @@ def refresh_operational_tasks(store, now=None, thresholds=None, freshness_hours=
 
 def build_daily_report(store, now=None, freshness_hours=None):
     now = now or datetime.now(UTC)
+    freshness_hours = float(freshness_hours) if freshness_hours not in (None, "") else "N/A"
     local_day = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
     shipments = store.get_shipments()
     results = store.get_document("ups_results", {})
@@ -178,6 +179,7 @@ def build_daily_report(store, now=None, freshness_hours=None):
             bucket = freshness.setdefault(
                 carrier, {"total": 0, "ok": 0, "with_events": 0,
                           "with_estimated_delivery": 0, "missing_result": 0,
+                          "missing_observed_at": 0, "stale": 0 if freshness_hours != "N/A" else "N/A",
                           "latest_observed_at": "N/A"})
             bucket["total"] += 1
             bucket["ok"] += int(bool(row.get("ok")))
@@ -185,10 +187,16 @@ def build_daily_report(store, now=None, freshness_hours=None):
             bucket["with_events"] += int(bool(row.get("events")))
             bucket["with_estimated_delivery"] += int(bool(row.get("estimated_delivery")))
             observed = row.get("observed_at")
-            if observed and (bucket["latest_observed_at"] == "N/A" or
-                             observed > bucket["latest_observed_at"]):
+            try:
+                observed_time = _datetime(observed)
+            except (TypeError, ValueError):
+                observed_time = None
+            bucket["missing_observed_at"] += int(observed_time is None)
+            if freshness_hours != "N/A" and observed_time is not None:
+                bucket["stale"] += int((now - observed_time).total_seconds() >= freshness_hours * 3600)
+            if observed_time and (bucket["latest_observed_at"] == "N/A" or
+                                  observed_time > _datetime(bucket["latest_observed_at"])):
                 bucket["latest_observed_at"] = observed
-    freshness_hours = float(freshness_hours) if freshness_hours not in (None, "") else "N/A"
     return {"date": str(local_day), "denominator": len(shipments),
             "missing_label": {"count": len(missing), "orders": missing},
             "unresolved": {"count": unresolved_count,

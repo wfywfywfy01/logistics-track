@@ -293,6 +293,87 @@ def test_order_detail_renders_official_tracking_timeline(tmp_path):
         server.shutdown()
 
 
+def test_admin_ui_searches_all_package_numbers_and_escapes_official_text(tmp_path):
+    store, server, base = run_server(tmp_path)
+    store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中",
+        "packages": [{"tracking": "FIRST", "carrier": "UPS"},
+                     {"tracking": "SECOND", "carrier": "DHL",
+                      "official_tracking": {"source": "dhl.com",
+                          "events": [{"occurred_at_utc": "2026-09-22T08:00:00Z",
+                                      "description": "<script>alert(1)</script>"}]}}]})
+    try:
+        _, listing = request_text(base + "/orders?q=SECOND", "secret-token")
+        assert "XSD1" in listing and "DHL" in listing
+        _, detail = request_text(base + "/orders/XSD1", "secret-token")
+        assert "FIRST" in detail and "SECOND" in detail
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in detail
+        assert "<script>alert(1)</script>" not in detail
+        assert "官网暂无轨迹节点" in detail
+        _, api = request(base + "/api/orders?q=SECOND", "secret-token")
+        assert len(api["items"]) == 1
+        status, content_type, css = request_bytes(base + "/admin.css", "secret-token")
+        assert status == 200 and content_type == "text/css" and b"--bg: #0b0d13" in css
+    finally:
+        server.shutdown()
+
+
+def test_official_status_without_events_and_archived_waybill_are_visible(tmp_path):
+    store, server, base = run_server(tmp_path)
+    store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中",
+        "packages": [{"tracking": "NEW", "carrier": "UPS", "status": "运输中",
+            "official_tracking": {"source": "ups.com", "status_en": "On the Way",
+                "observed_at": "2026-09-22T08:00:00Z",
+                "progress_steps": [{"name": "We Have Your Package", "completed": True}],
+                "received_by": "Jane"},
+            "binding_history": [{"from": "OLD", "to": "NEW", "at": "2026-09-22T07:00:00Z",
+                "snapshot": {"tracking": "OLD", "carrier": "UPS", "status": "签收",
+                    "official_tracking": {"source": "ups.com", "status_en": "Delivered",
+                        "events": [{"status": "Delivered", "description": "Old proof"}]}}}]}]})
+    try:
+        _, listing = request_text(base + "/orders", "secret-token")
+        assert "官网时效未知" in listing and "暂无官网数据" not in listing
+        _, detail = request_text(base + "/orders/XSD1", "secret-token")
+        assert "官网状态</span><div>On the Way" in detail
+        assert "We Have Your Package" in detail and "Jane" in detail
+        assert "查看旧运单归档轨迹" in detail and "Old proof" in detail
+    finally:
+        server.shutdown()
+
+
+def test_issue_and_notification_pages_filter_before_pagination(tmp_path):
+    store, server, base = run_server(tmp_path)
+    store.upsert_shipment("XSD2", {"orderNo": "XSD2", "status": "已预报"})
+    for number in range(55):
+        store.enqueue_task("review", f"review:{number}", {"order": "XSD1"})
+        store.enqueue_task("notify_group", f"notify:{number}", {"order": "XSD1"})
+    store.enqueue_task("review", "review:target", {"orders": ["XSD1", "XSD2"]})
+    try:
+        _, first = request_text(base + "/tasks?order=XSD1&kind=review", "secret-token")
+        _, third = request_text(base + "/tasks?order=XSD1&kind=review&page=3", "secret-token")
+        assert "符合条件：56 条" in first and "符合条件：56 条" in third
+        assert third.count("class='todo'") == 6
+        _, order = request_text(base + "/orders/XSD2", "secret-token")
+        assert "关联待办" in order and "review · pending" in order
+        _, notifications = request_text(base + "/notifications?page=3", "secret-token")
+        assert "符合条件：55 条" in notifications and "尝试 0 次" in notifications
+    finally:
+        server.shutdown()
+
+
+def test_unknown_notification_is_visible_but_has_no_one_click_action(tmp_path):
+    store, server, base = run_server(tmp_path)
+    task_id = store.enqueue_task("notify_group", "group:XSD1:event", {"order": "XSD1"})
+    store.claim_task("sender", kind="notify_group")
+    store.mark_delivery_inflight(task_id)
+    try:
+        _, tasks_page = request_text(base + "/tasks", "secret-token")
+        assert "发送结果不确定" in tasks_page
+        assert f"/api/tasks/{task_id}/retry" not in tasks_page
+        assert f"/api/tasks/{task_id}/resolve" not in tasks_page
+    finally:
+        server.shutdown()
+
+
 def test_order_evidence_requires_exact_order_match(tmp_path):
     store, server, base = run_server(tmp_path)
     wrong = tmp_path / "wrong.png"

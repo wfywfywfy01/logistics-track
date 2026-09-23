@@ -383,5 +383,10 @@ def test_daily_report_separates_status_history_and_eta_coverage(tmp_path):
 
     assert report["carrier_freshness"]["UPS"] == {
         "total": 3, "ok": 2, "missing_result": 1, "with_events": 1,
-        "with_estimated_delivery": 1,
+        "with_estimated_delivery": 1, "missing_observed_at": 1, "stale": "N/A",
         "latest_observed_at": "2026-09-10T11:30:00+00:00"}
+
+    report = build_daily_report(store, now=datetime(2026, 9, 12, tzinfo=UTC),
+                                freshness_hours=24)
+    assert report["carrier_freshness"]["UPS"]["stale"] == 2
+    assert report["carrier_freshness"]["UPS"]["missing_observed_at"] == 1

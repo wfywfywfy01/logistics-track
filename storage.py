@@ -666,7 +666,7 @@ class Storage:
         with self.connect() as connection:
             return connection.execute(sql, params).fetchone()["count"]
 
-    def list_tasks(self, statuses=None, limit=500, kinds=None):
+    def list_tasks(self, statuses=None, limit=500, kinds=None, offset=0):
         sql = "SELECT * FROM tasks"
         params = []
         clauses = []
@@ -678,8 +678,8 @@ class Storage:
             params.extend(kinds)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY updated_at DESC,id DESC LIMIT ?"
-        params.append(limit)
+        sql += " ORDER BY updated_at DESC,id DESC LIMIT ? OFFSET ?"
+        params.extend((limit, offset))
         with self.connect() as connection:
             rows = connection.execute(sql, params).fetchall()
         result = []
@@ -921,6 +921,39 @@ class Storage:
                          "kind": "incoming_message"})
             issues.append(item)
         return sorted(issues, key=lambda item: item.get("updated_at", ""), reverse=True)[:limit]
+
+    def issues_page(self, *, kind="", status="", order="", limit=25, offset=0):
+        """Filter and paginate the three issue sources before decoding payloads."""
+        sources = """SELECT 'task' AS source, CAST(id AS TEXT) AS source_id,
+                       id, kind, status, attempts, last_error, updated_at, payload FROM tasks
+                     UNION ALL SELECT 'inbox', id, id, 'ocr', status, attempts,
+                       last_error, updated_at, payload FROM inbox
+                     UNION ALL SELECT 'incoming_message', channel_id || ':' || message_id,
+                       message_id, 'incoming_message', status, attempts, last_error,
+                       updated_at, payload FROM incoming_messages"""
+        clauses, params = ["status IN ('pending','retry','dead','unknown')"], []
+        if kind:
+            clauses.append("kind=?"); params.append(kind)
+        if status:
+            clauses.append("status=?"); params.append(status)
+        if order:
+            clauses.append("(json_extract(payload,'$.order')=? OR EXISTS "
+                           "(SELECT 1 FROM json_each(payload,'$.orders') WHERE value=?))")
+            params.extend((order, order))
+        where = " AND ".join(clauses)
+        with self.connect() as connection:
+            total = connection.execute(
+                f"SELECT COUNT(*) FROM ({sources}) WHERE {where}", params).fetchone()[0]
+            rows = connection.execute(
+                f"SELECT * FROM ({sources}) WHERE {where} "
+                "ORDER BY updated_at DESC,source_id DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset)).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item["payload"])
+            items.append(item)
+        return items, total
 
     def complete_task(self, task_id):
         with self.connect() as connection:
