@@ -293,6 +293,44 @@ def test_order_detail_renders_official_tracking_timeline(tmp_path):
         server.shutdown()
 
 
+def test_admin_ui_searches_all_package_numbers_and_escapes_official_text(tmp_path):
+    store, server, base = run_server(tmp_path)
+    store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中",
+        "packages": [{"tracking": "FIRST", "carrier": "UPS"},
+                     {"tracking": "SECOND", "carrier": "DHL",
+                      "official_tracking": {"source": "dhl.com",
+                          "events": [{"occurred_at_utc": "2026-09-22T08:00:00Z",
+                                      "description": "<script>alert(1)</script>"}]}}]})
+    try:
+        _, listing = request_text(base + "/orders?q=SECOND", "secret-token")
+        assert "XSD1" in listing and "DHL" in listing
+        _, detail = request_text(base + "/orders/XSD1", "secret-token")
+        assert "FIRST" in detail and "SECOND" in detail
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in detail
+        assert "<script>alert(1)</script>" not in detail
+        assert "官网暂无轨迹节点" in detail
+        _, api = request(base + "/api/orders?q=SECOND", "secret-token")
+        assert len(api["items"]) == 1
+        status, content_type, css = request_bytes(base + "/admin.css", "secret-token")
+        assert status == 200 and content_type == "text/css" and b"--bg: #0b0d13" in css
+    finally:
+        server.shutdown()
+
+
+def test_unknown_notification_is_visible_but_has_no_one_click_action(tmp_path):
+    store, server, base = run_server(tmp_path)
+    task_id = store.enqueue_task("notify_group", "group:XSD1:event", {"order": "XSD1"})
+    store.claim_task("sender", kind="notify_group")
+    store.mark_delivery_inflight(task_id)
+    try:
+        _, tasks_page = request_text(base + "/tasks", "secret-token")
+        assert "发送结果不确定" in tasks_page
+        assert f"/api/tasks/{task_id}/retry" not in tasks_page
+        assert f"/api/tasks/{task_id}/resolve" not in tasks_page
+    finally:
+        server.shutdown()
+
+
 def test_order_evidence_requires_exact_order_match(tmp_path):
     store, server, base = run_server(tmp_path)
     wrong = tmp_path / "wrong.png"

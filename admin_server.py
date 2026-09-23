@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 from carriers import detect_carrier
 from storage import Storage, TaskConflict
 from operations import build_daily_report
+import admin_ui
 
 
 def parse_content_length(value):
@@ -62,15 +63,36 @@ document.addEventListener('submit', async event => {
   const form = event.target;
   if (!form.matches('.api-form')) return;
   event.preventDefault();
-  const response = await fetch(event.submitter?.formAction || form.action, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json',
-              'X-CSRF-Token': document.querySelector('meta[name=csrf]').content},
-    body: JSON.stringify(Object.fromEntries(new FormData(form)))
-  });
-  const result = await response.json();
-  if (!response.ok) return alert(result.error || '操作失败');
-  location.reload();
+  if (!form.reportValidity()) return;
+  const button = event.submitter;
+  if (button?.dataset.confirm && !window.confirm(button.dataset.confirm)) return;
+  const feedback = document.querySelector('.action-feedback');
+  const buttons = [...form.querySelectorAll('button')];
+  buttons.forEach(item => item.disabled = true);
+  if (feedback) { feedback.hidden = false; feedback.textContent = '正在提交…'; }
+  try {
+    const response = await fetch(button?.formAction || form.action, {
+      method: 'POST', credentials: 'same-origin',
+      headers: {'Content-Type': 'application/json',
+                'X-CSRF-Token': document.querySelector('meta[name=csrf]').content},
+      body: JSON.stringify(Object.fromEntries(new FormData(form)))
+    });
+    const result = await response.json();
+    if (response.status === 401) {
+      location.href = document.querySelector('form.logout').action.replace(/logout$/, 'login');
+      return;
+    }
+    if (!response.ok) throw new Error(result.error || `操作失败（HTTP ${response.status}）`);
+    location.reload();
+  } catch (error) {
+    if (feedback) feedback.textContent = error.message || '网络错误，请重试';
+    buttons.forEach(item => item.disabled = false);
+  }
+});
+document.getElementById('nav-toggle')?.addEventListener('click', event => {
+  const nav = document.getElementById('admin-nav');
+  const open = nav.classList.toggle('sidenav--open');
+  event.currentTarget.setAttribute('aria-expanded', String(open));
 });
 """.strip()
 
@@ -84,7 +106,10 @@ def _orders(store, query="", status=""):
     rows = []
     for shipment in store.get_shipments().values():
         haystack = " ".join(str(shipment.get(key) or "") for key in
-                            ("orderNo", "intl", "domestic", "salesperson")).casefold()
+                            ("orderNo", "intl", "alt_intl", "domestic", "salesperson"))
+        haystack += " " + " ".join(str(package.get("tracking") or "")
+                                     for package in shipment.get("packages") or [])
+        haystack = haystack.casefold()
         if query and query not in haystack:
             continue
         if status and shipment.get("status") != status:
@@ -365,7 +390,7 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Content-Security-Policy",
-                             "default-src 'self'; style-src 'unsafe-inline'; script-src 'self'; "
+                             "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; "
                              "form-action 'self'; base-uri 'none'")
             if status == 401 and urlsplit(self.path).path.startswith("/api/"):
                 self.send_header("WWW-Authenticate", 'Basic realm="logistics-admin"')
@@ -377,44 +402,24 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             self._headers(status, "application/json; charset=utf-8")
             self.wfile.write(json.dumps(payload, ensure_ascii=False).encode())
 
-        def _html(self, status, body):
+        def _html(self, status, body, section="orders"):
             self._headers(status, "text/html; charset=utf-8")
             principal = self._principal() or {"username": "-", "role": "-"}
-            users_link = "<a href='/users'>权限管理</a>" if principal["role"] == "admin" else ""
-            shell = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
-                     "<meta name=csrf content='" + self._csrf() + "'>"
-                     "<title>物流运营台</title><style>body{font:15px system-ui;margin:2rem auto;max-width:1200px;"
-                     "padding:0 1rem;color:#17202a;background:#f6f8fa}nav{padding:1rem;border-radius:.7rem;"
-                     "background:#17202a}nav a{margin-right:1rem;color:#fff}.user{float:right;color:#c9d1d9}"
-                     ".logout{float:right;margin:-.45rem 0 0 .7rem}.logout button{background:#30363d;border:0}"
-                     "h1{margin-top:1.6rem}"
-                     "table,pre,.api-form{background:#fff;border:1px solid #d8dee4;border-radius:.6rem}"
-                     "table{border-collapse:separate;border-spacing:0;width:100%}th,td{padding:.65rem;"
-                     "border-bottom:1px solid #e7ebef;text-align:left}.bad{color:#b42318;font-weight:600}"
-                     "input,select,button{margin:.2rem;padding:.5rem;border:1px solid #aab2bd;border-radius:.35rem}"
-                     "button{color:#fff;background:#0969da;border-color:#0969da;cursor:pointer}"
-                     "form{margin:.7rem 0}.api-form{padding:.55rem}pre{white-space:pre-wrap;padding:1rem;overflow:auto}"
-                     "@media(max-width:700px){body{margin:1rem auto}table{display:block;overflow:auto}"
-                     "input,select,button{box-sizing:border-box;width:100%;margin:.2rem 0}}</style>"
-                     "<nav><a href='/orders'>订单</a><a href='/tasks'>异常待办</a><a href='/notifications'>通知中心</a>"
-                     "<a href='/reports/daily'>运营日报</a>" + users_link +
-                     "<form class=logout method=post action='/logout'><input type=hidden name=csrf value='%s'>"
-                     "<button>退出</button></form><span class=user>当前：%s（%s）</span></nav>" % (
-                         html.escape(self._csrf()), html.escape(principal["username"]),
-                         html.escape(principal["role"])) + body +
-                     "<script src='/admin.js' defer></script>")
-            self.wfile.write(shell.encode())
+            self.wfile.write(admin_ui.shell(body, principal, self._csrf(), section).encode())
 
         def _login_page(self, status=200, error="", extra=None):
             login_csrf = secrets.token_urlsafe(32)
             message = "<p class=bad>%s</p>" % html.escape(error) if error else ""
             body = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
-                    "<title>登录物流运营台</title><style>body{font:15px system-ui;background:#f6f8fa;"
-                    "display:grid;min-height:100vh;place-items:center;margin:0}.login{width:min(360px,85vw);"
-                    "padding:2rem;background:#fff;border:1px solid #d8dee4;border-radius:.8rem}label{display:block;"
-                    "margin:1rem 0}input,button{box-sizing:border-box;width:100%;padding:.65rem;margin-top:.35rem;"
-                    "border:1px solid #aab2bd;border-radius:.4rem}button{color:#fff;background:#0969da;"
-                    "border-color:#0969da}.bad{color:#b42318}</style><main class=login>"
+                    "<title>登录物流运营台</title><style>body{font:14px system-ui;background:#0b0d13;"
+                    "color:#e2e8f0;display:grid;min-height:100vh;place-items:center;margin:0}"
+                    ".login{box-sizing:border-box;width:min(390px,92vw);padding:2rem;background:#13182a;"
+                    "border:1px solid rgba(255,255,255,.14);border-radius:16px}label{display:block;"
+                    "margin:1rem 0}input,button{box-sizing:border-box;width:100%;padding:.7rem;margin-top:.35rem;"
+                    "border:1px solid rgba(255,255,255,.2);border-radius:10px}input{background:#0e1220;"
+                    "color:#e2e8f0}button{color:#0b0d13;background:#6bb0ff;border-color:#6bb0ff;"
+                    "font-weight:600;cursor:pointer}:focus-visible{outline:2px solid #6bb0ff;"
+                    "outline-offset:2px}.bad{color:#fb7185}</style><main class=login>"
                     "<h1>登录物流运营台</h1>" + message +
                     "<form method=post action='/login'><input type=hidden name=csrf value='%s'>"
                     "<label>用户名<input name=username required "
@@ -543,6 +548,9 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             if parsed.path == "/admin.js":
                 self._headers(200, "text/javascript; charset=utf-8")
                 return self.wfile.write(ADMIN_JS.encode())
+            if parsed.path == "/admin.css":
+                self._headers(200, "text/css; charset=utf-8")
+                return self.wfile.write((Path(__file__).parent / "admin_ui.css").read_bytes())
             if parsed.path.startswith("/evidence/"):
                 item_id = unquote(parsed.path.removeprefix("/evidence/"))
                 item = next((row for row in store.get_inbox() if row["id"] == item_id), None)
@@ -649,113 +657,45 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             if parsed.path in ("/", "/orders"):
                 rows = _orders(store, (params.get("q") or [""])[0],
                                (params.get("status") or [""])[0])
-                body = "<h1>订单列表</h1><form><input name=q placeholder='订单/运单/录单人'><button>查询</button></form>"
-                body += "<table><tr><th>订单</th><th>国际单</th><th>录单人</th><th>状态</th></tr>"
-                for row in rows:
-                    order = str(row.get("orderNo") or "")
-                    body += "<tr><td><a href='/orders/%s'>%s</a></td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                        quote(order), html.escape(order), html.escape(str(row.get("intl") or "-")),
-                        html.escape(str(row.get("salesperson") or "未匹配")),
-                        html.escape(str(row.get("status") or "N/A")))
-                return self._html(200, body + "</table>")
+                results = store.get_document("ups_results", {})
+                views = [track_view(row, results.get(row.get("orderNo")), tracking_max_age_hours)
+                         for row in rows]
+                try: page_number = int((params.get("page") or ["1"])[0])
+                except ValueError: page_number = 1
+                return self._html(200, admin_ui.orders(views, stats_view(store),
+                    (params.get("q") or [""])[0], (params.get("status") or [""])[0],
+                    (params.get("carrier") or [""])[0].upper(), page_number), "orders")
             if parsed.path.startswith("/orders/"):
                 order = unquote(parsed.path.removeprefix("/orders/")); shipment = store.get_shipment(order)
                 if not shipment: return self._html(404, "<h1>订单不存在</h1>")
-                endpoint = "/api/orders/" + quote(order, safe="")
                 evidence = store.evidence_for_order(order)
-                fields = "<input name=reason required placeholder='原因'>"
-                body = "<h1>%s</h1>%s<pre>%s</pre>" % (
-                    html.escape(order), _official_tracking_html(shipment),
-                    html.escape(json.dumps(shipment, ensure_ascii=False, indent=2)))
-                if principal["role"] in ("admin", "operator"):
-                    body += ("<h2>补录人员</h2><form class=api-form action='%s/salesperson'>"
-                             "<input name=salesperson required placeholder='姓名'><input name=user_id required "
-                             "placeholder='用户 ID'>%s<button>保存</button></form>") % (endpoint, fields)
-                    body += ("<h2>增加包裹</h2><form class=api-form action='%s/packages'>"
-                             "<input name=tracking required placeholder='国际单号'><select name=carrier>"
-                             "<option>UPS</option><option>DHL</option><option>FEDEX</option></select>"
-                             "%s<button>增加</button></form>") % (endpoint, fields)
-                    body += ("<h2>换单</h2><form class=api-form action='%s/replace-package'>"
-                             "<input name=tracking required placeholder='原国际单号'><input name=new_tracking "
-                             "required placeholder='新国际单号'>%s<button>换单</button></form>") % (endpoint, fields)
-                links = " ".join("<a href='/evidence/%s'>查看 %s</a>" % (
-                    quote(str(item["id"]), safe=""), html.escape(str(item["id"])))
-                    for item in evidence["inbox"] if (item.get("payload") or {}).get("path"))
-                body += "<h2>原件与处理记录</h2>%s<pre>%s</pre><h2>审计</h2><pre>%s</pre>" % (
-                    links, html.escape(json.dumps(evidence, ensure_ascii=False, indent=2)),
-                    html.escape(json.dumps(store.list_audit(order), ensure_ascii=False, indent=2)))
-                return self._html(200, body)
+                view = track_view(shipment,
+                    store.get_document("ups_results", {}).get(order), tracking_max_age_hours)
+                body = admin_ui.order_detail(shipment, view, evidence, store.list_audit(order),
+                                             store.list_issues(limit=100000), principal["role"])
+                return self._html(200, body, "orders")
             if parsed.path == "/tasks":
-                rows = store.list_issues()
-                body = "<h1>异常待办</h1><table><tr><th>ID</th><th>类型</th><th>状态</th><th>原因</th><th>内容</th><th>操作</th></tr>"
-                for row in rows:
-                    actions = ""
-                    if principal["role"] in ("admin", "operator") and row.get("source") == "task":
-                        endpoint = "/api/tasks/%s" % row["id"]
-                        actions = ("<form class=api-form action='%s/retry'><input name=reason required placeholder='原因'>"
-                                   "<button>重试</button><button formaction='%s/claim'>认领</button>"
-                                   "<button formaction='%s/resolve'>结案</button></form>") % (
-                                       endpoint, endpoint, endpoint)
-                    elif principal["role"] in ("admin", "operator") and row.get("source") == "inbox":
-                        endpoint = "/api/inbox/%s/retry" % quote(str(row["id"]), safe="")
-                        actions = ("<form class=api-form action='%s'><input name=reason required placeholder='原因'>"
-                                   "<button>重试</button></form>") % endpoint
-                    body += "<tr><td>%s</td><td>%s</td><td class=bad>%s</td><td>%s</td><td><pre>%s</pre></td><td>%s</td></tr>" % (
-                        row["id"], html.escape(row["kind"]), html.escape(row["status"]),
-                        html.escape(str(row.get("last_error") or "")),
-                        html.escape(json.dumps(row["payload"], ensure_ascii=False)), actions)
-                return self._html(200, body + "</table>")
+                try: page_number = int((params.get("page") or ["1"])[0])
+                except ValueError: page_number = 1
+                filters = {key: (params.get(key) or [""])[0] for key in ("kind", "status", "order")}
+                return self._html(200, admin_ui.tasks(store.list_issues(limit=100000),
+                    principal["role"], filters, page_number), "tasks")
             if parsed.path == "/notifications":
-                rows = store.list_tasks(kinds=("notify_group", "notify_dm"))
-                return self._html(200, "<h1>通知中心</h1><pre>%s</pre>" % html.escape(
-                    json.dumps(rows, ensure_ascii=False, indent=2)))
+                rows = store.list_tasks(limit=100000, kinds=("notify_group", "notify_dm"))
+                try: page_number = int((params.get("page") or ["1"])[0])
+                except ValueError: page_number = 1
+                return self._html(200, admin_ui.notifications(rows,
+                    {"status": (params.get("status") or [""])[0]}, page_number), "notifications")
             if parsed.path == "/reports/daily":
                 report = build_daily_report(
                     store, freshness_hours=os.environ.get("TRACKING_DATA_MAX_AGE_HOURS"))
-                def order_links(orders):
-                    return " ".join("<a href='/orders/%s'>%s</a>" % (
-                        quote(str(order), safe=""), html.escape(str(order))) for order in orders) or "无"
-                body = "<h1>运营日报 %s</h1><p>订单总数：%s</p>" % (
-                    html.escape(report["date"]), report["denominator"])
-                body += "<h2>缺面单：%s</h2><p>%s</p>" % (
-                    report["missing_label"]["count"], order_links(report["missing_label"]["orders"]))
-                body += "<h2>今日签收：%s</h2><p>%s</p>" % (
-                    report["delivered_today"]["count"], order_links(report["delivered_today"]["orders"]))
-                body += "<h2>未结案：%s</h2><p><a href='/tasks'>进入异常待办</a></p>" % (
-                    report["unresolved"]["count"])
-                body += "<h2>承运商数据新鲜度</h2><pre>%s</pre>" % html.escape(
-                    json.dumps(report["carrier_freshness"], ensure_ascii=False, indent=2))
-                body += "<p>数据过期阈值：%s</p>" % html.escape(
-                    str(report["tracking_data_max_age_hours"]))
-                return self._html(200, body)
+                return self._html(200, admin_ui.report(report), "reports")
             if parsed.path == "/users":
                 if principal["role"] != "admin":
                     return self._json(403, {"error": "permission denied"})
-                body = ("<h1>权限管理</h1><p>admin：全部权限；operator：处理订单和异常；"
-                        "viewer：只读查看。</p><form class=api-form action='/api/users'>"
-                        "<input name=username required placeholder='用户名'><input name=password type=password "
-                        "required minlength=12 placeholder='初始密码（至少 12 位）'><select name=role>"
-                        "<option>viewer</option><option>operator</option><option>admin</option></select>"
-                        "<input name=reason required placeholder='原因'><button>新增账号</button></form>")
-                body += "<table><tr><th>用户名</th><th>角色</th><th>状态</th><th>修改</th></tr>"
-                for user in store.list_admin_users():
-                    endpoint = "/api/users/" + quote(user["username"], safe="")
-                    active_options = ("<option value=true selected>启用</option><option value=false>停用</option>"
-                                      if user["active"] else
-                                      "<option value=true>启用</option><option value=false selected>停用</option>")
-                    body += ("<tr><td>%s</td><td>%s</td><td>%s</td><td><form class=api-form "
-                             "action='%s'><input name=password type=password minlength=12 "
-                             "placeholder='留空不改密码'><select name=role><option>%s</option>"
-                             "<option>admin</option><option>operator</option><option>viewer</option></select>"
-                             "<select name=active>%s"
-                             "</select><input name=reason required placeholder='原因'><button>保存</button>"
-                             "</form></td></tr>") % (html.escape(user["username"]),
-                                html.escape(user["role"]), "启用" if user["active"] else "停用",
-                                endpoint, html.escape(user["role"]), active_options)
-                body += "</table><h2>权限审计</h2><pre>%s</pre>" % html.escape(json.dumps(
-                    [row for row in store.list_audit(limit=100) if row["entity_type"] == "admin_user"],
-                    ensure_ascii=False, indent=2))
-                return self._html(200, body)
+                audit = [row for row in store.list_audit(limit=100)
+                         if row["entity_type"] == "admin_user"]
+                return self._html(200, admin_ui.users(store.list_admin_users(), audit), "users")
             return self._json(404, {"error": "not found"})
 
         def do_POST(self):
