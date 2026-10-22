@@ -9,7 +9,11 @@
 - 发布增加可选 `--xray-bundle` 复用官方包，仍执行待发布提交中的 SHA-256 与大小上限校验；不继承旧镜像的来源标签。
 - 最后交叉复审补齐 DHL 当前节点有时间、历史首项无时间的场景：当前节点优先参与比较，仍允许更晚的有效 UTC 扫描胜出。最终本地完整回归启用真实 Chromium：302 passed / 3 skipped（Windows 无符号链接权限、Linux /proc 和 SIGALRM），预期的篡改 ZIP 测试产生 1 条 warning。Python 编译、两个 Bash 语法检查和 git diff --check 通过。
 - 从切换前生产备份恢复到隔离目录，以实际生产参数（停滞 48 小时、数据过期 18 小时）连续刷新两次：均为 256 单、integrity_check=ok，官网失败 142、停滞 6，数量稳定；新代码生成备份并再次恢复仍为 256 单、完整性 ok。只操作副本，未发送真实测试通知。
-- 回归场景与线上核对顺序见 `ACCEPTANCE-20261023.md`；Linux CI、最终版本及线上发布证据将在执行后补记。
+- PR #26 已合并并部署为 `3a930d45e0fb08eea4f00e81511289c353542022`；精确提交的 Linux CI [39816421888](https://github.com/wfywfywfy01/logistics-track/actions/runs/39816421888) 为 304 passed / 1 skipped（本机已运行的浏览器测试）。GitHub 检查状态同步前预检曾安全拒绝；确认 success 后使用已校验的官方 ZIP 正常构建与切换，未绕过发布门禁。
+- 生产镜像 `sha256:4412a7736063c0d828437eb29741bfe2c77b6844eacf3d9e3cd463aad1756e04` healthy、重启数 0。切换前备份 `/app/backups/pre-release-20261022-164723.zip`；回滚容器 `logistics-track-rollback-20261022-164723-c5c509cf4e2767f1` 已停止并保留。配置、网络、资源限制及数据卷沿用。
+- 发布后健康端点返回正确版本；认证后的订单、待办、通知、日报、用户页面与查询 API 均 200，无凭据 API 401，非 ASCII CSRF 403，现存原件读取 200。生产无中文文件名样本，此项由本机真实 HTTP 回归验证，不冒充线上实测。台账 256 单、integrity_check=ok，watcher 心跳 25 秒前更新。
+- 新容器在 2026-10-22 16:48 UTC 只读复查 UPS、DHL 授权样本，分别返回运输中及 6、14 条官网轨迹。公网 healthz 与运行版本一致，Teams 物流页面和后台均正常跳转同域 HTTPS 登录，无 JavaScript 页面异常。
+- 生产历史待办保留：官网失败 142、人工审核 59、停滞 5、私聊死信 1。FedEx 有效实票、持续异地备份及 72 小时观察仍未验收。回归场景见 `ACCEPTANCE-20261023.md`；本次发布后的文档补记不改变运行程序 SHA。
 
 ## 2026-10-23：发布完成与线上复核
 
