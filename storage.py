@@ -62,6 +62,15 @@ class TaskConflict(RuntimeError):
     pass
 
 
+class _Connection(sqlite3.Connection):
+    """Commit or roll back a context, then release its SQLite file handles."""
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
+
 class Storage:
     def __init__(self, data_dir=None):
         self.data_dir = Path(data_dir or os.environ.get("LOGIBOT_DATA_DIR") or "data")
@@ -70,7 +79,7 @@ class Storage:
         self._initialize()
 
     def connect(self):
-        connection = sqlite3.connect(self.path, timeout=30)
+        connection = sqlite3.connect(self.path, timeout=30, factory=_Connection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=30000")
@@ -337,14 +346,7 @@ class Storage:
                      audit["operator"], audit["reason"], timestamp),
                 )
             for task in tasks:
-                connection.execute(
-                    """INSERT OR IGNORE INTO tasks
-                       (kind,dedupe_key,payload,next_attempt_at,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?)""",
-                    (task["kind"], task["dedupe_key"],
-                     json.dumps(task["payload"], ensure_ascii=False),
-                     timestamp, timestamp, timestamp),
-                )
+                self._insert_task(connection, task, timestamp)
         return payload
 
     def patch_shipment(self, order, updates, append=None):
@@ -474,6 +476,27 @@ class Storage:
             )
         return status
 
+    def retry_message(self, channel_id, message_id, operator, reason):
+        timestamp = iso()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status FROM incoming_messages WHERE channel_id=? AND message_id=?",
+                (channel_id, message_id)).fetchone()
+            if not row:
+                return None
+            if row["status"] != "dead":
+                raise TaskConflict("only failed messages can be retried")
+            connection.execute(
+                """UPDATE incoming_messages SET status='pending',attempts=0,last_error=NULL,
+                   updated_at=? WHERE channel_id=? AND message_id=?""",
+                (timestamp, channel_id, message_id))
+            connection.execute(
+                """INSERT INTO audit_log(order_no,entity_type,entity_id,action,operator,reason,created_at)
+                   VALUES(NULL,'incoming_message',?,'retry',?,?,?)""",
+                (json.dumps([channel_id, message_id], ensure_ascii=False), operator, reason, timestamp))
+        return {"id": message_id, "channel_id": channel_id, "status": "pending", "action": "retry"}
+
     def enqueue_inbox(self, item_id, payload, now=None):
         timestamp = iso(now)
         with self.connect() as connection:
@@ -503,21 +526,24 @@ class Storage:
     def claim_inbox(self, worker, now=None, lease_seconds=300):
         return self._claim("inbox", worker, now, lease_seconds)
 
-    def complete_inbox(self, item_id):
+    def complete_inbox(self, item_id, *, claim=None):
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._check_claim(connection, "inbox", item_id, claim)
             connection.execute(
                 "UPDATE inbox SET status='succeeded',lease_owner=NULL,lease_until=NULL,updated_at=? WHERE id=?",
                 (iso(), item_id),
             )
 
-    def complete_inbox_with_task(self, item_id, kind, dedupe_key, payload, orders=None):
+    def complete_inbox_with_task(self, item_id, kind, dedupe_key, payload, orders=None, *, claim=None):
         return self.complete_inbox_with_tasks(
-            item_id, [(kind, dedupe_key, payload)], orders=orders)
+            item_id, [(kind, dedupe_key, payload)], orders=orders, claim=claim)
 
-    def complete_inbox_with_tasks(self, item_id, tasks, orders=None):
+    def complete_inbox_with_tasks(self, item_id, tasks, orders=None, *, claim=None):
         timestamp = iso()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._check_claim(connection, "inbox", item_id, claim)
             for kind, dedupe_key, payload in tasks:
                 connection.execute(
                     """INSERT OR IGNORE INTO tasks
@@ -539,23 +565,32 @@ class Storage:
                 (json.dumps(inbox_payload, ensure_ascii=False), timestamp, item_id),
             )
 
-    def fail_inbox(self, item_id, error, max_attempts=7, now=None):
-        return self._fail("inbox", item_id, error, max_attempts, now)
+    def fail_inbox(self, item_id, error, max_attempts=7, now=None, *, claim=None):
+        return self._fail("inbox", item_id, error, max_attempts, now, claim=claim)
 
-    def enqueue_task(self, kind, dedupe_key, payload, now=None):
+    def _insert_task(self, connection, task, timestamp):
+        legacy_key = task.get("legacy_dedupe_key")
+        if legacy_key:
+            legacy = connection.execute(
+                "SELECT id,payload FROM tasks WHERE dedupe_key=?", (legacy_key,)).fetchone()
+            if legacy and json.loads(legacy["payload"]).get("name") == task["payload"].get("name"):
+                return legacy["id"]
+        connection.execute(
+            """INSERT OR IGNORE INTO tasks
+               (kind,dedupe_key,payload,next_attempt_at,created_at,updated_at)
+               VALUES(?,?,?,?,?,?)""",
+            (task["kind"], task["dedupe_key"], json.dumps(task["payload"], ensure_ascii=False),
+             timestamp, timestamp, timestamp))
+        return connection.execute("SELECT id FROM tasks WHERE dedupe_key=?",
+                                  (task["dedupe_key"],)).fetchone()["id"]
+
+    def enqueue_task(self, kind, dedupe_key, payload, now=None, *, legacy_dedupe_key=None):
         timestamp = iso(now)
         with self.connect() as connection:
-            connection.execute(
-                """INSERT OR IGNORE INTO tasks
-                   (kind,dedupe_key,payload,next_attempt_at,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?)""",
-                (kind, dedupe_key, json.dumps(payload, ensure_ascii=False),
-                 timestamp, timestamp, timestamp),
-            )
-            row = connection.execute(
-                "SELECT id FROM tasks WHERE dedupe_key=?", (dedupe_key,)
-            ).fetchone()
-        return row["id"]
+            connection.execute("BEGIN IMMEDIATE")
+            return self._insert_task(connection, {
+                "kind": kind, "dedupe_key": dedupe_key, "payload": payload,
+                "legacy_dedupe_key": legacy_dedupe_key}, timestamp)
 
     def sync_operational_tasks(self, kind, order, desired, resolved_reason):
         """Keep one current task per operational condition and archive cleared keys."""
@@ -702,6 +737,9 @@ class Storage:
                 raise TaskConflict("task is being processed")
             payload = json.loads(row["payload"])
             if action == "retry":
+                if row["kind"] in ("notify_group", "notify_dm") and row["status"] in (
+                        "unknown", "succeeded"):
+                    raise TaskConflict("delivered or uncertain notifications cannot be retried")
                 connection.execute(
                     """UPDATE tasks SET status='pending',attempts=0,next_attempt_at=?,
                        lease_owner=NULL,lease_until=NULL,last_error=NULL,updated_at=? WHERE id=?""",
@@ -731,7 +769,7 @@ class Storage:
                         if row["kind"] == "notify_group":
                             shipment.update({"needs_notify": False,
                                              "notified_status": payload.get("status")})
-                        else:
+                        elif payload.get("name") == shipment.get("salesperson"):
                             shipment.update({"dm_notified_status": payload.get("status"),
                                              "dm_notified_event": payload.get("event_key")})
                         connection.execute(
@@ -925,12 +963,13 @@ class Storage:
     def issues_page(self, *, kind="", status="", order="", limit=25, offset=0):
         """Filter and paginate the three issue sources before decoding payloads."""
         sources = """SELECT 'task' AS source, CAST(id AS TEXT) AS source_id,
-                       id, kind, status, attempts, last_error, updated_at, payload FROM tasks
+                       id, kind, status, attempts, last_error, updated_at, payload,
+                       NULL AS channel_id FROM tasks
                      UNION ALL SELECT 'inbox', id, id, 'ocr', status, attempts,
-                       last_error, updated_at, payload FROM inbox
+                       last_error, updated_at, payload, NULL FROM inbox
                      UNION ALL SELECT 'incoming_message', channel_id || ':' || message_id,
                        message_id, 'incoming_message', status, attempts, last_error,
-                       updated_at, payload FROM incoming_messages"""
+                       updated_at, payload, channel_id FROM incoming_messages"""
         clauses, params = ["status IN ('pending','retry','dead','unknown')"], []
         if kind:
             clauses.append("kind=?"); params.append(kind)
@@ -955,17 +994,22 @@ class Storage:
             items.append(item)
         return items, total
 
-    def complete_task(self, task_id):
+    def complete_task(self, task_id, *, claim=None):
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._check_claim(connection, "tasks", task_id, claim)
             connection.execute(
                 "UPDATE tasks SET status='succeeded',lease_owner=NULL,lease_until=NULL,updated_at=? WHERE id=?",
                 (iso(), task_id),
             )
 
-    def complete_notification(self, task_id, order, event_key, updates, receipt=""):
+    def complete_notification(self, task_id, order, event_key, updates, receipt="", *, claim=None):
         """Commit a delivery receipt without acknowledging a newer shipment event."""
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._check_claim(connection, "tasks", task_id, claim)
+            task = connection.execute("SELECT payload FROM tasks WHERE id=?", (task_id,)).fetchone()
+            task_payload = json.loads(task["payload"]) if task else {}
             row = connection.execute(
                 "SELECT payload FROM shipments WHERE order_no=?", (order,)
             ).fetchone()
@@ -975,13 +1019,15 @@ class Storage:
                 current_key = (history[-1].get("at") or history[-1].get("observed_at") or
                                f"legacy:{payload.get('status', '-')}:{int(payload.get('binding_version') or 0)}")
                 if current_key == event_key:
-                    payload.update(updates)
+                    applicable = dict(updates)
+                    if task_payload.get("name") != payload.get("salesperson"):
+                        applicable.pop("dm_notified_status", None)
+                        applicable.pop("dm_notified_event", None)
+                    payload.update(applicable)
                 connection.execute(
                     "UPDATE shipments SET payload=?,updated_at=? WHERE order_no=?",
                     (json.dumps(payload, ensure_ascii=False), iso(), order),
                 )
-            task = connection.execute("SELECT payload FROM tasks WHERE id=?", (task_id,)).fetchone()
-            task_payload = json.loads(task["payload"]) if task else {}
             task_payload["receipt"] = str(receipt or "")[:500]
             task_payload["completed_at"] = iso()
             connection.execute(
@@ -990,24 +1036,44 @@ class Storage:
                 (json.dumps(task_payload, ensure_ascii=False), iso(), task_id),
             )
 
-    def fail_task(self, task_id, error, max_attempts=5, now=None):
-        return self._fail("tasks", task_id, error, max_attempts, now)
+    def fail_task(self, task_id, error, max_attempts=5, now=None, *, claim=None):
+        return self._fail("tasks", task_id, error, max_attempts, now, claim=claim)
 
-    def mark_task_unknown(self, task_id, error):
+    def mark_task_unknown(self, task_id, error, *, claim=None):
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._check_claim(connection, "tasks", task_id, claim)
             connection.execute(
                 """UPDATE tasks SET status='unknown',lease_owner=NULL,lease_until=NULL,
                    last_error=?,updated_at=? WHERE id=?""",
                 (error[:500], iso(), task_id),
             )
 
-    def mark_delivery_inflight(self, task_id):
+    def mark_delivery_inflight(self, task_id, *, claim=None):
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._check_claim(connection, "tasks", task_id, claim, before_delivery=True)
             connection.execute(
                 """UPDATE tasks SET status='unknown',
                    last_error='delivery started; receipt pending',updated_at=? WHERE id=?""",
                 (iso(), task_id),
             )
+
+    def _check_claim(self, connection, table, item_id, claim, before_delivery=False):
+        # Legacy maintenance calls omit claim; every worker supplies the exact lease
+        # it received. Attempts fence an older worker even when owner names repeat.
+        if claim is None:
+            return
+        row = connection.execute(
+            f"SELECT status,lease_owner,lease_until,attempts FROM {table} WHERE id=?",
+            (item_id,)).fetchone()
+        if (not row or row["status"] not in ("running", "unknown") or
+                row["lease_owner"] != claim.get("lease_owner") or
+                row["attempts"] != claim.get("attempts") or
+                row["lease_until"] != claim.get("lease_until") or
+                (before_delivery and (row["status"] != "running" or
+                                      not row["lease_until"] or row["lease_until"] <= iso()))):
+            raise TaskConflict("task lease changed or expired")
 
     def _claim(self, table, worker, now, lease_seconds, kind=None):
         timestamp = iso(now)
@@ -1034,11 +1100,12 @@ class Storage:
         result["payload"] = json.loads(result["payload"])
         return result
 
-    def _fail(self, table, item_id, error, max_attempts, now):
+    def _fail(self, table, item_id, error, max_attempts, now, *, claim=None):
         value = now or utcnow()
         timestamp = iso(value)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            self._check_claim(connection, table, item_id, claim)
             row = connection.execute(
                 f"SELECT attempts FROM {table} WHERE id=?", (item_id,)
             ).fetchone()

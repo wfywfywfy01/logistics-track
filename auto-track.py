@@ -7,21 +7,25 @@
 """
 import argparse, json, os, subprocess, sys, time
 from pathlib import Path
-from storage import Storage
+from storage import Storage, TaskConflict
 import robust
 
-DATA = Path("data")
+DATA = Path(os.environ.get("LOGIBOT_DATA_DIR") or "data")
 STORE = Storage(DATA)
 STORE.migrate_legacy_json()
 
-def run(args, desc):
-    t0 = time.time()
-    timeout_name = "TRACK_STEP_TIMEOUT_SECONDS" if args[0] == "track_all_ups.py" else \
+def step_timeout(script):
+    timeout_name = "TRACK_STEP_TIMEOUT_SECONDS" if script == "track_all_ups.py" else \
         "STEP_TIMEOUT_SECONDS"
     default_timeout = 7200 if timeout_name == "TRACK_STEP_TIMEOUT_SECONDS" else 900
+    return max(1, int(os.environ.get(timeout_name) or default_timeout))
+
+
+def run(args, desc):
+    t0 = time.time()
     try:
         r = subprocess.run([sys.executable] + args, capture_output=True,
-                           timeout=int(os.environ.get(timeout_name) or default_timeout))
+                           timeout=step_timeout(args[0]))
     except subprocess.TimeoutExpired:
         print(f"[{desc}] timed out", flush=True)
         return False
@@ -73,22 +77,27 @@ def execute(a):
                         "reason": parsed.get("error") or "OCR produced no fully ingested pair",
                     }))
                 STORE.complete_inbox_with_tasks(
-                    item["id"], followups, orders=[row.get("order") for row in ingested])
+                    item["id"], followups, orders=[row.get("order") for row in ingested], claim=item)
                 print("inbox OCR needs review:", payload.get("name"), flush=True)
                 continue
             STORE.complete_inbox_with_task(
                 item["id"], "pipeline", f"ocr:{item['id']}",
                 {"channel_id": a.channel_id, "bot_app_id": a.bot_app_id},
-                orders=[row.get("order") for row in ingested])
+                orders=[row.get("order") for row in ingested], claim=item)
             print("inbox OCR ok:", payload.get("name"), parsed.get("pairs"), flush=True)
+        except TaskConflict:
+            print("inbox lease changed:", item["id"], flush=True)
         except Exception as error:
             max_attempts = max(1, int(os.environ.get("OCR_MAX_ATTEMPTS") or 3))
-            state = STORE.fail_inbox(item["id"], str(error), max_attempts=max_attempts)
+            state = STORE.fail_inbox(item["id"], str(error), max_attempts=max_attempts, claim=item)
             print("inbox OCR failed:", payload.get("name"), state, str(error)[:120], flush=True)
 
     tasks = []
+    lease_seconds = 60 + 5 * step_timeout("tracking-pipeline.py")
+    if not a.skip_track:
+        lease_seconds += step_timeout("track_all_ups.py")
     while True:
-        task = STORE.claim_task(worker, lease_seconds=1800, kind="pipeline")
+        task = STORE.claim_task(worker, lease_seconds=lease_seconds, kind="pipeline")
         if not task:
             break
         tasks.append(task)
@@ -119,9 +128,9 @@ def execute(a):
         ok = (step_ok or not required) and ok
     for task in tasks:
         if ok:
-            STORE.complete_task(task["id"])
+            STORE.complete_task(task["id"], claim=task)
         else:
-            STORE.fail_task(task["id"], "pipeline stage failed")
+            STORE.fail_task(task["id"], "pipeline stage failed", claim=task)
     if not ok:
         print("AUTO-TRACK FAILED", flush=True)
         return 1
