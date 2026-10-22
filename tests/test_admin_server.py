@@ -252,7 +252,8 @@ def test_browser_action_forms_use_form_action_and_explicit_button_override(tmp_p
             form.locator("[name=salesperson]").fill("Test User")
             form.locator("[name=user_id]").fill("user-123")
             form.locator("[name=reason]").fill("Verified user identity")
-            with page.expect_response(lambda response: response.request.method == "POST") as response:
+            with page.expect_navigation(wait_until="load"), page.expect_response(
+                    lambda response: response.request.method == "POST") as response:
                 form.locator("button").click()
             assert response.value.url == base + "/api/orders/XSD1/salesperson"
             assert response.value.status == 200
@@ -263,7 +264,8 @@ def test_browser_action_forms_use_form_action_and_explicit_button_override(tmp_p
             form.locator("[name=username]").fill("new-viewer")
             form.locator("[name=password]").fill("test-password-123")
             form.locator("[name=reason]").fill("Read only access")
-            with page.expect_response(lambda response: response.request.method == "POST") as response:
+            with page.expect_navigation(wait_until="load"), page.expect_response(
+                    lambda response: response.request.method == "POST") as response:
                 form.locator("button").click()
             assert response.value.url == base + "/api/users"
             assert response.value.status == 200
@@ -272,7 +274,8 @@ def test_browser_action_forms_use_form_action_and_explicit_button_override(tmp_p
             page.goto(base + "/tasks")
             form = page.locator(f"form[action='/api/tasks/{task_id}']")
             form.locator("[name=reason]").fill("Investigating this order")
-            with page.expect_response(lambda response: response.request.method == "POST") as response:
+            with page.expect_navigation(wait_until="load"), page.expect_response(
+                    lambda response: response.request.method == "POST") as response:
                 form.locator(f"button[formaction='/api/tasks/{task_id}/claim']").click()
             assert response.value.url == base + f"/api/tasks/{task_id}/claim"
             assert response.value.status == 200

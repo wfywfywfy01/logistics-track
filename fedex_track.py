@@ -7,7 +7,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit
-from official_tracking import delivery_confirmed
+from official_tracking import delivery_confirmed, latest_event as select_latest_event
 
 
 def classify_status(code, description):
@@ -100,18 +100,16 @@ def parse_tracking_response(tracking, payload):
         return {"tracking": tracking, "ok": False, "error": "unknown FedEx status",
                 "status_en": description}
     scans = match.get("scanEvents") or []
-    scan = scans[0] if scans else {}
-    detail = " ".join(x for x in (
-        scan.get("date") or scan.get("dateAndTime") or "",
-        _location(scan.get("scanLocation") or latest.get("scanLocation")),
-        scan.get("eventDescription") or description,
-    ) if x).strip()
     events = [_event(item, latest.get("scanLocation")) for item in scans]
-    latest_event = events[0] if events else {
+    latest_event = select_latest_event(events, {
         "source_time_text": "", "occurred_at_utc": "N/A",
         "location": _location(latest.get("scanLocation")),
         "status": description, "description": "", "code": latest.get("code") or "",
-        "exception_code": ""}
+        "exception_code": ""})
+    detail = " ".join(x for x in (
+        latest_event.get("source_time_text"), latest_event.get("location"),
+        latest_event.get("status") or description,
+    ) if x).strip()
     return {"tracking": tracking, "ok": True, "stage": stage,
             "status_en": description, "detail": detail, "source": "fedex.com",
             "estimated_delivery": _estimated_delivery(match),
@@ -238,7 +236,9 @@ def _track_once(tracking, timeout_nav, wait_ms, proxy):
                 except Exception:
                     body = ""
                 lower = body.lower()
-                if parse_dom_status(tracking, body) or "can't find that tracking number" in lower or \
+                # A rendered status can precede a contradictory official response.
+                # Use DOM fallback only after the API response window has elapsed.
+                if "can't find that tracking number" in lower or \
                         "tracking number cannot be found" in lower:
                     break
             drain_responses()

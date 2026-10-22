@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 from carriers import detect_carrier
 from storage import Storage, TaskConflict
 from operations import build_daily_report
+from official_tracking import result_matches_package
 import admin_ui
 
 
@@ -99,6 +100,11 @@ document.getElementById('nav-toggle')?.addEventListener('click', event => {
 
 def csrf_token(secret):
     return hmac.new(secret.encode(), b"logistics-admin-csrf", hashlib.sha256).hexdigest()
+
+
+def csrf_matches(value, expected):
+    return bool(value and expected and value.isascii() and expected.isascii() and
+                hmac.compare_digest(value, expected))
 
 
 def _orders(store, query="", status=""):
@@ -180,11 +186,10 @@ def event_text(event):
     return " ".join(ordered)[:200]
 
 
-def _tracking_attempt(result, tracking):
+def _tracking_attempt(result, package):
     result = result or {}
-    current = (result.get("package_results") or {}).get(tracking)
-    if current is None and result.get("tracking") == tracking:
-        current = result
+    candidates = list((result.get("package_results") or {}).values()) + [result]
+    current = next((item for item in candidates if result_matches_package(item, package)), None)
     if not current:
         return None
     return {"observed_at": current.get("observed_at") or "N/A",
@@ -194,7 +199,7 @@ def _tracking_attempt(result, tracking):
 def _timestamp(value):
     try:
         parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
-        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+        return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
     except (TypeError, ValueError):
         return None
 
@@ -210,6 +215,8 @@ def package_views(shipment, tracking_result=None, max_age_hours=None, now=None):
                 continue
             packages.append({"tracking": tracking, "role": role,
                              "carrier": detect_carrier(tracking, shipment.get("carrier")) or "N/A",
+                             "binding_version": shipment.get("binding_version"),
+                             "binding_history": shipment.get("binding_history") or [],
                              "status": shipment.get("status", "已预报")})
     views = []
     for package in packages:
@@ -218,7 +225,7 @@ def package_views(shipment, tracking_result=None, max_age_hours=None, now=None):
             "status_observed_at", "last_observation")}
         view["official"] = official_view(package)
         view["last_tracking_attempt"] = _tracking_attempt(
-            tracking_result, package.get("tracking"))
+            tracking_result, package)
         observed = _timestamp(view["official"].get("observed_at"))
         if max_age_hours is None or observed is None:
             view["tracking_data_stale"] = "N/A"
@@ -248,8 +255,9 @@ def track_view(shipment, tracking_result=None, max_age_hours=None, now=None):
                 if item["last_tracking_attempt"]]
     latest_attempt = max(attempts, key=lambda item: (
         _timestamp(item["observed_at"]) or datetime.min.replace(tzinfo=UTC))) if attempts else None
-    stale_values = [item["tracking_data_stale"] for item in packages
-                    if item["tracking_data_stale"] != "N/A"]
+    stale_values = [item["tracking_data_stale"] for item in packages]
+    stale = (True if any(value is True for value in stale_values) else
+             False if stale_values and all(value is False for value in stale_values) else "N/A")
     return {
         "order": shipment.get("orderNo"),
         "status": shipment.get("status", "已预报"),
@@ -266,7 +274,7 @@ def track_view(shipment, tracking_result=None, max_age_hours=None, now=None):
         "latest_event_text": event_text(latest),
         "last_tracking_attempt": latest_attempt,
         "tracking_data_max_age_hours": max_age_hours if max_age_hours is not None else "N/A",
-        "tracking_data_stale": any(stale_values) if stale_values else "N/A",
+        "tracking_data_stale": stale,
         "packages": packages,
         "history": shipment.get("history") or [],
     }
@@ -444,7 +452,7 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             except CookieError:
                 cookie.clear()
             csrf_cookie = cookie.get("logistics_login_csrf")
-            if not csrf_cookie or not hmac.compare_digest(
+            if not csrf_cookie or not csrf_matches(
                     str(form.get("csrf") or ""), csrf_cookie.value):
                 return False
             if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
@@ -571,7 +579,7 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                 content = path.read_bytes()
                 self._headers(200, mimetypes.guess_type(path.name)[0] or "application/octet-stream",
                               {"Content-Length": str(len(content)),
-                               "Content-Disposition": 'inline; filename="%s"' % path.name.replace('"', '')})
+                               "Content-Disposition": "inline; filename=evidence; filename*=UTF-8''" + quote(path.name, safe="")})
                 return self.wfile.write(content)
             tracking_results = store.get_document("ups_results", {}) if (
                 parsed.path == "/api/track" or parsed.path.startswith("/api/track/") or
@@ -761,7 +769,7 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                         form = self._read_form()
                     except (UnicodeDecodeError, ValueError) as error:
                         return self._json(400, {"error": str(error)})
-                    if not hmac.compare_digest(str(form.get("csrf") or ""), self._csrf()):
+                    if not csrf_matches(str(form.get("csrf") or ""), self._csrf()):
                         return self._json(403, {"error": "csrf check failed"})
                     with sessions_lock:
                         sessions.pop(principal.get("_session"), None)
@@ -770,7 +778,7 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             principal = self._principal()
             if not principal:
                 return self._json(401, {"error": "authentication required"})
-            if not hmac.compare_digest(self.headers.get("X-CSRF-Token", ""), self._csrf()):
+            if not csrf_matches(self.headers.get("X-CSRF-Token", ""), self._csrf()):
                 return self._json(403, {"error": "csrf check failed"})
             parts = parsed_path.strip("/").split("/")
             try:

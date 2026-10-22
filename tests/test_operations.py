@@ -429,3 +429,83 @@ def test_daily_report_separates_status_history_and_eta_coverage(tmp_path):
                                 freshness_hours=24)
     assert report["carrier_freshness"]["UPS"]["stale"] == 2
     assert report["carrier_freshness"]["UPS"]["missing_observed_at"] == 1
+
+
+def test_newer_dhl_current_status_prevents_false_stall_from_old_scan_list(tmp_path):
+    from dhl_track import parse_tracking_response
+
+    store = Storage(tmp_path)
+    store.upsert_shipment("XSD1", {**shipment(), "intl": "1234567890", "carrier": "DHL"})
+    result = parse_tracking_response("1234567890", {
+        "id": "1234567890",
+        "status": {"timestamp": "2026-09-10T11:00:00Z", "statusCode": "transit",
+                   "description": "Arrived at delivery facility"},
+        "events": [{"timestamp": "2026-09-07T00:00:00Z", "description": "Departed facility"}],
+    })
+    result.update(carrier="DHL", observed_at="2026-09-10T11:30:00Z")
+    store.put_document("ups_results", {"XSD1": result})
+
+    refresh_operational_tasks(store, datetime(2026, 9, 10, 12, tzinfo=UTC), {"DHL": 48})
+
+    assert store.list_tasks(("pending",), kinds=("stalled",)) == []
+    assert result["latest_event"]["occurred_at_utc"] == "2026-09-10T11:00:00Z"
+    assert len(result["events"]) == 1
+
+
+@pytest.mark.parametrize("old_version", [1, 0, None])
+def test_old_binding_result_cannot_resolve_new_binding_failure_or_count_as_fresh(tmp_path, old_version):
+    store = Storage(tmp_path)
+    item = shipment()
+    item["packages"] = [{"tracking": "1Z1", "carrier": "UPS", "binding_version": 3,
+                         "binding_history": [{"from": "1Z2", "to": "1Z1"}]}]
+    store.upsert_shipment("XSD1", item)
+    result = {"tracking": "1Z1", "carrier": "UPS", "binding_version": old_version,
+              "ok": True, "stage": "签收", "observed_at": "2026-09-10T11:30:00Z"}
+    store.put_document("ups_results", {"XSD1": {"package_results": {"1Z1": result}}})
+    task_id = store.enqueue_task("tracking_failure", "tracking-failure:XSD1:1Z1", {
+        "order": "XSD1", "tracking": "1Z1", "reason": "new binding has no result"})
+    now = datetime(2026, 9, 10, 12, tzinfo=UTC)
+
+    refresh_operational_tasks(store, now, {"UPS": 48}, freshness_hours=24)
+
+    active = store.list_tasks(("pending",), kinds=("tracking_failure",))
+    assert [row["id"] for row in active] == [task_id]
+    freshness = build_daily_report(store, now, freshness_hours=24)["carrier_freshness"]["UPS"]
+    assert freshness["ok"] == 0
+    assert freshness["missing_result"] == 1
+    assert freshness["latest_observed_at"] == "N/A"
+
+    result["binding_version"] = 3
+    store.put_document("ups_results", {"XSD1": {"package_results": {"1Z1": result}}})
+    refresh_operational_tasks(store, now, {"UPS": 48}, freshness_hours=24)
+    assert store.list_tasks(("pending",), kinds=("tracking_failure",)) == []
+
+
+@pytest.mark.parametrize("timestamp", [None, "2026-09-10T11:00:00"])
+def test_unknown_current_scan_time_cannot_be_replaced_with_old_history_for_stall(tmp_path, timestamp):
+    from dhl_track import parse_tracking_response
+
+    store = Storage(tmp_path)
+    store.upsert_shipment("XSD1", {**shipment(), "intl": "1234567890", "carrier": "DHL"})
+    result = parse_tracking_response("1234567890", {
+        "status": {"timestamp": timestamp, "statusCode": "transit", "description": "Arrived recently"},
+        "events": [{"timestamp": "2026-09-07T00:00:00Z", "description": "Old departure"}],
+    })
+    result.update(carrier="DHL", observed_at="2026-09-10T11:30:00Z")
+    store.put_document("ups_results", {"XSD1": result})
+
+    refresh_operational_tasks(store, datetime(2026, 9, 10, 12, tzinfo=UTC), {"DHL": 48})
+
+    assert result["latest_event"]["status"] == "Arrived recently"
+    assert result["latest_event"]["occurred_at_utc"] == "N/A"
+    assert store.list_tasks(("pending",), kinds=("stalled",)) == []
+
+
+def test_binding_matcher_rejects_unversioned_later_generation_without_history():
+    from official_tracking import result_matches_package
+
+    for version in (None, 0):
+        assert not result_matches_package({"tracking": "1Z1", "binding_version": version},
+                                          {"tracking": "1Z1", "binding_version": 2})
+    assert result_matches_package({"tracking": "1Z1", "binding_version": 0},
+                                  {"tracking": "1Z1", "binding_version": 1})

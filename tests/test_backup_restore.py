@@ -226,3 +226,62 @@ def test_invalid_retention_does_not_create_backup(monkeypatch, tmp_path):
         create_backup(output, tmp_path / "data")
 
     assert not output.exists()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_failed_backup_never_publishes_partial_archive(monkeypatch, tmp_path, existing):
+    output = tmp_path / "backup.zip"
+    source = tmp_path / "source"
+    if existing:
+        create_backup(output, source)
+        previous = output.read_bytes()
+
+    def fail_write(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(zipfile.ZipFile, "write", fail_write)
+    with pytest.raises(OSError, match="disk full"):
+        create_backup(output, source)
+
+    if existing:
+        assert output.read_bytes() == previous
+    else:
+        assert not output.exists()
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("destination", ["outside", "database"])
+def test_restore_rejects_evidence_target_escape_or_database(tmp_path, destination):
+    source = tmp_path / "source"
+    source_tmp = tmp_path / "source-tmp"
+    source_tmp.mkdir()
+    label = source_tmp / "label.png"
+    label.write_bytes(b"label")
+    Storage(source).enqueue_inbox("label-1", {"path": str(label)})
+    archive_path = create_backup(tmp_path / "backup.zip", source, source_tmp)
+    with zipfile.ZipFile(archive_path) as archive:
+        files = {name: archive.read(name) for name in archive.namelist()}
+    manifest = json.loads(files["manifest.json"])
+    target, target_tmp = tmp_path / "target", tmp_path / "target-tmp"
+    if destination == "outside":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        target_tmp.mkdir()
+        try:
+            (target_tmp / "escape").symlink_to(outside, target_is_directory=True)
+        except OSError:
+            pytest.skip("directory symlinks unavailable")
+        manifest["evidence"][0]["path"] = "escape/label.png"
+    else:
+        manifest["evidence"][0].update(root="data", path="shipments.db")
+    files["manifest.json"] = json.dumps(manifest).encode()
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        for name, content in files.items():
+            archive.writestr(name, content)
+
+    with pytest.raises(ValueError, match="evidence.*path"):
+        restore(archive_path, target, tmp_dir=target_tmp)
+
+    assert not (target / "shipments.db").exists()
+    if destination == "outside":
+        assert not (outside / "label.png").exists()

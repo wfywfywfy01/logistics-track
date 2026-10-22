@@ -435,3 +435,86 @@ def test_fedex_dom_success_wins_over_late_api_parse_error(monkeypatch):
     assert result["ok"] is True
     assert result["stage"] == "签收"
     assert result["source"] == "dom"
+
+
+def test_fedex_waits_for_authoritative_response_despite_early_page_status(monkeypatch):
+    import fedex_track
+
+    response = _LateResponse("https://api.fedex.com/track/v2/shipments", {
+        "output": {"completeTrackResults": [{"trackResults": [{
+            "trackingNumberInfo": {"trackingNumber": "876543210123"},
+            "latestStatusDetail": {"code": "IT", "statusByLocale": "On the way"},
+        }]}]}})
+
+    class DelayedPage(_LateResponsePage):
+        waits = 0
+
+        def wait_for_timeout(self, _milliseconds):
+            self.waits += 1
+            if self.waits == 2:
+                self.sent = True
+                self.handler(self.response)
+
+    page = DelayedPage(response, "876543210123\nDELIVERED\nMEMPHIS, TN US")
+    _install_fake_browser(monkeypatch, page)
+    clock = iter((0, 0, 0.5, 1, 2))
+    monkeypatch.setattr(fedex_track.time, "time", lambda: next(clock))
+
+    result = fedex_track._track_once("876543210123", 1, 2000, None)
+
+    assert result["stage"] == "运输中"
+    assert result["source"] == "fedex.com"
+    assert "events" in result
+
+
+def test_latest_official_scan_uses_instant_not_array_order_or_local_clock():
+    result = parse_tracking_response("876543210123", {"completeTrackResults": [{"trackResults": [{
+        "trackingNumber": "876543210123", "latestStatusDetail": {"code": "IT"},
+        "scanEvents": [
+            {"date": "2026-09-10T12:00:00+03:00", "eventDescription": "Arrived at facility"},
+            {"date": "2026-09-10T08:00:00-05:00", "eventDescription": "Departed facility"},
+        ],
+    }]}]})
+    assert result["latest_event"]["occurred_at_utc"] == "2026-09-10T13:00:00Z"
+    assert "Departed facility" in result["detail"]
+    assert len(result["events"]) == 2
+
+
+    result = ups_track.parse_tracking_response("1Z999AA10123456784", {"trackDetails": [{
+        "trackingNumber": "1Z999AA10123456784", "packageStatusType": "I",
+        "shipmentProgressActivities": [
+            {"gmtDate": "20260910", "gmtTime": "090000", "activityScan": "Arrived at facility"},
+            {"gmtDate": "20260910", "gmtTime": "130000", "activityScan": "Departed facility"},
+        ],
+    }]})
+    assert result["latest_event"]["occurred_at_utc"] == "2026-09-10T13:00:00Z"
+    assert len(result["events"]) == 2
+
+
+def test_unknown_time_on_leading_scan_is_not_replaced_with_older_dated_scan():
+    result = parse_tracking_response("876543210123", {"completeTrackResults": [{"trackResults": [{
+        "trackingNumber": "876543210123", "latestStatusDetail": {"code": "IT"},
+        "scanEvents": [
+            {"date": "2026-09-10T12:00:00", "eventDescription": "Arrived recently"},
+            {"date": "2026-09-07T08:00:00-05:00", "eventDescription": "Old departure"},
+        ],
+    }]}]})
+    assert result["latest_event"]["status"] == "Arrived recently"
+    assert result["latest_event"]["occurred_at_utc"] == "N/A"
+
+
+@pytest.mark.parametrize("later_scan", [False, True])
+def test_dhl_known_current_time_precedes_undated_history(later_scan):
+    events = [{"description": "Old departure"}]
+    if later_scan:
+        events.append({"timestamp": "2026-10-23T02:00:00Z", "description": "Processed later"})
+    result = parse_dhl_response("1234567890", {
+        "status": {"timestamp": "2026-10-23T01:00:00Z", "statusCode": "transit",
+                   "description": "Arrived at facility"},
+        "events": events,
+    })
+
+    assert result["latest_event"]["status"] == (
+        "Processed later" if later_scan else "Arrived at facility")
+    assert result["latest_event"]["occurred_at_utc"] == (
+        "2026-10-23T02:00:00Z" if later_scan else "2026-10-23T01:00:00Z")
