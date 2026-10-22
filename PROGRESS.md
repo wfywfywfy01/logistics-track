@@ -12,6 +12,8 @@
 - 服务器只读实票：UPS 官网成功、6条轨迹；DHL 官网成功、14条轨迹。生产现存142条官网失败中108条为早前连接重置，目前代理及两家实票可达；失败待办保留待正常采集更新。12条 FedEx 候选号为 not_found，不算有效实票。
 - 最终本地完整回归（含真实 Chromium 表单操作）：255 passed / 2 skipped；跳过项为 Linux SIGALRM 与 /proc 子孙进程测试，交由 Linux CI 执行。备份篡改测试的重复 ZIP 成员 warning 为预期。Python 编译、两个 Bash 语法检查与 git diff --check 通过。
 - 本轮验收标准及外部边界见 `ACCEPTANCE-20261022.md`。发布版本及 Linux CI 证据待发布后补记；FedEx 有效实票、异地容灾和 72 小时观察仍不记作通过。
+- PR #22 已合并为 `3250ead`，分支、PR、合并提交的 Linux CI 均通过，合并提交为 256 passed / 1 skipped（本机已执行的浏览器可选测试）。生产备份 `/app/backups/acceptance-20261022.zip` 导出后在空目录恢复，256 单、完整性 ok；这是单次恢复演练，不代替持续异地备份策略。
+- 首次发布在服务器拉取 GitHub 构建上下文时遇到 TLS 中断，尚未切换容器，原服务保持 healthy。构建调整为本机 `git archive` 导出精确提交后上传 Docker，保持 CI/版本校验，排除工作区未提交文件。
 
 ## 2026-09-22：查询兼容、采集闭环与 PDCA 私网修复
 
