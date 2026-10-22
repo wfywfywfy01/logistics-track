@@ -61,9 +61,9 @@ python fedex_track.py 876543210123
 
 现有生产服务升级先 `git fetch origin master`，再使用 `python deploy/release.py <完整 master SHA> --docker-host <可信管理面地址> --expected-image <当前镜像 ID>` 预检；加 `--execute` 才发布。脚本验证该提交的 CI，通过 `git archive` 导出固定提交（不包含工作区未提交文件）上传构建，保存备份，复用当前配置，保留旧容器，健康失败自动回滚。镜像 OCI revision 与 `/healthz.release` 均可核对实际代码版本。Docker 管理面仅在受信任网络使用，勿公开暴露。
 
-本轮回归与线上验收流程见 [ACCEPTANCE-20261022.md](ACCEPTANCE-20261022.md)。以下命令用于首次创建服务。
+本轮回归与线上验收流程见 [ACCEPTANCE-20261023.md](ACCEPTANCE-20261023.md)。以下命令用于首次创建服务。
 
-发布脚本还在本机下载固定版本的官方 Xray 包，验证仓库内固定 SHA-256 后加入临时构建上下文，避免依赖第三方 GitHub 下载镜像；Docker 构建中再次验证同一摘要。临时文件在构建结束后清理。
+发布脚本还在本机下载固定版本的官方 Xray 包，验证仓库内固定 SHA-256 后加入临时构建上下文，避免依赖第三方 GitHub 下载镜像；Docker 构建中再次验证同一摘要。临时文件在构建结束后清理。已有官方 ZIP 时可加 `--xray-bundle <本地文件>` 复用；仍按待发布提交中的固定摘要和大小上限校验，截断或被修改的包会在切换服务前被拒绝。
 
 ```bash
 cp deploy/.env.example deploy/.env   # 填 Vertu 认证 / XRAY_* 出口节点 / OCR_* 等
@@ -81,6 +81,8 @@ docker run -d --name logistics-track --restart unless-stopped \
 恢复演练必须先停止服务，再运行 `python restore_backup.py <backup.zip> --data-dir data --force`，随后执行 SQLite `PRAGMA integrity_check` 并核对订单计数。
 
 默认备份写入持久卷 `/app/backups`，并按 `BACKUP_RETENTION_DAYS`（默认 30 天）清理过期的 `logistics-backup-*.zip`。配置 `BACKUP_UPLOAD=1` 才额外上传 V 盘；远端身份不可用时本地备份仍会保留，任务返回失败并重试。
+
+备份压缩包完整写入并同步到磁盘后才原子替换目标文件，写入失败不会破坏已有备份。恢复前校验附件路径，拒绝通过符号链接越出指定目录，或把附件写到数据库及其 WAL/SHM/恢复备份路径。
 
 ## 运营工作台
 

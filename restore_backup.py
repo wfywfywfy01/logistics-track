@@ -4,9 +4,11 @@ import argparse, hashlib, json, os, sqlite3, tempfile, zipfile
 from pathlib import Path
 
 def restore(archive_path, data_dir="data", force=False, tmp_dir=None):
-    target = Path(data_dir) / "shipments.db"
     roots = {"data": Path(data_dir).resolve(),
              "tmp": Path(tmp_dir or os.environ.get("LOGIBOT_TMP_DIR") or "tmp").resolve()}
+    target = roots["data"] / "shipments.db"
+    reserved = {Path(str(target) + suffix).resolve()
+                for suffix in ("", "-wal", "-shm", ".pre-restore")}
     if target.exists() and not force:
         raise FileExistsError("target exists; stop the service and pass --force")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -20,12 +22,15 @@ def restore(archive_path, data_dir="data", force=False, tmp_dir=None):
             for item in manifest.get("evidence") or []:
                 root = item.get("root")
                 relative = Path(str(item.get("path") or ""))
-                if root not in roots or relative.is_absolute() or ".." in relative.parts:
+                if root not in roots or not relative.parts or relative.is_absolute() or ".." in relative.parts:
                     raise ValueError("invalid evidence path")
+                evidence_target = (roots[root] / relative).resolve()
+                if not evidence_target.is_relative_to(roots[root]) or evidence_target in reserved:
+                    raise ValueError("invalid evidence target path")
                 evidence_content = archive.read(item["archive"])
                 if hashlib.sha256(evidence_content).hexdigest() != item["sha256"]:
                     raise ValueError("evidence checksum mismatch")
-                evidence.append((item, evidence_content))
+                evidence.append((item, evidence_target, evidence_content))
         if hashlib.sha256(content).hexdigest() != manifest["sha256"]:
             raise ValueError("backup checksum mismatch")
         restored = Path(temp_dir) / "shipments.db"
@@ -34,8 +39,7 @@ def restore(archive_path, data_dir="data", force=False, tmp_dir=None):
         try:
             if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise ValueError("restored database integrity check failed")
-            for item, _ in evidence:
-                evidence_target = roots[item["root"]] / item["path"]
+            for item, evidence_target, _ in evidence:
                 row = connection.execute(
                     "SELECT payload FROM inbox WHERE id=?", (item["inbox_id"],)).fetchone()
                 if row:
@@ -48,8 +52,7 @@ def restore(archive_path, data_dir="data", force=False, tmp_dir=None):
         finally:
             connection.close()
 
-        for item, evidence_content in evidence:
-            evidence_target = roots[item["root"]] / item["path"]
+        for item, evidence_target, evidence_content in evidence:
             evidence_target.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(dir=evidence_target.parent, delete=False) as handle:
                 handle.write(evidence_content)

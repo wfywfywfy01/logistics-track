@@ -94,11 +94,19 @@ def create_backup(output=None, data_dir=None, tmp_dir=None):
         manifest = {"created_at": iso(), "database": "shipments.db",
                     "sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
                     "evidence": evidence}
-        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.write(snapshot, "shipments.db")
-            for item in evidence:
-                archive.write(staged_evidence[item["archive"]], item["archive"])
-            archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        fd, pending = tempfile.mkstemp(dir=output.parent, prefix="." + output.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w+b") as handle:
+                with zipfile.ZipFile(handle, "w", zipfile.ZIP_DEFLATED) as archive:
+                    archive.write(snapshot, "shipments.db")
+                    for item in evidence:
+                        archive.write(staged_evidence[item["archive"]], item["archive"])
+                    archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(pending, output)
+        finally:
+            Path(pending).unlink(missing_ok=True)
     prune_backups(backup_dir, retention_days, keep=output)
     return output
 

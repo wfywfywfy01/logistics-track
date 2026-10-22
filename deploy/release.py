@@ -23,8 +23,8 @@ import urllib.request
 REPO = "wfywfywfy01/logistics-track"
 
 
-def download_xray(context, directory):
-    """Use the release commit's pinned upstream version and checksum."""
+def download_xray(context, directory, local_bundle=None):
+    """Copy the upstream or local bundle, enforcing the release commit's checksum."""
     with tarfile.open(fileobj=context, mode="r:") as archive:
         member = archive.getmember("deploy/Dockerfile")
         if not member.isfile() or member.size > 65536:
@@ -37,7 +37,8 @@ def download_xray(context, directory):
     url = "https://github.com/XTLS/Xray-core/releases/download/" + version[1] + "/Xray-linux-64.zip"
     bundle = Path(directory) / "xray-bundle.zip"
     digest, total = hashlib.sha256(), 0
-    with urllib.request.urlopen(url, timeout=60) as response, bundle.open("wb") as output:
+    source = Path(local_bundle).open("rb") if local_bundle else urllib.request.urlopen(url, timeout=60)
+    with source as response, bundle.open("wb") as output:
         while chunk := response.read(65536):
             total += len(chunk)
             if total > 40 * 1024 * 1024:
@@ -49,14 +50,14 @@ def download_xray(context, directory):
     return bundle
 
 
-def build_image(docker, image, revision):
+def build_image(docker, image, revision, xray_bundle=None):
     """Stream only the requested Git commit, never the local working tree."""
     repo = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryFile() as context, tempfile.TemporaryDirectory() as directory:
         subprocess.run(["git", "archive", "--format=tar", revision], cwd=repo,
                        stdout=context, stderr=subprocess.PIPE, check=True, timeout=60)
         context.seek(0)
-        bundle = download_xray(context, directory)
+        bundle = download_xray(context, directory, xray_bundle)
         context.seek(0)
         with tarfile.open(fileobj=context, mode="a") as archive:
             target = ".build/Xray-linux-64.zip"
@@ -83,6 +84,8 @@ def replacement_config(old, image, revision):
     config["Env"].append("LOGISTICS_RELEASE_SHA=" + revision)
     config["Labels"] = {**(config.get("Labels") or {}),
                         "org.opencontainers.image.revision": revision}
+    for key in ("io.logistics.source-commit", "io.logistics.promoted-from"):
+        config["Labels"].pop(key, None)  # Inherit provenance from the new image, not the old container.
     config["HostConfig"] = copy.deepcopy(old["HostConfig"])
     # Image-declared anonymous volumes are absent from HostConfig.Binds/Mounts.
     # Reuse their concrete volume names instead of silently creating empty data.
@@ -175,6 +178,7 @@ def main():
     parser.add_argument("revision", help="full SHA on GitHub master with successful test check")
     parser.add_argument("--docker-host", required=True, help="trusted Docker HTTP endpoint (tcp://host:port)")
     parser.add_argument("--expected-image", required=True, help="current image ID, preventing stale releases")
+    parser.add_argument("--xray-bundle", help="local upstream ZIP; pinned checksum is still mandatory")
     parser.add_argument("--execute", action="store_true", help="otherwise perform read-only preflight")
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9a-f]{40}", args.revision):
@@ -222,7 +226,7 @@ def main():
     if not args.execute:
         return
     docker = ["docker", "-H", args.docker_host]
-    build_image(docker, image, args.revision)
+    build_image(docker, image, args.revision, args.xray_bundle)
     built = api("/images/" + urllib.parse.quote(image, safe="") + "/json")
     if built["Config"]["Labels"].get("org.opencontainers.image.revision") != args.revision:
         raise RuntimeError("built image revision mismatch")

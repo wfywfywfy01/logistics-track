@@ -42,6 +42,8 @@ def old_container():
 
 def test_replacement_preserves_runtime_and_existing_volume_without_old_release():
     old = old_container()
+    old["Config"]["Labels"].update({"io.logistics.source-commit": "old-source",
+                                   "io.logistics.promoted-from": "old-image"})
     original = copy.deepcopy(old)
     new = release.replacement_config(old, "logistics-track:new", REVISION)
 
@@ -49,6 +51,8 @@ def test_replacement_preserves_runtime_and_existing_volume_without_old_release()
     assert new["Env"] == ["ADMIN_TOKEN=DUMMY_RUNTIME_SECRET", "LOGISTICS_RELEASE_SHA=" + REVISION]
     assert new["Labels"]["org.opencontainers.image.revision"] == REVISION
     assert new["Labels"]["runtime-owner"] == "operations"
+    assert "io.logistics.source-commit" not in new["Labels"]
+    assert "io.logistics.promoted-from" not in new["Labels"]
     assert new["Hostname"] == ""
     assert new["User"] == "1000:1000" and new["Entrypoint"] == old["Config"]["Entrypoint"]
     assert new["HostConfig"]["PortBindings"] == old["HostConfig"]["PortBindings"]
@@ -386,3 +390,27 @@ def test_rollback_does_not_delete_unrelated_named_container():
     assert "service name belongs to another deployment" in errors
     assert "foreign" in harness.containers
     assert not harness.containers[OLD_ID]["State"]["Running"]
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_local_xray_bundle_is_verified_without_network_before_any_switch(monkeypatch, tmp_path, valid):
+    import sys
+    harness = DockerHarness()
+    commands = setup_main(monkeypatch, harness)
+    bundle = tmp_path / "official-xray.zip"
+    bundle.write_bytes(XRAY_BUNDLE if valid else b"truncated bundle")
+    monkeypatch.setattr(sys, "argv", sys.argv + ["--xray-bundle", str(bundle)])
+
+    def network_forbidden(*args, **kwargs):
+        raise AssertionError("local bundle must not trigger upstream download")
+
+    monkeypatch.setattr(release.urllib.request, "urlopen", network_forbidden)
+    if valid:
+        release.main()
+        assert harness.containers["candidate"]["State"]["Running"]
+    else:
+        with pytest.raises(RuntimeError, match="checksum"):
+            release.main()
+        assert not any(command[0] == "docker" for command in commands)
+        assert harness.containers[OLD_ID]["State"]["Running"]
+        assert all(method == "GET" for method, _ in harness.calls)
