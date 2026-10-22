@@ -1,4 +1,6 @@
 import copy
+import hashlib
+import io
 import json
 import subprocess
 import tarfile
@@ -13,6 +15,9 @@ from deploy import release
 
 REVISION = "a" * 40
 OLD_ID = "b" * 64
+XRAY_BUNDLE = b"test-only verified upstream bundle"
+PINNED_DOCKERFILE = ("FROM scratch\nARG XRAY_VERSION=v26.3.27\nARG XRAY_SHA256=" +
+                     hashlib.sha256(XRAY_BUNDLE).hexdigest() + "\nCOPY app.py /app.py\n").encode()
 
 
 def old_container():
@@ -145,6 +150,12 @@ def setup_main(monkeypatch, harness, *, execute=True, master=REVISION, ci="succe
     def run(command, **kwargs):
         nonlocal master_queries
         commands.append(command)
+        if command[0] == "git":
+            with tarfile.open(fileobj=kwargs["stdout"], mode="w") as archive:
+                member = tarfile.TarInfo("deploy/Dockerfile")
+                member.size = len(PINNED_DOCKERFILE)
+                archive.addfile(member, io.BytesIO(PINNED_DOCKERFILE))
+            return SimpleNamespace(returncode=0)
         if command[0] == "gh":
             if command[-1].endswith("git/ref/heads/master"):
                 master_queries += 1
@@ -156,6 +167,7 @@ def setup_main(monkeypatch, harness, *, execute=True, master=REVISION, ci="succe
 
     monkeypatch.setattr(release.subprocess, "run", run)
     monkeypatch.setattr(release.urllib.request, "build_opener", lambda *args: harness)
+    monkeypatch.setattr(release.urllib.request, "urlopen", lambda *args, **kwargs: io.BytesIO(XRAY_BUNDLE))
     argv = ["release.py", REVISION, "--docker-host", "tcp://docker.test:2375",
             "--expected-image", "sha256:old-image"]
     if execute:
@@ -242,7 +254,7 @@ def test_build_context_uses_exact_commit_and_excludes_dirty_and_untracked_files(
     git("config", "core.autocrlf", "false")
     git("config", "core.hooksPath", str(tmp_path / "no-hooks"))
     (tmp_path / "deploy").mkdir()
-    (tmp_path / "deploy" / "Dockerfile").write_bytes(b"FROM scratch\nCOPY app.py /app.py\n")
+    (tmp_path / "deploy" / "Dockerfile").write_bytes(PINNED_DOCKERFILE)
     (tmp_path / "app.py").write_bytes(b"print('selected commit')\n")
     git("add", ".")
     git("-c", "user.name=Release Test", "-c", "user.email=release@example.invalid",
@@ -269,11 +281,18 @@ def test_build_context_uses_exact_commit_and_excludes_dirty_and_untracked_files(
                                   for member in archive.getmembers() if member.isfile()})
         return SimpleNamespace(returncode=0)
 
+    def download(url, timeout):
+        assert url == "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip"
+        assert timeout == 60
+        return io.BytesIO(XRAY_BUNDLE)
+
     monkeypatch.setattr(release, "__file__", str(tmp_path / "deploy" / "release.py"))
     monkeypatch.setattr(release.subprocess, "run", run)
+    monkeypatch.setattr(release.urllib.request, "urlopen", download)
     release.build_image(["docker", "-H", "tcp://docker.test:2375"], "logistics-track:test", revision)
     assert archive_files == {"app.py": b"print('selected commit')\n",
-                            "deploy/Dockerfile": b"FROM scratch\nCOPY app.py /app.py\n"}
+                            "deploy/Dockerfile": PINNED_DOCKERFILE,
+                            ".build/Xray-linux-64.zip": XRAY_BUNDLE}
     assert calls[0] == (["git", "archive", "--format=tar", revision], 60)
     assert calls[1][1] == 1200
 
@@ -299,6 +318,30 @@ def test_archive_or_build_failure_keeps_old_service_untouched(monkeypatch, faile
     assert harness.containers[OLD_ID]["State"]["Running"]
     assert harness.containers[OLD_ID]["Name"] == "/logistics-track"
     assert bool(build_calls) == (failed_stage == "docker")
+
+
+@pytest.mark.parametrize("failure", ["download", "checksum", "oversized"])
+def test_upstream_failure_prevents_build_and_keeps_old_service_running(monkeypatch, failure):
+    harness = DockerHarness()
+    commands = setup_main(monkeypatch, harness)
+
+    class OversizedBundle(io.BytesIO):
+        def read(self, size):
+            assert size == 65536
+            return b"x" * size
+
+    def download(*args, **kwargs):
+        if failure == "download":
+            raise urllib.error.URLError("upstream unavailable")
+        return OversizedBundle() if failure == "oversized" else io.BytesIO(b"tampered bundle")
+
+    monkeypatch.setattr(release.urllib.request, "urlopen", download)
+    with pytest.raises((RuntimeError, urllib.error.URLError)):
+        release.main()
+    assert harness.calls == [("GET", "/containers/logistics-track/json")]
+    assert not any(command[0] == "docker" for command in commands)
+    assert harness.containers[OLD_ID]["State"]["Running"]
+    assert harness.containers[OLD_ID]["Name"] == "/logistics-track"
 
 
 @pytest.mark.parametrize("running", [False, True])

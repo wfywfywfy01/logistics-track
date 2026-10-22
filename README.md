@@ -63,6 +63,8 @@ python fedex_track.py 876543210123
 
 本轮回归与线上验收流程见 [ACCEPTANCE-20261022.md](ACCEPTANCE-20261022.md)。以下命令用于首次创建服务。
 
+发布脚本还在本机下载固定版本的官方 Xray 包，验证仓库内固定 SHA-256 后加入临时构建上下文，避免依赖第三方 GitHub 下载镜像；Docker 构建中再次验证同一摘要。临时文件在构建结束后清理。
+
 ```bash
 cp deploy/.env.example deploy/.env   # 填 Vertu 认证 / XRAY_* 出口节点 / OCR_* 等
 docker build -f deploy/Dockerfile -t logistics-track:latest .

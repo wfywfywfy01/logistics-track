@@ -29,10 +29,15 @@ ENV PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
 RUN python -m patchright install --with-deps chromium
 
 # xray-core: 容器内本地代理(SS 节点 -> 美国出口), 供 UPS 抓取走海外线路
-# 云端直连 GitHub 慢/断, 走 ghfast.top 镜像(实测 21MB/17s)
+# release.py 从本机下载官方包并校验后，放入临时构建上下文。
+# 直接 docker build 时从官方地址下载；两条路径均校验相同 SHA-256。
 ARG XRAY_VERSION=v26.3.27
-RUN curl -fsSL --retry 3 --max-time 300 -o /tmp/xray.zip \
-        "https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
+ARG XRAY_SHA256=23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae
+RUN --mount=type=bind,target=/build-context \
+    if [ -f /build-context/.build/Xray-linux-64.zip ]; then cp /build-context/.build/Xray-linux-64.zip /tmp/xray.zip; \
+    else curl -fsSL --retry 3 --max-time 300 -o /tmp/xray.zip \
+        "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"; fi \
+    && echo "${XRAY_SHA256}  /tmp/xray.zip" | sha256sum -c - \
     && python -c "import zipfile; zipfile.ZipFile('/tmp/xray.zip').extract('xray', '/usr/local/bin')" \
     && chmod +x /usr/local/bin/xray && rm /tmp/xray.zip \
     && xray version | head -1
@@ -47,7 +52,8 @@ WORKDIR /app
 # vertu-cli 入口: 代码里 shell 调用 "vertu-cli ...", 这里做 shim 指向 node 包(鉴权靠 APP_KEY, 二进制本身无敏感信息)
 RUN printf "#!/bin/sh\nexec node /app/bin/vertu-cli.cjs \"\$@\"\n" > /usr/local/bin/vertu-cli \
     && chmod +x /usr/local/bin/vertu-cli \
-    && chmod +x /app/deploy/entrypoint.sh
+    && chmod +x /app/deploy/entrypoint.sh \
+    && rm -rf /app/.build
 
 # 健康状态(docker ps 可见): watcher 心跳 10 分钟内有更新
 HEALTHCHECK --interval=60s --timeout=5s --start-period=180s --retries=3 \

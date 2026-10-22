@@ -6,11 +6,13 @@ The stopped rollback container and the consistent backup are retained.
 import argparse
 import copy
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
 import secrets
 import subprocess
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -21,12 +23,50 @@ import urllib.request
 REPO = "wfywfywfy01/logistics-track"
 
 
+def download_xray(context, directory):
+    """Use the release commit's pinned upstream version and checksum."""
+    with tarfile.open(fileobj=context, mode="r:") as archive:
+        member = archive.getmember("deploy/Dockerfile")
+        if not member.isfile() or member.size > 65536:
+            raise RuntimeError("invalid release Dockerfile")
+        dockerfile = archive.extractfile(member).read().decode("utf-8")
+    version = re.search(r"(?m)^ARG XRAY_VERSION=(v[0-9]+\.[0-9]+\.[0-9]+)\s*$", dockerfile)
+    checksum = re.search(r"(?m)^ARG XRAY_SHA256=([0-9a-f]{64})\s*$", dockerfile)
+    if not version or not checksum:
+        raise RuntimeError("release Dockerfile must pin XRAY_VERSION and XRAY_SHA256")
+    url = "https://github.com/XTLS/Xray-core/releases/download/" + version[1] + "/Xray-linux-64.zip"
+    bundle = Path(directory) / "xray-bundle.zip"
+    digest, total = hashlib.sha256(), 0
+    with urllib.request.urlopen(url, timeout=60) as response, bundle.open("wb") as output:
+        while chunk := response.read(65536):
+            total += len(chunk)
+            if total > 40 * 1024 * 1024:
+                raise RuntimeError("Xray download exceeds 40 MiB limit")
+            digest.update(chunk)
+            output.write(chunk)
+    if digest.hexdigest() != checksum[1]:
+        raise RuntimeError("Xray bundle checksum mismatch")
+    return bundle
+
+
 def build_image(docker, image, revision):
     """Stream only the requested Git commit, never the local working tree."""
     repo = Path(__file__).resolve().parents[1]
-    with tempfile.TemporaryFile() as context:
+    with tempfile.TemporaryFile() as context, tempfile.TemporaryDirectory() as directory:
         subprocess.run(["git", "archive", "--format=tar", revision], cwd=repo,
                        stdout=context, stderr=subprocess.PIPE, check=True, timeout=60)
+        context.seek(0)
+        bundle = download_xray(context, directory)
+        context.seek(0)
+        with tarfile.open(fileobj=context, mode="a") as archive:
+            target = ".build/Xray-linux-64.zip"
+            if target in archive.getnames():
+                raise RuntimeError("release archive already contains reserved Xray bundle path")
+            member = tarfile.TarInfo(target)
+            member.size = bundle.stat().st_size
+            member.mode = 0o644
+            with bundle.open("rb") as source:
+                archive.addfile(member, source)
         context.seek(0)
         subprocess.run(docker + ["build", "--build-arg", "SOURCE_REVISION=" + revision,
                        "-f", "deploy/Dockerfile", "-t", image, "-"],

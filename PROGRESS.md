@@ -14,6 +14,7 @@
 - 本轮验收标准及外部边界见 `ACCEPTANCE-20261022.md`。发布版本及 Linux CI 证据待发布后补记；FedEx 有效实票、异地容灾和 72 小时观察仍不记作通过。
 - PR #22 已合并为 `3250ead`，分支、PR、合并提交的 Linux CI 均通过，合并提交为 256 passed / 1 skipped（本机已执行的浏览器可选测试）。生产备份 `/app/backups/acceptance-20261022.zip` 导出后在空目录恢复，256 单、完整性 ok；这是单次恢复演练，不代替持续异地备份策略。
 - 首次发布在服务器拉取 GitHub 构建上下文时遇到 TLS 中断，尚未切换容器，原服务保持 healthy。构建调整为本机 `git archive` 导出精确提交后上传 Docker，保持 CI/版本校验，排除工作区未提交文件。
+- PR #23 合并为 `e9f4c45`，Linux CI 为 259 passed / 1 skipped。本机固定提交上传构建已通，随后暴露既有 Xray 下载镜像 HTTP 403；改为本机下载官方 v26.3.27 包，以 GitHub 官方 release API 提供的 SHA-256 在本机与 Docker 双重验证，再通过临时构建挂载传入服务器。
 
 ## 2026-09-22：查询兼容、采集闭环与 PDCA 私网修复
 
