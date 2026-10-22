@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 import openpyxl
 from storage import Storage, TaskConflict, iso
-from official_tracking import delivery_confirmed, result_hash
+from official_tracking import delivery_confirmed, result_hash, result_matches_package
 from carriers import detect_carrier
 
 DATA = Path((os.environ.get("LOGIBOT_DATA_DIR") or "data")); DATA.mkdir(parents=True, exist_ok=True)
@@ -116,6 +116,14 @@ def match_sales(order_no, domestic=None):
         save_json(SALES_MAP, sm)
     return sm.get(order_no, rec)
 
+
+def _set_salesperson(shipment, name):
+    name = trim(name)
+    if name != trim(shipment.get("salesperson")):
+        shipment.pop("salesperson_id", None)
+    shipment["salesperson"] = name
+
+
 def rematch(order):
     with LEDGER_LOCK:
         return _rematch(order)
@@ -132,10 +140,12 @@ def _rematch(order):
             sales = match_sales(m.group(1), domestic=(db.get(m.group(1)) or {}).get("domestic"))
         inherit_parent(it, db)
     if sales.get("salesperson"):
-        updates = {"salesperson": sales["salesperson"]}
-        if sales.get("products"): updates["products"] = [sales["products"]]
-        if sales.get("domestic"): updates["domestic"] = sales["domestic"]
-        STORE.patch_shipment(order, updates)
+        def update(current):
+            _set_salesperson(current, sales["salesperson"])
+            if sales.get("products"): current["products"] = [sales["products"]]
+            if sales.get("domestic"): current["domestic"] = sales["domestic"]
+            return current, []
+        STORE.mutate_shipment(order, update)
         return {"order": order, "matched": True, "salesperson": sales["salesperson"]}
     return {"order": order, "matched": False}
 
@@ -165,7 +175,7 @@ def _ingest_forecast(xlsx):
             if not (current and candidate and current != candidate) and it.get("carrier"):
                 prev["carrier"] = it["carrier"]
             prev["orderNo"] = order
-            prev["salesperson"] = sales.get("salesperson") or prev.get("salesperson") or ""
+            _set_salesperson(prev, sales.get("salesperson") or prev.get("salesperson") or "")
             if sales.get("products"):
                 prev["products"] = [sales["products"]]
             prev["domestic"] = sales.get("domestic") or prev.get("domestic") or ""
@@ -187,7 +197,10 @@ def inherit_parent(it, db):
     if not parent: return
     for k in ("salesperson", "domestic", "products", "note"):
         if parent.get(k) and not it.get(k):
-            it[k] = parent[k]
+            if k == "salesperson":
+                _set_salesperson(it, parent[k])
+            else:
+                it[k] = parent[k]
 
 
 def ingest_pair(order, intl, force=False, silent=False):
@@ -260,12 +273,18 @@ def _ingest_pair(order, intl, force=False, silent=False):
         detected = detect_carrier(intl)
         if detected:
             current["carrier"] = detected
-        for field in ("salesperson", "domestic"):
-            if sales.get(field): current[field] = sales[field]
+        if sales.get("salesperson"):
+            _set_salesperson(current, sales["salesperson"])
+        if sales.get("domestic"):
+            current["domestic"] = sales["domestic"]
         if sales.get("products"): current["products"] = [sales["products"]]
         if parent:
             for field in ("salesperson", "domestic", "products", "note"):
-                if parent.get(field) and not current.get(field): current[field] = parent[field]
+                if parent.get(field) and not current.get(field):
+                    if field == "salesperson":
+                        _set_salesperson(current, parent[field])
+                    else:
+                        current[field] = parent[field]
         if current.get("status", "已预报") == "已预报":
             event_at = iso()
             current.setdefault("history", []).append(
@@ -380,7 +399,9 @@ def _event_notification_tasks(order, shipment, event, channel_id=None, bot_app_i
     if recipients is None:
         # Read family recipients while the caller holds the shipment write transaction;
         # every event receives its full outbox even when several changes precede a drain.
-        recipients = _family_recipients(STORE.get_shipments()).get(_family_key(order), [])
+        shipments = STORE.get_shipments()
+        shipments[order] = shipment
+        recipients = _family_recipients(shipments).get(_family_key(order), [])
     names = list(dict.fromkeys(name for name in recipients if name))
     if primary and primary not in names:
         names.insert(0, primary)
@@ -529,9 +550,8 @@ def package_update(order, tracking, status, detail="", observed_at=None, binding
                         for event in item.get("binding_history") or [])
             outcome.update({"changed": False, "reason": "stale binding" if stale else "package not found"})
             return shipment, []
-        reported_version = int(binding_version) if binding_version is not None else 0
-        bound_version = int(package.get("binding_version") or 0)
-        if reported_version and bound_version and reported_version != bound_version:
+        if not result_matches_package(
+                {"tracking": tracking, "binding_version": binding_version}, package):
             outcome.update({"changed": False, "reason": "stale binding"}); return shipment, []
         if normalized is None:
             outcome.update({"changed": False, "reason": "unknown status"}); return shipment, []
@@ -698,6 +718,11 @@ def _track_update(order, status, detail="", observed_at=None, tracking=None,
         elif binding_version is not None and int(binding_version) and int(it.get("binding_version") or 0) \
                 and int(binding_version) != int(it.get("binding_version") or 0):
             reason = "stale binding"
+        elif not int(binding_version or 0) and (
+                int(it.get("binding_version") or 0) > 1 or
+                any(event.get("from") for event in it.get("binding_history") or []) or
+                any(package.get("binding_history") for package in it.get("packages") or [])):
+            reason = "stale binding"
         elif tracking and tracking not in (it.get("intl"), it.get("alt_intl")):
             reason = "stale binding"
         elif watermark and seen_at < watermark:
@@ -766,28 +791,28 @@ def resolve_user(name):
 def _queue_notifications(channel_id, bot_app_id=None, enqueue=True):
     queued = []
     shipments = STORE.get_shipments()
-    families = _family_recipients(shipments)
     for order, it in shipments.items():
         if not it.get("needs_notify"):
             continue
-        h = (it.get("history") or [{}])[-1]
-        if h.get("notification_suppressed"):
-            continue
-        if not h.get("at") and not h.get("observed_at"):
-            h = {**h, "at": "legacy:%s:%s" % (
-                it.get("status", "-"), int(it.get("binding_version") or 0))}
-        tasks = _event_notification_tasks(order, it, h, channel_id, bot_app_id,
-                                          families.get(_family_key(order)))
-        line = tasks[0]["payload"]["body"]
+        def recover(current):
+            if not current.get("needs_notify"):
+                return current, []
+            h = (current.get("history") or [{}])[-1]
+            if h.get("notification_suppressed"):
+                return current, []
+            if not h.get("at") and not h.get("observed_at"):
+                h = {**h, "at": "legacy:%s:%s" % (
+                    current.get("status", "-"), int(current.get("binding_version") or 0))}
+            tasks = _event_notification_tasks(order, current, h, channel_id, bot_app_id)
+            queued.append({"order": order, "line": tasks[0]["payload"]["body"]})
+            tasks = [task for task in tasks if not (task["kind"] == "notify_dm" and
+                task["payload"].get("name") == current.get("salesperson") and
+                current.get("dm_notified_event") == task["payload"]["event_key"])]
+            return current, tasks
         if enqueue:
-            for task in tasks:
-                primary_already_sent = (task["kind"] == "notify_dm" and
-                    task["payload"].get("name") == it.get("salesperson") and
-                    it.get("dm_notified_event") == task["payload"]["event_key"])
-                if not primary_already_sent:
-                    STORE.enqueue_task(task["kind"], task["dedupe_key"], task["payload"],
-                                       legacy_dedupe_key=task.get("legacy_dedupe_key"))
-        queued.append({"order": order, "line": line})
+            STORE.mutate_shipment(order, recover)
+        else:
+            recover(it)
     return queued
 
 def _delivery_outcome(output):

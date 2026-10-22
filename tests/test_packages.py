@@ -7,17 +7,21 @@ def test_three_packages_roll_up_to_partial_then_full_delivery(monkeypatch, tmp_p
     pipeline.STORE.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "已预报",
         "history": [], "products": []})
 
+    versions = {}
     for number in ("876543210121", "876543210122", "876543210123"):
         result = pipeline.add_package("XSD1", number, "FedEx")
         assert result["added"] is True
+        versions[number] = result["binding_version"]
     for number in ("876543210121", "876543210122"):
-        pipeline.package_update("XSD1", number, "运输中", observed_at="2026-09-10T01:00:00Z")
+        pipeline.package_update("XSD1", number, "运输中", observed_at="2026-09-10T01:00:00Z",
+                                binding_version=versions[number])
     pipeline.package_update("XSD1", "876543210123", "签收",
-                            observed_at="2026-09-10T02:00:00Z")
+                            observed_at="2026-09-10T02:00:00Z", binding_version=versions["876543210123"])
     assert pipeline.STORE.get_shipment("XSD1")["status"] == "部分签收"
 
     for number in ("876543210121", "876543210122"):
-        pipeline.package_update("XSD1", number, "签收", observed_at="2026-09-10T03:00:00Z")
+        pipeline.package_update("XSD1", number, "签收", observed_at="2026-09-10T03:00:00Z",
+                                binding_version=versions[number])
     saved = pipeline.STORE.get_shipment("XSD1")
     assert saved["status"] == "签收"
     assert len(saved["packages"]) == 3
