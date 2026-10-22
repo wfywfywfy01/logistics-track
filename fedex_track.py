@@ -2,27 +2,36 @@
 """FedEx official-site tracker using headed Chromium and response capture."""
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
 from urllib.parse import quote, urlsplit
+from official_tracking import delivery_confirmed
 
 
 def classify_status(code, description):
     code = (code or "").upper()
     text = (description or "").lower()
-    if code == "DL" or "delivered" in text:
-        return "签收"
-    if code == "RS" or any(x in text for x in ("return to shipper", "returned")):
+    # Known carrier codes outrank explanatory text (e.g. a delayed delivery plan).
+    codes = {"DL": "签收", "RS": "退回", "CD": "清关中", "CC": "清关中",
+             **dict.fromkeys(("DE", "SE", "CA", "DY", "EX"), "异常"),
+             **dict.fromkeys(("IT", "OD", "AR", "DP", "AF"), "运输中"),
+             **dict.fromkeys(("OC", "PU", "PX", "AP"), "已出国际单")}
+    if code in codes:
+        return codes[code]
+    if any(x in text for x in ("return to shipper", "returned")):
         return "退回"
-    if code in {"CD", "CC"} or any(x in text for x in ("clearance", "customs")):
+    if any(x in text for x in ("clearance", "customs")):
         return "清关中"
-    if code in {"DE", "SE", "CA", "DY", "EX"} or any(x in text for x in ("exception", "delay", "on hold")):
+    if any(x in text for x in ("exception", "delay", "on hold")):
         return "异常"
-    if code in {"IT", "OD", "AR", "DP", "AF"} or any(x in text for x in ("on the way", "transit", "out for delivery", "departed", "arrived")):
+    if any(x in text for x in ("on the way", "transit", "out for delivery", "departed", "arrived")):
         return "运输中"
-    if code in {"OC", "PU", "PX", "AP"} or any(x in text for x in ("label created", "picked up", "shipment information sent")):
+    if any(x in text for x in ("label created", "picked up", "shipment information sent")):
         return "已出国际单"
+    if delivery_confirmed(text):
+        return "签收"
     return None
 
 
@@ -112,6 +121,7 @@ def parse_tracking_response(tracking, payload):
 
 DOM_STAGES = (
     ("OUT FOR DELIVERY", "运输中"),
+    ("ON THE WAY", "运输中"),
     ("IN TRANSIT", "运输中"),
     ("DELIVERED", "签收"),
     ("DELIVERY EXCEPTION", "异常"),
@@ -128,24 +138,26 @@ DOM_STAGES = (
 
 
 def dom_status_hint(body):
-    """Map rendered FedEx page text to a stage; earliest match wins
-    (the status heading appears before scan-history rows)."""
+    """Match complete status lines, not FAQ text or negative delivery sentences."""
     if not body:
         return None
-    upper = str(body).upper()
-    best = None
-    for phrase, stage in DOM_STAGES:
-        pos = upper.find(phrase)
-        if pos >= 0 and (best is None or pos < best[0]):
-            best = (pos, stage, phrase)
-    if not best:
-        return None
-    return best[1], best[2]
+    stages = dict(DOM_STAGES)
+    for line in str(body).splitlines():
+        phrase = " ".join(line.upper().split())
+        if phrase in {"SHIPMENT HISTORY", "TRAVEL HISTORY", "TRACKING HISTORY"}:
+            return None
+        if phrase in stages:
+            return stages[phrase], phrase
+    return None
 
 
 def parse_dom_status(tracking, body):
     """Fall back to the rendered FedEx page when the API payload is blocked."""
     if not body or not str(body).strip():
+        return None
+    number = re.sub(r"[\s-]", "", str(tracking or ""))
+    if not number or not re.search(
+            r"(?<!\d)" + r"[\s-]*".join(map(re.escape, number)) + r"(?!\d)", str(body)):
         return None
     hint = dom_status_hint(body)
     if not hint:
@@ -154,7 +166,7 @@ def parse_dom_status(tracking, body):
     lines = [line.strip() for line in str(body).splitlines() if line.strip()]
     detail = ""
     for index, line in enumerate(lines):
-        if phrase in line.upper():
+        if " ".join(line.upper().split()) == phrase:
             detail = " | ".join(lines[index + 1:index + 5])[:200]
             break
     return {"tracking": tracking, "ok": True, "stage": stage,
@@ -226,7 +238,7 @@ def _track_once(tracking, timeout_nav, wait_ms, proxy):
                 except Exception:
                     body = ""
                 lower = body.lower()
-                if dom_status_hint(body) or "can't find that tracking number" in lower or \
+                if parse_dom_status(tracking, body) or "can't find that tracking number" in lower or \
                         "tracking number cannot be found" in lower:
                     break
             drain_responses()

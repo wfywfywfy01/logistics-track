@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+import pytest
 
 from operations import build_daily_report, refresh_operational_tasks
 from storage import Storage
@@ -230,6 +231,44 @@ def test_missing_tracking_observation_time_blocks_stall_decision(tmp_path):
 def test_daily_report_exposes_unconfigured_freshness_threshold(tmp_path):
     report = build_daily_report(Storage(tmp_path))
     assert report["tracking_data_max_age_hours"] == "N/A"
+
+
+@pytest.mark.parametrize("observed", ["bad-date", "N/A", "2026-09-10T11:00:00", None])
+def test_invalid_observation_does_not_abort_other_orders_or_infer_stall(tmp_path, observed):
+    store = Storage(tmp_path)
+    for order in ("BAD", "GOOD"):
+        item = shipment()
+        item["orderNo"] = order
+        store.upsert_shipment(order, item)
+    store.put_document("ups_results", {
+        "BAD": {"tracking": "1Z1", "carrier": "UPS", "ok": True, "observed_at": observed},
+        "GOOD": {"tracking": "1Z1", "carrier": "UPS", "ok": True,
+                 "observed_at": "2026-09-10T11:00:00Z"},
+    })
+
+    refresh_operational_tasks(store, datetime(2026, 9, 10, 12, tzinfo=UTC),
+                              {"UPS": 48}, freshness_hours=24)
+
+    active = store.list_tasks(("pending",))
+    assert {(row["payload"]["order"], row["kind"]) for row in active} == {
+        ("BAD", "tracking_failure"), ("GOOD", "stalled")}
+
+
+def test_report_uses_active_packages_and_ignores_invalid_history_dates(tmp_path):
+    store = Storage(tmp_path)
+    store.upsert_shipment("ACTIVE", {"orderNo": "ACTIVE", "packages": [
+        {"tracking": "1Z1", "carrier": "UPS"}],
+        "history": [{"to": "签收", "at": "bad-date"}]})
+    store.upsert_shipment("INACTIVE", {"orderNo": "INACTIVE", "intl": "1Z2", "packages": [
+        {"tracking": "1Z2", "carrier": "UPS", "active": False}]})
+    store.upsert_shipment("NO_TRACKING", {"orderNo": "NO_TRACKING", "packages": [
+        {"carrier": "UPS", "active": True}]})
+
+    report = build_daily_report(store, datetime(2026, 9, 10, 12, tzinfo=UTC))
+
+    assert report["missing_label"] == {"count": 2, "orders": ["INACTIVE", "NO_TRACKING"]}
+    assert report["carrier_freshness"]["UPS"]["total"] == 1
+    assert report["delivered_today"]["count"] == 0
 
 
 def test_secondary_package_staleness_blocks_order_stall_decision(tmp_path):
