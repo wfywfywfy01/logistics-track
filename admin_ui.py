@@ -211,7 +211,7 @@ def _package(package, number):
 
 def _action_form(title, endpoint, fields, button, confirm=""):
     return (f"<details class='action-panel'><summary>{h(title)}</summary>"
-            f"<form class=api-form action='{h(endpoint)}'>{fields}"
+            f"<form class=api-form method='post' action='{h(endpoint)}'>{fields}"
             "<label>操作原因<input class='input' name='reason' required minlength='2'></label>"
             f"<button class='btn btn--primary' type='submit' data-confirm='{h(confirm)}'>{h(button)}</button>"
             "</form></details>")
@@ -341,16 +341,22 @@ def tasks(rows, role, filters, page_number=1, per_page=25, total_override=None):
                  + (f"<a href='/orders/{quote(order_no, safe='')}'>查看订单 {h(order_no)}</a>" if order_no else "") + "</div>")
         if status_value == "unknown" and kind in ("notify_group", "notify_dm"):
             body += "<div class='uncertain-flag'>发送结果不确定。先人工核实接收情况，避免重复通知。</div>"
-        if role in ("admin", "operator") and item.get("source") in ("task", "inbox") and kind not in ("notify_group", "notify_dm"):
+        actionable_source = (item.get("source") in ("task", "inbox") or
+                             (item.get("source") == "incoming_message" and status_value == "dead"))
+        if role in ("admin", "operator") and actionable_source and kind not in ("notify_group", "notify_dm"):
             if item.get("source") == "task":
                 endpoint = "/api/tasks/" + quote(str(item["id"]), safe="")
                 buttons = (f"<button class='btn btn--sm' formaction='{endpoint}/retry' data-confirm='确认重试？'>重试</button>"
                            f"<button class='btn btn--sm' formaction='{endpoint}/claim' data-confirm='确认认领？'>认领</button>")
                 buttons += f"<button class='btn btn--sm' formaction='{endpoint}/resolve' data-confirm='确认结案？'>结案</button>"
-            else:
+            elif item.get("source") == "inbox":
                 endpoint = "/api/inbox/" + quote(str(item["id"]), safe="") + "/retry"
                 buttons = "<button class='btn btn--sm' data-confirm='确认重试 OCR？'>重试</button>"
-            body += (f"<form class=api-form action='{endpoint}'><label>操作原因"
+            else:
+                endpoint = ("/api/messages/" + quote(str(item["channel_id"]), safe="") + "/" +
+                            quote(str(item["id"]), safe="") + "/retry")
+                buttons = "<button class='btn btn--sm' data-confirm='确认重新处理这条失败消息？'>重试消息</button>"
+            body += (f"<form class=api-form method='post' action='{endpoint}'><label>操作原因"
                      "<input class='input' name='reason' required minlength='2'></label>" + buttons + "</form>")
         body += "<details><summary>查看原始任务数据</summary><pre>" + h(json.dumps(payload, ensure_ascii=False, indent=2)) + "</pre></details></article>"
     body += "</div>"
@@ -434,7 +440,7 @@ def users(items, audit):
               "<label>角色<select class='select' name='role'><option>viewer</option><option>operator</option><option>admin</option></select></label>"
               "<label>开通原因<input class='input' name='reason' required minlength='2'></label>"
               "<button class='btn btn--primary'>新增账号</button>")
-    body += card("新增账号", "<form class=api-form action='/api/users'>" + fields + "</form>")
+    body += card("新增账号", "<form class=api-form method='post' action='/api/users'>" + fields + "</form>")
     rows = ""
     for user in items:
         username = str(user.get("username") or "")
@@ -445,7 +451,7 @@ def users(items, audit):
                  f"<td data-m='label' data-label='角色'>{h(user.get('role'))}</td>"
                  f"<td data-m='label' data-label='状态'>{h('启用' if user.get('active') else '停用')}</td>"
                  f"<td data-m='full'>"
-                 f"<form class=api-form action='{endpoint}'><label>新密码<input class='input' name='password' type='password' minlength='12' placeholder='留空不改'></label>"
+                 f"<form class=api-form method='post' action='{endpoint}'><label>新密码<input class='input' name='password' type='password' minlength='12' placeholder='留空不改'></label>"
                  f"<label>角色<select class='select' name='role'>{options}</select></label>"
                  f"<label>状态<select class='select' name='active'><option value='true' {'selected' if active == 'true' else ''}>启用</option>"
                  f"<option value='false' {'selected' if active == 'false' else ''}>停用</option></select></label>"
