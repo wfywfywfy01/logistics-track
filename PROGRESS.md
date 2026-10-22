@@ -1,5 +1,16 @@
 # 生产化进度
 
+## 2026-10-23：发布完成与线上复核
+
+- PR #24 合并版本 `7e88a5c7b1c2069283c42ae82aa52940d8f7f33d` 已部署。精确提交的 Linux CI [39810303284](https://github.com/wfywfywfy01/logistics-track/actions/runs/39810303284) 为 262 passed / 1 skipped；跳过的是已在本机真实 Chromium 执行的可选浏览器测试。
+- 发布复用已成功构建的候选 `4b4baae`：其 Git tree 与合并版本均为 `d7c00290c9803fe4f4bbb62de1c4cfd7d09b1f51`。只对未启动、未挂数据卷且文件差异为空的临时容器更新版本标签及环境变量，保存 source-commit/promoted-from；原发布流程的 CI、当前镜像、备份、健康与回滚门禁全部保留。重复下载校验失败的构建没有切换生产。
+- 生产镜像 `sha256:2f4f9e1a563480073f67bd2d3ec14da43da69a3a65eb6cb1f46cf9987663efca` 为 healthy、重启数 0。切换前备份 `/app/backups/pre-release-20261022-161337.zip`；旧容器 `logistics-track-rollback-20261022-161337-36887960fa656a39` 已停止并保留，原网络、端口、数据卷及资源限制沿用。
+- 发布后 `/healthz` 返回正确版本；无凭据 API 返回 401。认证后的订单、待办、通知、日报、用户页面及统计/列表 API 均返回 200，订单号与国际运单号查询均为 200。台账 256 单、SQLite integrity_check=ok；watcher 心跳 22 秒前更新，收件 774 条均已处理。
+- 公网 `/logistics-api/healthz` 为 200 且版本正确；PDCA 物流中心与后台未登录入口均正常跳转同域 HTTPS 登录页，浏览器无 JavaScript 异常。没有借此宣称登录后的全部生产写操作已经实测。
+- 2026-10-22 16:16 UTC 在新容器只读复查真实样本：UPS 返回运输中、6 条官网轨迹；DHL 返回运输中、14 条官网轨迹。测试未写生产订单、未发送测试通知。
+- 仍保留业务待办：官网查询失败 142、人工审核 59、停滞 5、私聊死信 1；未清空历史错误以代替业务恢复。FedEx 有效实票、持续异地备份和发布后 72 小时观察仍待验收。
+- 本节为发布后的文档补记；运行程序版本以以上 SHA 及 `/healthz.release` 为准。
+
 ## 2026-10-22：全程序复审与可靠性完善
 
 - 线上 `candidate-familydm-20261022` 比 GitHub master 多出的销售补单、家族通知、UPS 清关放行及独立通知循环已保存原始副本并纳入本轮代码，避免发版覆盖线上功能。
@@ -11,7 +22,7 @@
 - 生产隔离副本连续两次异常刷新：订单均 256、integrity_check 均 ok，待办数稳定（官网失败142、停滞6）；未发送真实测试通知。
 - 服务器只读实票：UPS 官网成功、6条轨迹；DHL 官网成功、14条轨迹。生产现存142条官网失败中108条为早前连接重置，目前代理及两家实票可达；失败待办保留待正常采集更新。12条 FedEx 候选号为 not_found，不算有效实票。
 - 最终本地完整回归（含真实 Chromium 表单操作）：255 passed / 2 skipped；跳过项为 Linux SIGALRM 与 /proc 子孙进程测试，交由 Linux CI 执行。备份篡改测试的重复 ZIP 成员 warning 为预期。Python 编译、两个 Bash 语法检查与 git diff --check 通过。
-- 本轮验收标准及外部边界见 `ACCEPTANCE-20261022.md`。发布版本及 Linux CI 证据待发布后补记；FedEx 有效实票、异地容灾和 72 小时观察仍不记作通过。
+- 本轮验收标准及外部边界见 `ACCEPTANCE-20261022.md`。最终发布版本及 Linux CI 证据见上方 2026-10-23 记录；FedEx 有效实票、异地容灾和 72 小时观察仍不记作通过。
 - PR #22 已合并为 `3250ead`，分支、PR、合并提交的 Linux CI 均通过，合并提交为 256 passed / 1 skipped（本机已执行的浏览器可选测试）。生产备份 `/app/backups/acceptance-20261022.zip` 导出后在空目录恢复，256 单、完整性 ok；这是单次恢复演练，不代替持续异地备份策略。
 - 首次发布在服务器拉取 GitHub 构建上下文时遇到 TLS 中断，尚未切换容器，原服务保持 healthy。构建调整为本机 `git archive` 导出精确提交后上传 Docker，保持 CI/版本校验，排除工作区未提交文件。
 - PR #23 合并为 `e9f4c45`，Linux CI 为 259 passed / 1 skipped。本机固定提交上传构建已通，随后暴露既有 Xray 下载镜像 HTTP 403；改为本机下载官方 v26.3.27 包，以 GitHub 官方 release API 提供的 SHA-256 在本机与 Docker 双重验证，再通过临时构建挂载传入服务器。
