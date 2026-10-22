@@ -6,6 +6,7 @@
 """
 import json, os, sys, time
 from datetime import datetime, timezone
+from official_tracking import delivery_confirmed
 
 
 def _location(value):
@@ -27,9 +28,10 @@ def _utc_timestamp(value):
 def classify_status(code, description):
     code = (code or "").lower()
     low = (description or "").lower()
-    if "delivered" in code or "delivered" in low: return "签收"
+    if code == "delivered": return "签收"
     if any(k in low for k in ("returned", "return to", "returning")) or "return" in code: return "退回"
     if any(k in low for k in ("exception", "on hold", "held")) or "exception" in code: return "异常"
+    if delivery_confirmed(low): return "签收"
     if "clearance" in low or "custom" in low: return "清关中"
     if "transit" in code or any(k in low for k in ("processed", "departed", "arrived")): return "运输中"
     if "picked" in code or "pickup" in low or "received" in low: return "已出国际单"

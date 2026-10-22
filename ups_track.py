@@ -4,6 +4,7 @@
 后台执行：窗口移出屏幕，无前台弹窗。"""
 import sys, json, os, time
 from datetime import datetime, timezone
+from official_tracking import delivery_confirmed
 
 STAGE_MAP = {
     "D": "签收", "I": "运输中", "P": "已出国际单", "M": "已出国际单", "O": "运输中",
@@ -18,7 +19,16 @@ def classify_status(status_type, description):
     st_type = (status_type or "").upper()
     en = (description or "").lower()
     if st_type == "X":
-        if any(k in en for k in ("clearance", "customs", "seized", "held by customs")):
+        # 先判"已放行/已解除":Cleared Customs、hold resolved 不属于扣关(2026-10-16 修正误报)
+        released = any(k in en for k in (
+            "cleared customs", "customs cleared", "released by customs",
+            "has been resolved", "hold resolved"))
+        if released:
+            if any(k in en for k in ("on the way", "transit", "out for delivery", "departed")):
+                return "运输中"
+            return "清关中"
+        if any(k in en for k in ("clearance", "customs", "seized", "held by customs",
+                                 "being held", "duties or taxes are due", "duties are due")):
             return "海关扣关"
         if any(k in en for k in ("on the way", "transit", "out for delivery")):
             return "运输中"
@@ -26,7 +36,7 @@ def classify_status(status_type, description):
     stage = STAGE_MAP.get(st_type)
     if stage:
         return stage
-    if "delivered" in en: return "签收"
+    if delivery_confirmed(en): return "签收"
     if any(k in en for k in ("on the way", "transit", "out for delivery")): return "运输中"
     if "label created" in en or "order received" in en: return "已出国际单"
     if "customs" in en or "clearance" in en: return "清关中"

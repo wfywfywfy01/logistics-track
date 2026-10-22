@@ -9,7 +9,7 @@ from pathlib import Path
 import robust
 from storage import Storage
 
-DATA = Path("data"); DATA.mkdir(exist_ok=True)
+DATA = Path(os.environ.get("LOGIBOT_DATA_DIR") or "data"); DATA.mkdir(parents=True, exist_ok=True)
 STATE = DATA / "watcher_state.json"; INBOX = DATA / "inbox.json"
 TMP = Path("tmp"); TMP.mkdir(exist_ok=True)
 STORE = Storage(DATA)
@@ -65,8 +65,13 @@ def process_attachment(att, channel_id, bot_app_id, item_id=None):
     if lower.endswith(".xlsx"):
         if not signature.startswith(b"PK"):
             return {"name": name, "ok": False, "error": "invalid xlsx content"}
-        r = subprocess.run([sys.executable, "tracking-pipeline.py", "ingest-forecast", "--file", str(target)],
-                           capture_output=True)
+        try:
+            r = subprocess.run([sys.executable, "tracking-pipeline.py", "ingest-forecast", "--file", str(target)],
+                               capture_output=True, timeout=min(900, max(1, int(
+                                   os.environ.get("FORECAST_TIMEOUT_SECONDS") or 300))))
+        except subprocess.TimeoutExpired:
+            return {"name": name, "ok": False, "kind": "forecast",
+                    "error": "forecast processing timed out"}
         if r.returncode != 0:
             return {"name": name, "ok": False, "kind": "forecast",
                     "error": r.stderr.decode("utf-8", errors="replace")[:200]}
@@ -115,8 +120,15 @@ def process_text(body, channel_id):
     """文字里的 XSD==1Z 配对 -> ingest-pair。返回处理结果列表。"""
     out = []
     for order, intl in extract_pairs(body):
-        r = subprocess.run([sys.executable, "tracking-pipeline.py", "ingest-pair",
-                            "--order", order, "--intl", intl], capture_output=True)
+        try:
+            r = subprocess.run([sys.executable, "tracking-pipeline.py", "ingest-pair",
+                                "--order", order, "--intl", intl], capture_output=True,
+                               timeout=min(120, max(1, int(
+                                   os.environ.get("PAIR_TIMEOUT_SECONDS") or 120))))
+        except subprocess.TimeoutExpired:
+            out.append({"kind": "pair", "order": order, "intl": intl, "ok": False,
+                        "error": "pair processing timed out"})
+            continue
         ok = r.returncode == 0
         txt = r.stdout.decode("utf-8", errors="replace").strip()
         try:

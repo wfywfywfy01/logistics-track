@@ -4,7 +4,7 @@ import re
 import sqlite3
 import threading
 from http.cookiejar import CookieJar
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.error import HTTPError
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
@@ -87,13 +87,14 @@ def test_request_length_rejects_negative_and_invalid_values():
             pass
 
 
-def test_health_endpoint_is_public_and_checks_database(tmp_path):
+def test_health_endpoint_is_public_and_checks_database(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOGISTICS_RELEASE_SHA", "test-release-abc123")
     _, server, base = run_server(tmp_path)
     try:
         with urlopen(base + "/healthz") as response:
             result = json.loads(response.read())
         assert response.status == 200
-        assert result == {"ok": True, "database": "ok"}
+        assert result == {"ok": True, "database": "ok", "release": "test-release-abc123"}
     finally:
         server.shutdown()
 
@@ -107,7 +108,9 @@ def test_health_endpoint_fails_when_database_is_missing(tmp_path):
             assert False, "missing database must fail health check"
         except HTTPError as error:
             assert error.code == 503
-            assert json.loads(error.read()) == {"ok": False, "database": "error"}
+            result = json.loads(error.read())
+            assert result["ok"] is False and result["database"] == "error"
+            assert "release" in result
     finally:
         server.shutdown()
 
@@ -201,6 +204,97 @@ def test_admin_cannot_retry_task_during_delivery(tmp_path):
         server.shutdown()
 
 
+def test_notification_api_rejects_unsafe_retries_after_lease_ends(tmp_path):
+    store, server, base = run_server(tmp_path)
+    store.put_admin_user("ops", "operator-password-1", "operator")
+    try:
+        for kind in ("notify_group", "notify_dm"):
+            for status in ("unknown", "succeeded"):
+                task_id = store.enqueue_task(kind, f"{kind}:{status}",
+                                             {"order": "XSD1", "event_key": "event-1"})
+                if status == "unknown":
+                    store.mark_task_unknown(task_id, "connection lost after sending")
+                else:
+                    store.complete_task(task_id)
+                try:
+                    request(base + f"/api/tasks/{task_id}/retry", "operator-password-1",
+                            "POST", {"reason": "manual retry"}, server.csrf_token,
+                            username="ops")
+                    assert False, f"{status} notification must not be replayed"
+                except HTTPError as error:
+                    assert error.code == 409
+                task = next(item for item in store.list_tasks() if item["id"] == task_id)
+                assert task["status"] == status
+                assert not store.list_audit("XSD1")
+    finally:
+        server.shutdown()
+
+
+def test_browser_action_forms_use_form_action_and_explicit_button_override(tmp_path):
+    """Run with LOGISTICS_BROWSER_TESTS=1 and an installed Playwright Chromium."""
+    import os
+    import pytest
+    if os.environ.get("LOGISTICS_BROWSER_TESTS") != "1":
+        pytest.skip("set LOGISTICS_BROWSER_TESTS=1 to run browser interaction checks")
+    playwright = pytest.importorskip("playwright.sync_api")
+    store, server, base = run_server(tmp_path)
+    store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "已预报"})
+    task_id = store.enqueue_task("review", "review:XSD1", {"order": "XSD1"})
+    try:
+        with playwright.sync_playwright() as driver:
+            browser = driver.chromium.launch(headless=True)
+            authorization = base64.b64encode(b"admin:secret-token").decode()
+            page = browser.new_page(extra_http_headers={"Authorization": "Basic " + authorization})
+            page.on("dialog", lambda dialog: dialog.accept())
+            page.goto(base + "/orders/XSD1")
+            page.get_by_text("补录人员", exact=True).click()
+            form = page.locator("form[action='/api/orders/XSD1/salesperson']")
+            form.locator("[name=salesperson]").fill("Test User")
+            form.locator("[name=user_id]").fill("user-123")
+            form.locator("[name=reason]").fill("Verified user identity")
+            with page.expect_response(lambda response: response.request.method == "POST") as response:
+                form.locator("button").click()
+            assert response.value.url == base + "/api/orders/XSD1/salesperson"
+            assert response.value.status == 200
+            assert store.get_shipment("XSD1")["salesperson_id"] == "user-123"
+            page.wait_for_load_state()
+            page.goto(base + "/users")
+            form = page.locator("form[action='/api/users']")
+            form.locator("[name=username]").fill("new-viewer")
+            form.locator("[name=password]").fill("test-password-123")
+            form.locator("[name=reason]").fill("Read only access")
+            with page.expect_response(lambda response: response.request.method == "POST") as response:
+                form.locator("button").click()
+            assert response.value.url == base + "/api/users"
+            assert response.value.status == 200
+            assert store.get_admin_principal("new-viewer")["role"] == "viewer"
+            page.wait_for_load_state()
+            page.goto(base + "/tasks")
+            form = page.locator(f"form[action='/api/tasks/{task_id}']")
+            form.locator("[name=reason]").fill("Investigating this order")
+            with page.expect_response(lambda response: response.request.method == "POST") as response:
+                form.locator(f"button[formaction='/api/tasks/{task_id}/claim']").click()
+            assert response.value.url == base + f"/api/tasks/{task_id}/claim"
+            assert response.value.status == 200
+            assert store.list_tasks()[0]["payload"]["owner"] == "admin"
+            no_script = browser.new_page(java_script_enabled=False,
+                extra_http_headers={"Authorization": "Basic " + authorization})
+            no_script.goto(base + "/users")
+            form = no_script.locator("form[action='/api/users']")
+            form.locator("[name=username]").fill("without-script")
+            form.locator("[name=password]").fill("not-for-access-logs-123")
+            form.locator("[name=reason]").fill("Script loading failure")
+            with no_script.expect_response(lambda response: response.request.is_navigation_request()) as response:
+                form.locator("button").click()
+            assert response.value.request.method == "POST"
+            assert response.value.url == base + "/api/users"
+            assert response.value.status == 403
+            assert store.get_admin_principal("without-script") is None
+            browser.close()
+    finally:
+        server.shutdown()
+
+
 def test_workbench_pages_expose_order_and_issue_actions(tmp_path):
     store, server, base = run_server(tmp_path)
     store.upsert_shipment("XSD1", {"orderNo": "XSD1", "status": "运输中",
@@ -215,6 +309,62 @@ def test_workbench_pages_expose_order_and_issue_actions(tmp_path):
         assert f"/api/tasks/{task_id}/retry" in task_page
         assert f"/api/tasks/{task_id}/claim" in task_page
         assert f"/api/tasks/{task_id}/resolve" in task_page
+    finally:
+        server.shutdown()
+
+
+def test_tasks_page_bounds_extreme_page_and_trims_filters(tmp_path):
+    store, server, base = run_server(tmp_path)
+    task_id = store.enqueue_task("review", "review:XSD1", {"order": "XSD1"})
+    try:
+        query = urlencode({"page": "9" * 30, "kind": " review ",
+                           "status": " pending ", "order": " XSD1 "})
+        status, page = request_text(base + "/tasks?" + query, "secret-token")
+        assert status == 200
+        assert "符合条件：1 条" in page
+        assert f"/api/tasks/{task_id}/claim" in page
+    finally:
+        server.shutdown()
+
+
+def test_dead_message_can_be_retried_from_admin_with_rbac_and_audit(tmp_path):
+    store, server, base = run_server(tmp_path)
+    store.put_admin_user("ops", "operator-password-1", "operator")
+    store.put_admin_user("reader", "viewer-password-1", "viewer")
+    channel, message = "channel/one", "message:one"
+    store.record_message(channel, message, "2026-10-22T00:00:00+00:00", {"order": "XSD1"})
+    store.fail_message(channel, message, "attachment temporarily unavailable", max_attempts=1)
+    endpoint = "/api/messages/" + quote(channel, safe="") + "/" + quote(message, safe="") + "/retry"
+    try:
+        _, page = request_text(base + "/tasks", "operator-password-1", "ops")
+        assert endpoint in page and "重试消息" in page
+        _, page = request_text(base + "/tasks", "viewer-password-1", "reader")
+        assert endpoint not in page
+        for username, password, csrf, expected in (
+                ("reader", "viewer-password-1", server.csrf_token, 403),
+                ("ops", "operator-password-1", None, 403)):
+            try:
+                request(base + endpoint, password, "POST", {"reason": "attachment restored"},
+                        csrf, username=username)
+                assert False, "unauthorized retry must fail"
+            except HTTPError as error:
+                assert error.code == expected
+        status, result = request(base + endpoint, "operator-password-1", "POST",
+                                 {"reason": "attachment restored"}, server.csrf_token, username="ops")
+        assert status == 200 and result["status"] == "pending"
+        assert result["channel_id"] == channel and result["id"] == message
+        pending = store.pending_messages(channel)
+        assert len(pending) == 1 and pending[0]["id"] == message and pending[0]["attempts"] == 0
+        assert any(row["operator"] == "ops" and row["reason"] == "attachment restored"
+                   for row in store.list_audit())
+        try:
+            request(base + endpoint, "operator-password-1", "POST",
+                    {"reason": "double click"}, server.csrf_token, username="ops")
+            assert False, "pending message must not be replayed"
+        except HTTPError as error:
+            assert error.code == 409
+        _, page = request_text(base + "/tasks", "operator-password-1", "ops")
+        assert endpoint not in page
     finally:
         server.shutdown()
 

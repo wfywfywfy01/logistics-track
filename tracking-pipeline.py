@@ -8,8 +8,8 @@ import argparse, copy, json, re, subprocess, sys, os
 from datetime import datetime
 from pathlib import Path
 import openpyxl
-from storage import Storage, iso
-from official_tracking import result_hash
+from storage import Storage, TaskConflict, iso
+from official_tracking import delivery_confirmed, result_hash
 from carriers import detect_carrier
 
 DATA = Path((os.environ.get("LOGIBOT_DATA_DIR") or "data")); DATA.mkdir(parents=True, exist_ok=True)
@@ -190,22 +190,46 @@ def inherit_parent(it, db):
             it[k] = parent[k]
 
 
-def ingest_pair(order, intl, force=False):
+def ingest_pair(order, intl, force=False, silent=False):
     with LEDGER_LOCK:
         if force:
             current = STORE.get_shipment(order) or {}
             previous = current.get("intl") or ""
-            if previous and previous != intl and current.get("packages"):
+            if previous and previous != intl:
                 replaced = replace_package(
                     order, previous, intl, "system:ingest-pair", "forced tracking rebind")
                 if not replaced.get("replaced"):
                     return {"paired": False, "needs_review": True,
                             "reason": replaced.get("error") or "tracking replacement failed",
                             "order": order, "intl": intl}
-        return _ingest_pair(order, intl, force)
+        return _ingest_pair(order, intl, force, silent=silent)
 
-def _ingest_pair(order, intl, force=False):
+def _create_order_from_sales(order):
+    """面单先到、预报没到时的兜底:销售系统精确命中才建单(防 OCR 幽灵单)。"""
+    try:
+        sales = match_sales(order)
+    except Exception:
+        return None
+    if not sales.get("salesperson"):
+        return None
+    payload = {"orderNo": order, "status": "已预报", "history": [], "products": [],
+               "notified_status": None, "salesperson": sales["salesperson"],
+               "source": "sales-backfill"}
+    if sales.get("domestic"):
+        payload["domestic"] = sales["domestic"]
+    if sales.get("products"):
+        payload["products"] = [sales["products"]]
+    return STORE.mutate_shipment(order, lambda current: (current or payload, []),
+        create=True, audit={"entity_type": "shipment", "entity_id": order,
+                            "action": "auto_create", "operator": "system",
+                            "reason": "面单先到且销售系统命中,自动建单"})
+
+
+def _ingest_pair(order, intl, force=False, silent=False):
     it = STORE.get_shipment(order)
+    if not it:
+        # 订单没见过时先靠销售系统补建(精确命中才建),查不到才失败关闭进复核
+        it = _create_order_from_sales(order)
     if not it:
         STORE.enqueue_task("review", f"pair-review:{order}:{intl}",
                            {"reason": "unknown order", "order": order, "intl": intl})
@@ -246,12 +270,15 @@ def _ingest_pair(order, intl, force=False):
             event_at = iso()
             current.setdefault("history", []).append(
                 {"from": "已预报", "to": "已出国际单", "at": event_at,
-                 "observed_at": event_at, "detail": "tracking number paired"}
+                 "observed_at": event_at, "detail": "tracking number paired",
+                 "notification_suppressed": bool(silent)}
             )
             current["status"] = "已出国际单"
             current["status_observed_at"] = event_at
-            current["needs_notify"] = True
-            tasks = _event_notification_tasks(order, current, current["history"][-1])
+            if not silent:
+                current["needs_notify"] = True
+            tasks = [] if silent else _event_notification_tasks(
+                order, current, current["history"][-1])
         else:
             tasks = []
         outcome.update({"paired": order, "intl": intl,
@@ -281,6 +308,10 @@ def norm_status(s):
     if s in STAGES or s in EXCEPTIONS: return s
     low = s.lower()
     for k, v in ALIASES.items():
+        if k == "delivered":
+            if delivery_confirmed(low):
+                return v
+            continue
         if k in low: return v
     return None
 
@@ -312,29 +343,59 @@ def _official_node_text(shipment, event):
     return " ".join(str((event or {}).get("detail") or "").split())[:120]
 
 
-def _event_notification_tasks(order, shipment, event, channel_id=None, bot_app_id=None):
+def _family_key(order):
+    """分单家族键：母单 XSD123 和子单 XSD123-1/-2 归为同一家族。"""
+    return re.sub(r"-\d+$", "", order or "")
+
+
+def _family_recipients(shipments):
+    """按分单家族汇总录单人（去重保序）：同一单的所有录单人都收私聊。"""
+    families = {}
+    for order, shipment in (shipments or {}).items():
+        bucket = families.setdefault(_family_key(order), [])
+        name = (shipment.get("salesperson") or "").strip()
+        if name and name not in bucket:
+            bucket.append(name)
+    return families
+
+
+def _event_notification_tasks(order, shipment, event, channel_id=None, bot_app_id=None,
+                              recipients=None):
     status = event.get("to") or shipment.get("status", "-")
     event_key = event.get("at") or event.get("observed_at")
     if not event_key:
         return []
     product = (shipment.get("products") or [""])[0]
+    primary = (shipment.get("salesperson") or "").strip()
     prefix = "⚠️" if status in EXCEPTIONS else ""
     node = _official_node_text(shipment, event) or "官网节点待更新"
     line = prefix + "【物流小助手】%s %s→%s｜%s｜国际单 %s｜顺丰 %s｜%s｜录单人 %s" % (
         order, event.get("from", "-"), status, node, shipment.get("intl") or "-",
-        shipment.get("domestic") or "-", product[:24], shipment.get("salesperson") or "未匹配")
+        shipment.get("domestic") or "-", product[:24], primary or "未匹配")
     tasks = [{"kind": "notify_group", "dedupe_key": f"group:{order}:{event_key}",
               "payload": {"order": order, "status": status, "event_key": event_key,
                           "dedupe_key": f"group:{order}:{event_key}",
                           "channel_id": channel_id or os.environ.get("CHANNEL_ID") or "",
                           "body": line}}]
-    if shipment.get("salesperson"):
-        dm = "你的订单 %s 物流更新：%s｜%s（国际单 %s）" % (
-            order, status, node, shipment.get("intl") or "-")
-        tasks.append({"kind": "notify_dm", "dedupe_key": f"dm:{order}:{event_key}",
+    if recipients is None:
+        # Read family recipients while the caller holds the shipment write transaction;
+        # every event receives its full outbox even when several changes precede a drain.
+        recipients = _family_recipients(STORE.get_shipments()).get(_family_key(order), [])
+    names = list(dict.fromkeys(name for name in recipients if name))
+    if primary and primary not in names:
+        names.insert(0, primary)
+    for name in names:
+        if name == primary:
+            dm = "你的订单 %s 物流更新：%s｜%s（国际单 %s）" % (
+                order, status, node, shipment.get("intl") or "-")
+        else:
+            dm = "同单 %s 物流更新：%s｜%s（国际单 %s，录单人 %s）" % (
+                order, status, node, shipment.get("intl") or "-", primary or "未匹配")
+        tasks.append({"kind": "notify_dm", "dedupe_key": f"dm:{order}:{event_key}:{name}",
+                      "legacy_dedupe_key": f"dm:{order}:{event_key}" if name == primary else None,
                       "payload": {"order": order, "status": status,
-                                  "name": shipment["salesperson"],
-                                  "uid": shipment.get("salesperson_id"),
+                                  "name": name,
+                                  "uid": shipment.get("salesperson_id") if name == primary else None,
                                   "event_key": event_key,
                                   "bot_app_id": bot_app_id or os.environ.get("BOT_APP_ID"),
                                   "body": dm}})
@@ -628,6 +689,9 @@ def _track_update(order, status, detail="", observed_at=None, tracking=None,
 
     def update(it):
         cur = it.get("status", "已预报")
+        watermark = max((parse_observed_at(value) for value in (
+            it.get("status_observed_at"),
+            (it.get("last_observation") or {}).get("observed_at")) if value), default=None)
         reason = None
         if ns is None:
             reason = "unknown status"
@@ -636,7 +700,7 @@ def _track_update(order, status, detail="", observed_at=None, tracking=None,
             reason = "stale binding"
         elif tracking and tracking not in (it.get("intl"), it.get("alt_intl")):
             reason = "stale binding"
-        elif it.get("status_observed_at") and seen_at < parse_observed_at(it["status_observed_at"]):
+        elif watermark and seen_at < watermark:
             reason = "stale observation"
         elif cur in ("签收", "退回") and ns != cur:
             reason = "terminal status"
@@ -701,20 +765,28 @@ def resolve_user(name):
 # ---------- 通知 ----------
 def _queue_notifications(channel_id, bot_app_id=None, enqueue=True):
     queued = []
-    for order, it in STORE.get_shipments().items():
+    shipments = STORE.get_shipments()
+    families = _family_recipients(shipments)
+    for order, it in shipments.items():
         if not it.get("needs_notify"):
             continue
         h = (it.get("history") or [{}])[-1]
+        if h.get("notification_suppressed"):
+            continue
         if not h.get("at") and not h.get("observed_at"):
             h = {**h, "at": "legacy:%s:%s" % (
                 it.get("status", "-"), int(it.get("binding_version") or 0))}
-        tasks = _event_notification_tasks(order, it, h, channel_id, bot_app_id)
+        tasks = _event_notification_tasks(order, it, h, channel_id, bot_app_id,
+                                          families.get(_family_key(order)))
         line = tasks[0]["payload"]["body"]
         if enqueue:
             for task in tasks:
-                if (task["kind"] != "notify_dm" or
-                        it.get("dm_notified_event") != task["payload"]["event_key"]):
-                    STORE.enqueue_task(task["kind"], task["dedupe_key"], task["payload"])
+                primary_already_sent = (task["kind"] == "notify_dm" and
+                    task["payload"].get("name") == it.get("salesperson") and
+                    it.get("dm_notified_event") == task["payload"]["event_key"])
+                if not primary_already_sent:
+                    STORE.enqueue_task(task["kind"], task["dedupe_key"], task["payload"],
+                                       legacy_dedupe_key=task.get("legacy_dedupe_key"))
         queued.append({"order": order, "line": line})
     return queued
 
@@ -745,7 +817,7 @@ def _drain_notification_kind(kind, worker, channel_id=None, bot_app_id=None):
                 body = payload["body"]
                 if body.encode("utf-8").decode("utf-8") != body or "?" in body or "�" in body:
                     raise ValueError("group message failed UTF-8 validation")
-                STORE.mark_delivery_inflight(task["id"])
+                STORE.mark_delivery_inflight(task["id"], claim=task)
                 delivery_started = True
                 out = cli(["im", "+agent-notify", "--target", "im", "--agent-slug", "logistics-track",
                            "--agent-name", "物流小助手", "--bot-name", "物流小助手",
@@ -757,14 +829,14 @@ def _drain_notification_kind(kind, worker, channel_id=None, bot_app_id=None):
                     raise RuntimeError("group notification " + outcome)
                 STORE.complete_notification(task["id"], payload["order"], payload["event_key"],
                                             {"needs_notify": False,
-                                             "notified_status": payload["status"]}, out)
+                                             "notified_status": payload["status"]}, out, claim=task)
             else:
                 uid = payload.get("uid") or resolve_user(payload["name"])
                 if not uid: raise RuntimeError("recipient is missing or ambiguous")
                 app_id = payload.get("bot_app_id") or bot_app_id
                 args = (["im", "+bot-send-user", "--app-id", app_id, "--user-id", str(uid), "--body", payload["body"]]
                         if app_id else ["im", "+send-user", "--user-id", str(uid), "--body", payload["body"]])
-                STORE.mark_delivery_inflight(task["id"])
+                STORE.mark_delivery_inflight(task["id"], claim=task)
                 delivery_started = True
                 out = cli(args)
                 outcome = _delivery_outcome(out)
@@ -773,17 +845,21 @@ def _drain_notification_kind(kind, worker, channel_id=None, bot_app_id=None):
                     raise RuntimeError("direct notification " + outcome)
                 STORE.complete_notification(task["id"], payload["order"], payload["event_key"],
                                             {"dm_notified_status": payload["status"],
-                                             "dm_notified_event": payload["event_key"]}, out)
+                                             "dm_notified_event": payload["event_key"]}, out, claim=task)
             results.append({"order": payload["order"], "kind": kind, "ok": True})
+        except TaskConflict:
+            results.append({"order": payload.get("order"), "kind": kind,
+                            "ok": False, "reason": "task ownership changed"})
         except CliRejected as error:
-            STORE.fail_task(task["id"], str(error), max_attempts=10)
+            STORE.fail_task(task["id"], str(error), max_attempts=10, claim=task)
             results.append({"order": payload.get("order"), "kind": kind, "ok": False,
                             "unknown": False})
         except Exception as error:
             if delivery_started:
-                STORE.mark_task_unknown(task["id"], "delivery outcome unknown: " + str(error))
+                STORE.mark_task_unknown(task["id"], "delivery outcome unknown: " + str(error),
+                                        claim=task)
             else:
-                STORE.fail_task(task["id"], str(error), max_attempts=10)
+                STORE.fail_task(task["id"], str(error), max_attempts=10, claim=task)
             results.append({"order": payload.get("order"), "kind": kind, "ok": False,
                             "unknown": delivery_started})
     return results
@@ -811,6 +887,44 @@ def list_cmd(need_review=False):
                                 "status": g.get("status", ""), "product": (g.get("products") or [""])[0][:30]} for g in group]})
     return {"total": len(rows), "by_salesperson": out}
 
+def backfill_pairs(limit=200, silent=False, dry=False):
+    """重跑"面单已到、订单缺失"的复核队列:现在会自动去销售系统补建订单。"""
+    tasks = [row for row in STORE.list_issues(statuses=("pending",), limit=limit)
+             if row.get("kind") == "review" and row.get("source") == "task"]
+    summary = {"review_tasks": len(tasks), "created": 0, "paired": 0,
+               "skipped": 0, "silent": bool(silent), "dry": bool(dry), "items": []}
+    for row in sorted(tasks, key=lambda item: item.get("id") or 0):
+        payload = row.get("payload") or {}
+        order, intl = trim(payload.get("order")), trim(payload.get("intl"))
+        if not order or not intl:
+            summary["skipped"] += 1
+            continue
+        existed = STORE.get_shipment(order) is not None
+        if dry:
+            sales = {}
+            if not existed:
+                try:
+                    sales = match_sales(order) or {}
+                except Exception:
+                    sales = {}
+            summary["items"].append({"order": order, "intl": intl, "exists": existed,
+                                     "would_create": bool(sales.get("salesperson")),
+                                     "salesperson": sales.get("salesperson") or ""})
+            continue
+        outcome = ingest_pair(order, intl, silent=silent)
+        paired = bool(outcome.get("paired"))
+        if paired:
+            summary["paired"] += 1
+            summary["created"] += int(not existed)
+            STORE.resolve_task_by_dedupe(f"pair-review:{order}:{intl}", order,
+                                         "backfilled from sales system")
+        else:
+            summary["skipped"] += 1
+        summary["items"].append({"order": order, "intl": intl, "paired": paired,
+                                 "created": not existed, "reason": outcome.get("reason")})
+    return summary
+
+
 def main():
     p = argparse.ArgumentParser()
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -822,6 +936,8 @@ def main():
     h = sp.add_parser("package-update"); h.add_argument("--order", required=True); h.add_argument("--tracking", required=True); h.add_argument("--status", required=True); h.add_argument("--detail", default=""); h.add_argument("--observed-at"); h.add_argument("--binding-version", type=int); h.add_argument("--official-from-results", action="store_true"); h.add_argument("--official-result-hash")
     c = sp.add_parser("rematch"); c.add_argument("--order", required=True)
     d = sp.add_parser("list"); d.add_argument("--need-review", action="store_true")
+    j = sp.add_parser("backfill-pairs"); j.add_argument("--limit", type=int, default=200)
+    j.add_argument("--silent", action="store_true"); j.add_argument("--dry", action="store_true")
     e = sp.add_parser("notify"); e.add_argument("--channel-id", required=True); e.add_argument("--bot-app-id"); e.add_argument("--dry", action="store_true")
     args = p.parse_args()
     rc = 0
@@ -859,6 +975,12 @@ def main():
         rc = 2 if result.get("error") or result.get("reason") in (
             "unknown status", "stale binding", "conflicting observation") else 0
         print(json.dumps(result, ensure_ascii=False))
+    elif args.cmd == "backfill-pairs":
+        result = backfill_pairs(args.limit, args.silent, args.dry)
+        print(json.dumps({key: value for key, value in result.items() if key != "items"},
+                         ensure_ascii=False))
+        if args.dry or args.silent:
+            print(json.dumps(result["items"], ensure_ascii=False))
     elif args.cmd == "list": print(json.dumps(list_cmd(args.need_review), ensure_ascii=False))
     elif args.cmd == "notify":
         result = notify(args.channel_id, args.bot_app_id, args.dry); rc = 1 if result.get("failed") else 0

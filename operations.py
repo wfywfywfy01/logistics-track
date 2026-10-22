@@ -12,8 +12,19 @@ from storage import Storage
 def _datetime(value):
     if not value:
         return None
-    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _active_packages(shipment):
+    configured = shipment.get("packages") or []
+    if configured:
+        return [item for item in configured if item.get("active", True) and item.get("tracking")]
+    return ([{"tracking": shipment["intl"], "carrier": shipment.get("carrier")}]
+            if shipment.get("intl") else [])
 
 
 def _latest_activity(current, package, shipment):
@@ -23,10 +34,7 @@ def _latest_activity(current, package, shipment):
         values.extend(event.get(key) for key in ("occurred_at_utc", "occurred_at"))
     parsed = []
     for value in values:
-        try:
-            timestamp = _datetime(value)
-        except (TypeError, ValueError):
-            timestamp = None
+        timestamp = _datetime(value)
         if timestamp:
             parsed.append(timestamp)
     if parsed:
@@ -52,13 +60,8 @@ def refresh_operational_tasks(store, now=None, thresholds=None, freshness_hours=
 
     created = []
     for order, shipment in shipments.items():
-        configured_packages = shipment.get("packages") or []
-        packages = [item for item in configured_packages if item.get("active", True)]
-        if not configured_packages and shipment.get("intl"):
-            packages = [{"tracking": shipment.get("intl"),
-                         "carrier": shipment.get("carrier"), "active": True}]
-        if (configured_packages and not packages) or (not configured_packages and
-                                                       not shipment.get("intl")):
+        packages = _active_packages(shipment)
+        if not packages:
             clear_operational_tasks(order, "shipment has no active tracking number")
             continue
         result = results.get(order) or {}
@@ -87,16 +90,17 @@ def refresh_operational_tasks(store, now=None, thresholds=None, freshness_hours=
             tracking = current.get("tracking") or shipment.get("intl")
             carrier = current.get("carrier") or detect_carrier(tracking, shipment.get("carrier"))
             observed_value = current.get("observed_at") or "N/A"
-            if not current.get("ok") or observed_value == "N/A":
+            result_observed = _datetime(observed_value)
+            if not current.get("ok") or result_observed is None:
                 reason = ("official tracking failed" if not current.get("ok") else
                           "official tracking observation time unavailable")
-                error = current.get("error") or ("observed_at is missing" if observed_value == "N/A" else "N/A")
+                error = current.get("error") or ("observed_at is missing or invalid"
+                                                if result_observed is None else "N/A")
                 failure_tasks.append((f"tracking-failure:{order}:{tracking or 'N/A'}", {
                     "order": order, "tracking": tracking or "N/A", "carrier": carrier or "N/A",
                     "reason": reason, "observed_at": observed_value, "error": error}))
                 created.append((order, "tracking_failure"))
                 continue
-            result_observed = _datetime(observed_value)
             package_terminal = current.get("stage") in ("签收", "退回")
             if (not package_terminal and freshness_hours is not None and
                     (now - result_observed).total_seconds() >= freshness_hours * 3600):
@@ -114,9 +118,9 @@ def refresh_operational_tasks(store, now=None, thresholds=None, freshness_hours=
         package_by_tracking = {item.get("tracking"): item for item in packages}
         stalled_tasks = []
         for current in evaluations:
-            if not current.get("ok") or current.get("observed_at") in (None, "N/A"):
-                continue
             result_observed = _datetime(current.get("observed_at"))
+            if not current.get("ok") or result_observed is None:
+                continue
             if (freshness_hours is not None and
                     (now - result_observed).total_seconds() >= freshness_hours * 3600):
                 continue
@@ -158,14 +162,12 @@ def build_daily_report(store, now=None, freshness_hours=None):
                _datetime(event.get("at")).astimezone(ZoneInfo("Asia/Shanghai")).date() == local_day
                for event in shipment.get("history") or []):
             delivered.append(order)
-    missing = [order for order, shipment in shipments.items() if not shipment.get("intl")]
+    missing = [order for order, shipment in shipments.items() if not _active_packages(shipment)]
     unresolved = store.list_tasks(("pending", "retry", "dead", "unknown"))
     unresolved_count = store.task_count(("pending", "retry", "dead", "unknown"))
     freshness = {}
     for order, shipment in shipments.items():
-        packages = [item for item in (shipment.get("packages") or []) if item.get("active", True)]
-        if not packages and shipment.get("intl"):
-            packages = [{"tracking": shipment.get("intl"), "carrier": shipment.get("carrier")}]
+        packages = _active_packages(shipment)
         result = results.get(order) or {}
         package_results = result.get("package_results") or {}
         for package in packages:
@@ -187,10 +189,7 @@ def build_daily_report(store, now=None, freshness_hours=None):
             bucket["with_events"] += int(bool(row.get("events")))
             bucket["with_estimated_delivery"] += int(bool(row.get("estimated_delivery")))
             observed = row.get("observed_at")
-            try:
-                observed_time = _datetime(observed)
-            except (TypeError, ValueError):
-                observed_time = None
+            observed_time = _datetime(observed)
             bucket["missing_observed_at"] += int(observed_time is None)
             if freshness_hours != "N/A" and observed_time is not None:
                 bucket["stale"] += int((now - observed_time).total_seconds() >= freshness_hours * 3600)

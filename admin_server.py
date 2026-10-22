@@ -71,7 +71,7 @@ document.addEventListener('submit', async event => {
   buttons.forEach(item => item.disabled = true);
   if (feedback) { feedback.hidden = false; feedback.textContent = '正在提交…'; }
   try {
-    const response = await fetch(button?.formAction || form.action, {
+    const response = await fetch(button?.hasAttribute('formaction') ? button.formAction : form.action, {
       method: 'POST', credentials: 'same-origin',
       headers: {'Content-Type': 'application/json',
                 'X-CSRF-Token': document.querySelector('meta[name=csrf]').content},
@@ -540,7 +540,8 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                 except Exception:
                     database = "error"
                 return self._json(200 if database == "ok" else 503,
-                                  {"ok": database == "ok", "database": database})
+                                  {"ok": database == "ok", "database": database,
+                                   "release": os.environ.get("LOGISTICS_RELEASE_SHA") or "unknown"})
             principal = self._principal()
             if parsed.path == "/login":
                 return self._redirect("/orders") if principal else self._login_page()
@@ -681,8 +682,8 @@ def create_server(store, token, host="127.0.0.1", port=8080):
             if parsed.path == "/tasks":
                 try: page_number = int((params.get("page") or ["1"])[0])
                 except ValueError: page_number = 1
-                filters = {key: (params.get(key) or [""])[0] for key in ("kind", "status", "order")}
-                page_number = max(1, page_number)
+                filters = {key: (params.get(key) or [""])[0].strip() for key in ("kind", "status", "order")}
+                page_number = max(1, min(page_number, sys.maxsize // 25))
                 rows, total = store.issues_page(kind=filters["kind"], status=filters["status"],
                     order=filters["order"], limit=25, offset=(page_number - 1) * 25)
                 if total and not rows:
@@ -803,6 +804,12 @@ def create_server(store, token, host="127.0.0.1", port=8080):
                 return self._json(200, result)
             if principal["role"] not in ("admin", "operator"):
                 return self._json(403, {"error": "permission denied"})
+            if len(parts) == 5 and parts[:2] == ["api", "messages"] and parts[4] == "retry":
+                try:
+                    result = store.retry_message(unquote(parts[2]), unquote(parts[3]), operator, reason)
+                except TaskConflict as error:
+                    return self._json(409, {"error": str(error)})
+                return self._json(200, result) if result else self._json(404, {"error": "message not found"})
             if len(parts) == 4 and parts[:2] == ["api", "inbox"] and parts[3] == "retry":
                 try: result = store.retry_inbox(unquote(parts[2]), operator, reason)
                 except TaskConflict as error: return self._json(409, {"error": str(error)})

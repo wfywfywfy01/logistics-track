@@ -5,6 +5,7 @@ from ups_track import classify_status as classify_ups
 import ups_track
 import sys
 import types
+import pytest
 
 
 class _LateResponsePage:
@@ -90,6 +91,38 @@ def test_known_carrier_statuses_are_classified():
     assert classify_fedex("DL", "Delivered") == "签收"
     assert classify_fedex("DE", "Delivery exception") == "异常"
     assert classify_fedex("RP", "Return label link emailed") is None
+
+
+@pytest.mark.parametrize("description", [
+    "Shipment not delivered", "Shipment could not be delivered", "Undelivered",
+    "Package will be delivered tomorrow", "Package is scheduled to be delivered",
+])
+def test_negative_or_future_delivery_text_is_not_a_delivery_confirmation(description):
+    assert classify_fedex("DE", description) == "异常"
+    assert classify_fedex("", description) != "签收"
+    assert classify_dhl("failure", description) != "签收"
+    assert classify_ups("", description) != "签收"
+
+
+def test_explicit_carrier_code_and_positive_delivery_text_remain_supported():
+    assert classify_fedex("IT", "Package will be delivered tomorrow") == "运输中"
+    assert classify_fedex("RS", "Delivered to shipper") == "退回"
+    for classify in (classify_fedex, classify_dhl, classify_ups):
+        assert classify("", "Shipment has been delivered") == "签收"
+        assert classify("", "Delivered - Signed for by recipient") == "签收"
+
+
+def test_fedex_dom_requires_requested_tracking_and_standalone_status_heading():
+    from fedex_track import page_failure, parse_dom_status
+
+    for body in (
+            "Help center\nWhy was my package not delivered?",
+            "876543210123\nHelp: My package says DELIVERED.",
+            "876543210999\nDELIVERED\nMEMPHIS, TN US",
+            "DELIVERED\nMEMPHIS, TN US"):
+        assert parse_dom_status("876543210123", body) is None
+        assert page_failure("876543210123", [403], body)["ok"] is False
+    assert parse_dom_status("876543210123", "Tracking number: 8765 4321 0123\nDELIVERED")["stage"] == "签收"
 
 
 def test_carrier_detection_prefers_explicit_carrier_and_fails_closed():
@@ -337,7 +370,7 @@ def test_fedex_uses_official_page_without_api_credentials(monkeypatch):
 def test_fedex_dom_status_parsed_when_api_blocked():
     from fedex_track import parse_dom_status, page_failure
 
-    body = ("DELIVERED\nThursday, 9/10/2026 at 10:45 AM\nMEMPHIS, TN US\n"
+    body = ("Tracking number: 876543210123\nDELIVERED\nThursday, 9/10/2026 at 10:45 AM\nMEMPHIS, TN US\n"
             "Package delivered to recipient")
     result = parse_dom_status("876543210123", body)
 
@@ -359,6 +392,14 @@ def test_fedex_dom_status_prefers_heading_over_scan_history():
     assert dom_status_hint(body) == ("签收", "DELIVERED")
     assert dom_status_hint("no carrier text here") is None
     assert dom_status_hint("") is None
+
+
+def test_fedex_dom_does_not_promote_history_delivery_to_current_status():
+    from fedex_track import parse_dom_status
+
+    body = "Tracking number: 876543210123\nON THE WAY\nShipment history\nDELIVERED\nOctober 2"
+    assert parse_dom_status("876543210123", body)["stage"] == "运输中"
+    assert parse_dom_status("876543210123", body.replace("ON THE WAY", "STATUS UNAVAILABLE")) is None
 
 
 def test_fedex_page_failure_distinguishes_not_found_from_access_denied():
@@ -384,7 +425,7 @@ def test_fedex_dom_success_wins_over_late_api_parse_error(monkeypatch):
     import fedex_track
     response = _LateResponse(
         "https://api.fedex.com/track/v2/shipments", ValueError("invalid JSON"))
-    page = _LateResponsePage(response, "DELIVERED\nMEMPHIS, TN US", send_on_goto=True)
+    page = _LateResponsePage(response, "876543210123\nDELIVERED\nMEMPHIS, TN US", send_on_goto=True)
     _install_fake_browser(monkeypatch, page)
     clock = iter((0, 0, 2))
     monkeypatch.setattr(fedex_track.time, "time", lambda: next(clock))
