@@ -6,7 +6,7 @@
 """
 import json, os, sys, time
 from datetime import datetime, timezone
-from official_tracking import delivery_confirmed
+from official_tracking import delivery_confirmed, latest_event as select_latest_event
 
 
 def _location(value):
@@ -61,7 +61,8 @@ def parse_tracking_response(tn, shipment):
         return {"tracking": tn, "ok": False, "error": "unknown DHL status",
                 "status_en": desc}
     events = [_event(item) for item in (shipment.get("events") or [])]
-    latest_event = events[0] if events else _event(st)
+    current_event = _event(st)
+    latest_event = select_latest_event([current_event] + events)
     frame = shipment.get("estimatedDeliveryTimeFrame") or {}
     eta = None
     if frame.get("estimatedFrom") or frame.get("estimatedThrough"):

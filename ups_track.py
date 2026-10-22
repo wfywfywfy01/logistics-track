@@ -4,7 +4,7 @@
 后台执行：窗口移出屏幕，无前台弹窗。"""
 import sys, json, os, time
 from datetime import datetime, timezone
-from official_tracking import delivery_confirmed
+from official_tracking import delivery_confirmed, latest_event as select_latest_event
 
 STAGE_MAP = {
     "D": "签收", "I": "运输中", "P": "已出国际单", "M": "已出国际单", "O": "运输中",
@@ -124,7 +124,7 @@ def parse_tracking_response(tn, payload):
         latest_text = f"{latest.get('date','')} {latest.get('time','')} " \
                       f"{latest.get('location','')} {latest.get('name','')}".strip()
     events = [_ups_event(item) for item in (detail.get("shipmentProgressActivities") or [])]
-    latest_event = events[0] if events else ({
+    latest_event = select_latest_event(events, {
         "source_time_text": " ".join(x for x in (
             latest.get("date") or "", latest.get("time") or "") if x),
         "occurred_at_utc": "N/A", "timezone_offset": "",

@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 from carriers import detect_carrier
+from official_tracking import result_matches_package
 from storage import Storage
 
 
@@ -23,13 +24,26 @@ def _active_packages(shipment):
     configured = shipment.get("packages") or []
     if configured:
         return [item for item in configured if item.get("active", True) and item.get("tracking")]
-    return ([{"tracking": shipment["intl"], "carrier": shipment.get("carrier")}]
+    return ([{"tracking": shipment["intl"], "carrier": shipment.get("carrier"),
+              "binding_version": shipment.get("binding_version"),
+              "binding_history": shipment.get("binding_history")}]
             if shipment.get("intl") else [])
+
+
+def _package_result(result, package):
+    package_results = result.get("package_results") or {}
+    candidate = package_results.get(package.get("tracking"))
+    if candidate is None and not package_results:
+        candidate = result
+    return candidate if result_matches_package(candidate, package) else {}
 
 
 def _latest_activity(current, package, shipment):
     latest = current.get("latest_event") or {}
     values = [latest.get(key) for key in ("occurred_at_utc", "occurred_at")]
+    if latest and not any(_datetime(value) for value in values):
+        # Older dated scans cannot establish the age of an undated current node.
+        return None
     for event in current.get("events") or []:
         values.extend(event.get(key) for key in ("occurred_at_utc", "occurred_at"))
     parsed = []
@@ -65,24 +79,14 @@ def refresh_operational_tasks(store, now=None, thresholds=None, freshness_hours=
             clear_operational_tasks(order, "shipment has no active tracking number")
             continue
         result = results.get(order) or {}
-        package_results = result.get("package_results") or {}
-        if packages:
-            evaluations = []
-            for package in packages:
-                tracking = package.get("tracking")
-                matched = package_results.get(tracking)
-                if matched is None and not package_results and result.get("tracking") == tracking:
-                    matched = result
-                current = dict(matched or {})
-                current.setdefault("tracking", tracking)
-                current.setdefault("carrier", package.get("carrier"))
-                if not matched:
-                    current.update({"ok": False, "error": "package result is missing"})
-                evaluations.append(current)
-        elif package_results:
-            evaluations = list(package_results.values())
-        else:
-            evaluations = [result]
+        evaluations = []
+        for package in packages:
+            current = dict(_package_result(result, package))
+            if not current:
+                current.update({"ok": False, "error": "current package binding result is missing"})
+            current.setdefault("tracking", package.get("tracking"))
+            current.setdefault("carrier", package.get("carrier"))
+            evaluations.append(current)
 
         failure_tasks = []
         stale_tasks = []
@@ -169,13 +173,9 @@ def build_daily_report(store, now=None, freshness_hours=None):
     for order, shipment in shipments.items():
         packages = _active_packages(shipment)
         result = results.get(order) or {}
-        package_results = result.get("package_results") or {}
         for package in packages:
             tracking = package.get("tracking")
-            if package_results:
-                row = package_results.get(tracking) or {}
-            else:
-                row = result if result.get("tracking") in (None, tracking) else {}
+            row = _package_result(result, package)
             carrier = (package.get("carrier") or row.get("carrier") or
                        detect_carrier(tracking) or "N/A")
             bucket = freshness.setdefault(
