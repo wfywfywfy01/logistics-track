@@ -1,5 +1,7 @@
 import copy
 import json
+import subprocess
+import tarfile
 from types import SimpleNamespace
 import urllib.error
 import urllib.parse
@@ -221,9 +223,82 @@ def test_successful_release_keeps_backup_and_stopped_rollback_container(monkeypa
     assert not harness.containers[OLD_ID]["State"]["Running"]
     assert harness.containers[OLD_ID]["Name"].startswith("/logistics-track-rollback-")
     assert any("backup.py" in command and "--no-upload" in command for command in commands)
+    assert ["git", "archive", "--format=tar", REVISION] in commands
+    assert any(command[0] == "docker" and "build" in command and command[-1] == "-"
+               and "SOURCE_REVISION=" + REVISION in command for command in commands)
     assert harness.created_config["Env"][-1] == "LOGISTICS_RELEASE_SHA=" + REVISION
     assert harness.created_config["Image"] == "sha256:built-image"
     assert "DUMMY_RUNTIME_SECRET" not in capsys.readouterr().out
+
+
+def test_build_context_uses_exact_commit_and_excludes_dirty_and_untracked_files(tmp_path, monkeypatch):
+    real_run = subprocess.run
+
+    def git(*args):
+        return real_run(["git", *args], cwd=tmp_path, check=True, capture_output=True,
+                        text=True, encoding="utf-8", timeout=60).stdout.strip()
+
+    git("init")
+    git("config", "core.autocrlf", "false")
+    git("config", "core.hooksPath", str(tmp_path / "no-hooks"))
+    (tmp_path / "deploy").mkdir()
+    (tmp_path / "deploy" / "Dockerfile").write_bytes(b"FROM scratch\nCOPY app.py /app.py\n")
+    (tmp_path / "app.py").write_bytes(b"print('selected commit')\n")
+    git("add", ".")
+    git("-c", "user.name=Release Test", "-c", "user.email=release@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "-m", "selected commit")
+    revision = git("rev-parse", "HEAD")
+    (tmp_path / "app.py").write_text("print('later commit')\n", encoding="utf-8")
+    git("add", ".")
+    git("-c", "user.name=Release Test", "-c", "user.email=release@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "-m", "later commit")
+    (tmp_path / "app.py").write_text("LOCAL_DIRTY_SECRET\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("LOCAL_UNTRACKED_SECRET\n", encoding="utf-8")
+    archive_files = {}
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs["timeout"]))
+        if command[0] == "git":
+            return real_run(command, **kwargs)
+        assert command == ["docker", "-H", "tcp://docker.test:2375", "build", "--build-arg",
+                           "SOURCE_REVISION=" + revision, "-f", "deploy/Dockerfile",
+                           "-t", "logistics-track:test", "-"]
+        with tarfile.open(fileobj=kwargs["stdin"], mode="r:") as archive:
+            archive_files.update({member.name: archive.extractfile(member).read()
+                                  for member in archive.getmembers() if member.isfile()})
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(release, "__file__", str(tmp_path / "deploy" / "release.py"))
+    monkeypatch.setattr(release.subprocess, "run", run)
+    release.build_image(["docker", "-H", "tcp://docker.test:2375"], "logistics-track:test", revision)
+    assert archive_files == {"app.py": b"print('selected commit')\n",
+                            "deploy/Dockerfile": b"FROM scratch\nCOPY app.py /app.py\n"}
+    assert calls[0] == (["git", "archive", "--format=tar", revision], 60)
+    assert calls[1][1] == 1200
+
+
+@pytest.mark.parametrize("failed_stage", ["git", "docker"])
+def test_archive_or_build_failure_keeps_old_service_untouched(monkeypatch, failed_stage):
+    harness = DockerHarness()
+    setup_main(monkeypatch, harness)
+    default_run = release.subprocess.run
+    build_calls = []
+
+    def fail_build(command, **kwargs):
+        if command[0] == "docker" and "build" in command:
+            build_calls.append(command)
+        if command[0] == failed_stage:
+            raise subprocess.CalledProcessError(1, command)
+        return default_run(command, **kwargs)
+
+    monkeypatch.setattr(release.subprocess, "run", fail_build)
+    with pytest.raises(subprocess.CalledProcessError):
+        release.main()
+    assert harness.calls == [("GET", "/containers/logistics-track/json")]
+    assert harness.containers[OLD_ID]["State"]["Running"]
+    assert harness.containers[OLD_ID]["Name"] == "/logistics-track"
+    assert bool(build_calls) == (failed_stage == "docker")
 
 
 @pytest.mark.parametrize("running", [False, True])

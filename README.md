@@ -59,7 +59,7 @@ python fedex_track.py 876543210123
 
 ## 部署（Docker）
 
-现有生产服务升级使用 `python deploy/release.py <完整 master SHA> --docker-host <可信管理面地址> --expected-image <当前镜像 ID>` 预检；加 `--execute` 才发布。脚本验证该提交的 CI，保存备份，复用当前配置，保留旧容器，健康失败自动回滚。镜像 OCI revision 与 `/healthz.release` 均可核对实际代码版本。Docker 管理面仅在受信任网络使用，勿公开暴露。
+现有生产服务升级先 `git fetch origin master`，再使用 `python deploy/release.py <完整 master SHA> --docker-host <可信管理面地址> --expected-image <当前镜像 ID>` 预检；加 `--execute` 才发布。脚本验证该提交的 CI，通过 `git archive` 导出固定提交（不包含工作区未提交文件）上传构建，保存备份，复用当前配置，保留旧容器，健康失败自动回滚。镜像 OCI revision 与 `/healthz.release` 均可核对实际代码版本。Docker 管理面仅在受信任网络使用，勿公开暴露。
 
 本轮回归与线上验收流程见 [ACCEPTANCE-20261022.md](ACCEPTANCE-20261022.md)。以下命令用于首次创建服务。
 

@@ -7,9 +7,11 @@ import argparse
 import copy
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 import re
 import secrets
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -17,6 +19,18 @@ import urllib.request
 
 
 REPO = "wfywfywfy01/logistics-track"
+
+
+def build_image(docker, image, revision):
+    """Stream only the requested Git commit, never the local working tree."""
+    repo = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryFile() as context:
+        subprocess.run(["git", "archive", "--format=tar", revision], cwd=repo,
+                       stdout=context, stderr=subprocess.PIPE, check=True, timeout=60)
+        context.seek(0)
+        subprocess.run(docker + ["build", "--build-arg", "SOURCE_REVISION=" + revision,
+                       "-f", "deploy/Dockerfile", "-t", image, "-"],
+                       stdin=context, check=True, timeout=1200)
 
 
 def replacement_config(old, image, revision):
@@ -168,8 +182,7 @@ def main():
     if not args.execute:
         return
     docker = ["docker", "-H", args.docker_host]
-    subprocess.run(docker + ["build", "--build-arg", "SOURCE_REVISION=" + args.revision,
-        "-f", "deploy/Dockerfile", "-t", image, f"https://github.com/{REPO}.git#{args.revision}"], check=True)
+    build_image(docker, image, args.revision)
     built = api("/images/" + urllib.parse.quote(image, safe="") + "/json")
     if built["Config"]["Labels"].get("org.opencontainers.image.revision") != args.revision:
         raise RuntimeError("built image revision mismatch")
