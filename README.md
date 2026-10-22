@@ -59,6 +59,10 @@ python fedex_track.py 876543210123
 
 ## 部署（Docker）
 
+现有生产服务升级使用 `python deploy/release.py <完整 master SHA> --docker-host <可信管理面地址> --expected-image <当前镜像 ID>` 预检；加 `--execute` 才发布。脚本验证该提交的 CI，保存备份，复用当前配置，保留旧容器，健康失败自动回滚。镜像 OCI revision 与 `/healthz.release` 均可核对实际代码版本。Docker 管理面仅在受信任网络使用，勿公开暴露。
+
+本轮回归与线上验收流程见 [ACCEPTANCE-20261022.md](ACCEPTANCE-20261022.md)。以下命令用于首次创建服务。
+
 ```bash
 cp deploy/.env.example deploy/.env   # 填 Vertu 认证 / XRAY_* 出口节点 / OCR_* 等
 docker build -f deploy/Dockerfile -t logistics-track:latest .
@@ -108,4 +112,4 @@ FedEx、DHL 和 UPS 均从官网页面获取状态，失败时不会猜测结果
 
 ## 环境变量
 
-见 `deploy/.env.example`，全部变量均有注释。必填：`VERTU_*` 四项、`CHANNEL_ID`、`XRAY_PASS`（无出口代理官网抓取会失败）；上游为 SOCKS5 时另填 `XRAY_PROTOCOL=socks5` 和 `XRAY_USER`。
+见 `deploy/.env.example`，全部变量均有注释。必填：`VERTU_*` 四项、`CHANNEL_ID`。内置出口代理填写 `XRAY_PASS`；上游为 SOCKS5 时另填 `XRAY_PROTOCOL=socks5` 和 `XRAY_USER`。不启用内置代理时保留外部 `UPS_PROXY` 配置，未配置则直连；能否抓取仍须在实际服务器验证。

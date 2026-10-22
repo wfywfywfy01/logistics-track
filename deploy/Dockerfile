@@ -38,6 +38,9 @@ RUN curl -fsSL --retry 3 --max-time 300 -o /tmp/xray.zip \
     && xray version | head -1
 
 # 服务代码
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+ENV LOGISTICS_RELEASE_SHA=$SOURCE_REVISION
 COPY . /app
 WORKDIR /app
 

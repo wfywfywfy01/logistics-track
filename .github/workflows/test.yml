@@ -11,3 +11,4 @@ jobs:
       - run: pip install -r deploy/requirements.txt pytest
       - run: python -m pytest -q
       - run: python -m compileall -q .
+      - run: bash -n deploy/entrypoint.sh
