@@ -17,11 +17,13 @@ import json
 import os
 import subprocess
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+import robust
+
 WORK_FILE = REPO / "_local_work_ups.json"
 OUT_FILE = REPO / "_local_ups_results.json"
 DOCKER_HOST = os.environ.get("DOCKER_HOST", "tcp://10.100.0.176:2375")
@@ -29,7 +31,7 @@ CONTAINER = "logistics-track"
 
 EXPORT_CODE = """
 import json, sqlite3
-connection = sqlite3.connect("/app/data/shipments.db")
+connection = sqlite3.connect("file:/app/data/shipments.db?mode=ro", uri=True)
 work = []
 for order, payload in connection.execute("select order_no, payload from shipments"):
     data = json.loads(payload)
@@ -42,26 +44,30 @@ for order, payload in connection.execute("select order_no, payload from shipment
         if tracking.startswith("1Z"):
             work.append({"order": order, "tracking": tracking,
                          "carrier": package.get("carrier") or "UPS",
-                         "status": data.get("status") or "",
+                         "status": package.get("status") or data.get("status") or "",
+                         "active": package.get("active", True),
                          "binding_version": int(package.get("binding_version") or 0)})
 print(json.dumps(work, ensure_ascii=False))
 """
 
 
-def docker(*args, capture=True):
+def docker(*args, capture=True, input=None, timeout=120):
     env = dict(os.environ, DOCKER_HOST=DOCKER_HOST)
-    return subprocess.run(["docker"] + list(args), capture_output=capture,
-                          env=env, check=False)
+    result = subprocess.run(["docker"] + list(args), capture_output=capture,
+                            env=env, input=input, timeout=timeout, check=False)
+    result.check_returncode()
+    return result
+
+
+def save_json(path, value):
+    if not robust.atomic_write_json(path, value):
+        raise OSError("Could not atomically save " + str(path))
 
 
 def export_worklist():
-    result = docker("exec", "-i", CONTAINER, "python3", "-", capture=True) if False else None
-    process = subprocess.run(
-        ["docker", "exec", "-i", CONTAINER, "python3", "-"],
-        input=EXPORT_CODE.encode("utf-8"), capture_output=True,
-        env=dict(os.environ, DOCKER_HOST=DOCKER_HOST), check=False)
+    process = docker("exec", "-i", CONTAINER, "python3", "-", input=EXPORT_CODE.encode("utf-8"))
     items = json.loads(process.stdout.decode("utf-8"))
-    WORK_FILE.write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+    save_json(WORK_FILE, items)
     print("导出待查清单: %d 单" % len(items), flush=True)
     return items
 
@@ -69,29 +75,29 @@ def export_worklist():
 def load_json(path, default):
     if not path.exists():
         return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
-    except Exception:
-        return default
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 TERMINAL_STATUSES = ("签收", "退回")
 
 
 def fetch_pending(work, limit=0, retry_failed=False, refresh_active=False):
-    sys.path.insert(0, str(REPO))
-    from patchright.sync_api import sync_playwright
     import ups_track
 
     results = load_json(OUT_FILE, {})
     pending = []
     for item in work:
+        if item.get("active") is False or item.get("status") in TERMINAL_STATUSES:
+            continue
         previous = results.get(item["tracking"])
+        if previous and (previous.get("order") != item["order"] or
+                         previous.get("tracking") != item["tracking"] or
+                         int(previous.get("binding_version") or 0) != int(item.get("binding_version") or 0)):
+            previous = None
         if previous and previous.get("ok"):
-            # 每日刷新:已抓成功但台账未到终态的单仍然重抓
-            if not (refresh_active and item.get("status") not in TERMINAL_STATUSES):
+            if not refresh_active:
                 continue
-        elif previous and not retry_failed:
+        elif previous and not (retry_failed or refresh_active):
             continue
         pending.append(item)
     if limit:
@@ -101,55 +107,23 @@ def fetch_pending(work, limit=0, retry_failed=False, refresh_active=False):
         return results
 
     done = ok = 0
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(
-            headless=False, channel="chrome", args=["--window-position=4000,4000"])
-        context = browser.new_context(locale="en-US", viewport={"width": 1366, "height": 768})
-        for item in pending:
-            page = context.new_page()
-            payloads = []
-
-            def on_response(response, sink=payloads):
-                if "GetStatus" in response.url:
-                    try:
-                        sink.append(response.json())
-                    except Exception:
-                        pass
-
-            page.on("response", on_response)
-            parsed = None
-            try:
-                page.goto("https://www.ups.com/track?tracknum=%s&loc=en_US" % item["tracking"],
-                          timeout=60000, wait_until="domcontentloaded")
-                deadline = time.time() + 25
-                while time.time() < deadline and not payloads:
-                    page.wait_for_timeout(500)
-                for payload in payloads:
-                    parsed = ups_track.parse_tracking_response(item["tracking"], payload)
-                    if parsed:
-                        break
-            except Exception as error:
-                parsed = {"tracking": item["tracking"], "ok": False,
-                          "error": type(error).__name__ + ": " + str(error)[:120]}
-            page.close()
-            if parsed is None:
-                parsed = {"tracking": item["tracking"], "ok": False, "error": "no GetStatus data"}
-            parsed["order"] = item["order"]
-            parsed["observed_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            parsed["binding_version"] = item.get("binding_version", 0)
-            parsed["carrier"] = item.get("carrier") or "UPS"
-            results[item["tracking"]] = parsed
-            done += 1
-            ok += int(bool(parsed.get("ok")))
-            if done % 3 == 0 or not parsed.get("ok"):
-                OUT_FILE.write_text(json.dumps(results, ensure_ascii=False, indent=1),
-                                    encoding="utf-8")
-            print("[%d/%d] %s %s -> %s" % (
-                done, len(pending), item["order"], item["tracking"],
-                parsed.get("stage") or ("ERR: " + str(parsed.get("error"))[:50])), flush=True)
-        browser.close()
-    OUT_FILE.write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
+    for item in pending:
+        # Reuse the shared response drain and bounded fresh-browser retry logic.
+        parsed = ups_track.track_ups(item["tracking"], proxy="", browser_channel="chrome")
+        parsed["order"] = item["order"]
+        parsed["observed_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        parsed["binding_version"] = item.get("binding_version", 0)
+        parsed["carrier"] = item.get("carrier") or "UPS"
+        results[item["tracking"]] = parsed
+        save_json(OUT_FILE, results)
+        done += 1
+        ok += int(bool(parsed.get("ok")))
+        print("[%d/%d] %s %s -> %s" % (
+            done, len(pending), item["order"], item["tracking"],
+            parsed.get("stage") or ("ERR: " + str(parsed.get("error"))[:50])), flush=True)
     print("抓取完成:本轮 %d 单,成功 %d,累计 %d" % (done, ok, len(results)), flush=True)
+    if not ok:
+        raise RuntimeError("UPS local channel returned no successful tracking results")
     return results
 
 
@@ -157,12 +131,10 @@ def apply_results():
     merge_script = REPO / "tools" / "server_merge_local_results.py"
     docker("cp", str(OUT_FILE), "%s:/tmp/local_ups_results.json" % CONTAINER)
     docker("cp", str(merge_script), "%s:/tmp/merge_local.py" % CONTAINER)
-    merged = docker("exec", CONTAINER, "sh", "-c",
-                    "cd /app && PYTHONPATH=/app python /tmp/merge_local.py /tmp/local_ups_results.json")
-    print("合并:", merged.stdout.decode("utf-8", "replace").strip(), flush=True)
-    wired = docker("exec", CONTAINER, "sh", "-c",
-                   "cd /app && python wire_results.py 2>&1 | tail -1")
-    print("应用:", wired.stdout.decode("utf-8", "replace").strip(), flush=True)
+    merged = docker("exec", "-w", "/app", "-e", "PYTHONPATH=/app", CONTAINER,
+                    "python", "/tmp/merge_local.py", "/tmp/local_ups_results.json", "--apply", timeout=1800)
+    summary = merged.stdout.decode("utf-8", "replace").strip().splitlines()
+    print("合并应用:", summary[-1] if summary else "", flush=True)
 
 
 def main():
@@ -175,11 +147,12 @@ def main():
                         help="台账未到终态的单即使抓过也重抓(每日任务用)")
     options = parser.parse_args()
 
-    if not options.apply_only:
-        work = export_worklist()
-        fetch_pending(work, options.limit, options.retry_failed, options.refresh_active)
-    if not options.skip_apply:
-        apply_results()
+    with robust.FileLock(OUT_FILE.with_suffix(".lock"), timeout=1):
+        if not options.apply_only:
+            work = export_worklist()
+            fetch_pending(work, options.limit, options.retry_failed, options.refresh_active)
+        if not options.skip_apply and (options.apply_only or OUT_FILE.exists()):
+            apply_results()
 
 
 if __name__ == "__main__":

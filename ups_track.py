@@ -99,6 +99,9 @@ def _ups_event(item):
 def parse_tracking_response(tn, payload):
     if not isinstance(payload, dict):
         return None
+    if str(payload.get("statusCode") or "") == "402" and payload.get("statusText") == "Invalid Request":
+        return {"tracking": tn, "ok": False, "request_rejected": True,
+                "error": "UPS official request rejected (code 402: Invalid Request)"}
     wanted = str(tn).strip().upper()
     detail = next((item for item in (payload.get("trackDetails") or [])
                    if str(item.get("trackingNumber") or "").strip().upper() == wanted), None)
@@ -165,7 +168,7 @@ def parse_tracking_response(tn, payload):
                        for item in milestones],
     }
 
-def _track_once(tn, timeout_nav, wait_ms, proxy):
+def _track_once(tn, timeout_nav, wait_ms, proxy, browser_channel=None):
     """proxy: SOCKS5 代理 URL, 形如 socks5://user:pass@host:port。
     不传则读环境变量 UPS_PROXY。中国数据中心出口直连会被 UPS 的 Akamai 杀 HTTP2,
     必须走海外代理(实测美国节点 GetStatus 200)。"""
@@ -174,7 +177,10 @@ def _track_once(tn, timeout_nav, wait_ms, proxy):
         args = ["--no-sandbox", "--window-position=4000,4000"]
         if os.environ.get("UPS_DISABLE_HTTP2") == "1":
             args.append("--disable-http2")
-        b = p.chromium.launch(headless=False, args=args)
+        launch_options = {"headless": False, "args": args}
+        if browser_channel:
+            launch_options["channel"] = browser_channel
+        b = p.chromium.launch(**launch_options)
         kw = {"locale": "en-US", "viewport": {"width":1366, "height":768}}
         if proxy:
             kw["proxy"] = {"server": proxy}
@@ -219,20 +225,24 @@ def _track_once(tn, timeout_nav, wait_ms, proxy):
     if parse_errors:
         return {"tracking": tn, "ok": False,
                 "error": "UPS response parse failed: " + parse_errors[-1]}
+    if responses:
+        return {"tracking": tn, "ok": False,
+                "error": "UPS response did not contain matching tracking data"}
     return {"tracking": tn, "ok": False, "error": "no GetStatus data"}
 
 
-def track_ups(tn, timeout_nav=60000, wait_ms=25000, proxy=None, attempts=2):
+def track_ups(tn, timeout_nav=60000, wait_ms=25000, proxy=None, attempts=2, browser_channel=None):
     """Retry with a fresh browser because stale UPS sessions commonly miss GetStatus."""
     proxy = proxy if proxy is not None else (os.environ.get("UPS_PROXY") or None)
     last = None
     for attempt in range(attempts):
         try:
-            last = _track_once(tn, timeout_nav, wait_ms, proxy)
+            last = _track_once(tn, timeout_nav, wait_ms, proxy, browser_channel)
         except Exception as error:
             last = {"tracking": tn, "ok": False,
                     "error": type(error).__name__ + ": " + str(error)[:150]}
-        if last.get("ok") or last.get("not_found") or last.get("error") == "unknown UPS status":
+        if (last.get("ok") or last.get("not_found") or last.get("request_rejected") or
+                last.get("error") == "unknown UPS status"):
             return last
         if attempt + 1 < attempts:
             time.sleep(attempt + 1)

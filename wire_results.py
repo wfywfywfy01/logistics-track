@@ -13,12 +13,14 @@ def run_pipeline(args):
     return result.returncode, result.stdout.decode("utf-8", errors="replace").strip()
 
 
-def apply_results(store, runner=run_pipeline):
+def apply_results(store, runner=run_pipeline, *, orders=None):
     results = store.get_document("ups_results", {})
     sales = store.get_document("sales_map", {})
     ledger = store.get_shipments()
     applied = failed = 0
     for order, result in results.items():
+        if orders is not None and order not in orders:
+            continue
         if not result.get("ok") and not (result.get("package_results") or {}):
             continue
         tracking = result.get("tracking") or ledger.get(order, {}).get("intl") or (sales.get(order) or {}).get("intl")

@@ -7,6 +7,10 @@ deploy/.env
 # 业务数据
 data/
 tmp/
+logs/
+_local_work_ups.json
+_local_ups_results.json
+_local_ups_results.lock
 
 # 本地上传缓存
 .dsh-uploads/
