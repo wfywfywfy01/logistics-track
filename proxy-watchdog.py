@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""出口节点看门狗: 每5分钟测代理; s1 挂 -> 切 s2; 都挂超过1小时 -> 私信付汪阳"""
+"""每5分钟探测活动代理并切换节点；连续失败12次告警一次，成功后重新计数。"""
 import os, shutil, subprocess, sys, time
 import robust
 
@@ -52,28 +52,50 @@ def switch_to(node):
     restart_xray()
 
 
-def main():
-    while True:
-        time.sleep(300)
-        if test():
+def alert_failure(node, fails):
+    body = ("物流追踪出口代理探测连续失败 %d 次：探测节点 %s 经本地代理访问 "
+            "https://ipinfo.io/ip 未成功。请检查代理连通性或探测目标可用性。") % (fails, node)
+    try:
+        rc, _, _ = robust.cli_run([
+            "im", "+bot-send-user", "--app-id", "vbot_EIBezUGncpO8v0QJ", "--user-id", ADMIN_UID,
+            "--body", body])
+        print("proxy alert im attempt rc=%s" % rc, flush=True)
+    except Exception as error:
+        print("proxy alert im attempt failed: " + type(error).__name__, flush=True)
+    try:
+        result = subprocess.run([sys.executable, "sendmail.py", "--to", EMAIL_TO,
+                                 "--subject", "物流追踪出口代理探测持续失败", "--body", body],
+                                capture_output=True, timeout=120)
+        print("proxy alert email attempt rc=%s" % result.returncode, flush=True)
+    except Exception as error:
+        print("proxy alert email attempt failed: " + type(error).__name__, flush=True)
+
+
+def check_once():
+    healthy = test()
+    with robust.FileLock(FAIL_LOG + ".lock"):
+        if healthy:
+            fails = 0
+        else:
             try:
-                open(FAIL_LOG, "w").write("0")
-            except Exception:
-                pass
-            continue
+                with open(FAIL_LOG) as handle:
+                    fails = int(handle.read().strip() or "0")
+            except FileNotFoundError:
+                fails = 0
+            fails += 1
+        # Consume the one alert attempt before external sends. A crash or ambiguous
+        # receipt must not replay it; only a successful probe resets suppression.
+        if not robust.atomic_write_json(FAIL_LOG, fails):
+            raise OSError("could not persist proxy failure state")
+    if healthy:
+        return
+    try:
+        with open(MARK) as handle:
+            node = handle.read().strip() or "s1"
+    except OSError:
         node = "s1"
-        try:
-            node = open(MARK).read().strip() or "s1"
-        except Exception:
-            pass
-        fails = 0
-        try:
-            fails = int(open(FAIL_LOG).read().strip() or "0")
-        except Exception:
-            pass
-        fails += 1
-        open(FAIL_LOG, "w").write(str(fails))
-        print("proxy down (node=%s fail=%d)" % (node, fails), flush=True)
+    print("proxy probe failed (node=%s fail=%d)" % (node, fails), flush=True)
+    try:
         if node == "s1" and fails <= 2:
             print("switch to s2", flush=True)
             switch_to("s2")
@@ -83,15 +105,19 @@ def main():
             print("toggle back to %s" % back, flush=True)
             switch_to(back)
             time.sleep(20)
-        if fails >= 12:
-            robust.cli_run(["im", "+bot-send-user", "--app-id", "vbot_EIBezUGncpO8v0QJ", "--user-id", ADMIN_UID,
-                            "--body", "物流追踪出口代理两个节点全部不可用, 官网追踪已中断。"])
-            subprocess.run([sys.executable, "sendmail.py", "--to", EMAIL_TO,
-                            "--subject", "物流追踪出口代理全部不可用",
-                            "--body", "物流追踪出口代理(s1/s2)超过1小时不可用, 官网追踪已中断, 请检查订阅节点。"],
-                           capture_output=True)
-            open(FAIL_LOG, "w").write("0")
-            print("alert sent", flush=True)
+    except Exception as error:
+        print("proxy switch failed: " + type(error).__name__, flush=True)
+    if fails == 12:
+        alert_failure(node, fails)
+
+
+def main():
+    while True:
+        time.sleep(300)
+        try:
+            check_once()
+        except Exception as error:
+            print("watchdog check failed: " + type(error).__name__, flush=True)
 
 
 if __name__ == "__main__":
