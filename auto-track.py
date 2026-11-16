@@ -93,7 +93,7 @@ def execute(a):
             print("inbox OCR failed:", payload.get("name"), state, str(error)[:120], flush=True)
 
     tasks = []
-    lease_seconds = 60 + 5 * step_timeout("tracking-pipeline.py")
+    lease_seconds = 60 + 6 * step_timeout("tracking-pipeline.py")
     if not a.skip_track:
         lease_seconds += step_timeout("track_all_ups.py")
     while True:
@@ -115,6 +115,7 @@ def execute(a):
     if not a.skip_track:
         steps.append((["track_all_ups.py", "--mode", a.mode or "full"], "抓官网", True))
     steps.extend([
+        (["tracking-pipeline.py", "sync-sales-recipients", "--apply"], "同步分摊收件人", True),
         (["wire_results.py"], "回填台账", True),
         (["operations.py", "refresh"], "刷新异常待办", True),
         (["sync_sheet.py"], "同步云表格", False),

@@ -568,12 +568,39 @@ class Storage:
     def fail_inbox(self, item_id, error, max_attempts=7, now=None, *, claim=None):
         return self._fail("inbox", item_id, error, max_attempts, now, claim=claim)
 
+    def _recipient_task(self, connection, order, event_key, uid, exclude_id=0):
+        return connection.execute(
+            """SELECT id FROM tasks WHERE kind='notify_dm' AND id<>?
+               AND json_extract(payload,'$.order')=? AND json_extract(payload,'$.event_key')=?
+               AND CAST(json_extract(payload,'$.uid') AS TEXT)=?
+               AND json_extract(payload,'$.duplicate_of') IS NULL
+               ORDER BY CASE status WHEN 'unknown' THEN 0 WHEN 'succeeded' THEN 1
+                        WHEN 'running' THEN 2 ELSE 3 END,id LIMIT 1""",
+            (exclude_id, order, event_key, str(uid))).fetchone()
+
     def _insert_task(self, connection, task, timestamp):
-        legacy_key = task.get("legacy_dedupe_key")
-        if legacy_key:
+        legacy_keys = list(task.get("legacy_dedupe_keys") or [])
+        if task.get("legacy_dedupe_key"):
+            legacy_keys.append(task["legacy_dedupe_key"])
+        payload = task["payload"]
+        if task["kind"] == "notify_dm" and payload.get("uid") and payload.get("order") and payload.get("event_key"):
+            existing = self._recipient_task(connection, payload["order"], payload["event_key"], payload["uid"])
+            if existing:
+                return existing["id"]
+        for legacy_key in dict.fromkeys(legacy_keys):
             legacy = connection.execute(
-                "SELECT id,payload FROM tasks WHERE dedupe_key=?", (legacy_key,)).fetchone()
-            if legacy and json.loads(legacy["payload"]).get("name") == task["payload"].get("name"):
+                "SELECT id,kind,payload FROM tasks WHERE dedupe_key=?", (legacy_key,)).fetchone()
+            if not legacy or legacy["kind"] != task["kind"]:
+                continue
+            previous = json.loads(legacy["payload"])
+            if any(previous.get(key) != payload.get(key) for key in ("order", "event_key")):
+                continue
+            old_uid, new_uid = previous.get("uid"), payload.get("uid")
+            if old_uid and new_uid:
+                same_recipient = str(old_uid) == str(new_uid)
+            else:
+                same_recipient = bool(previous.get("name")) and previous["name"] == payload.get("name")
+            if same_recipient:
                 return legacy["id"]
         connection.execute(
             """INSERT OR IGNORE INTO tasks
@@ -584,13 +611,15 @@ class Storage:
         return connection.execute("SELECT id FROM tasks WHERE dedupe_key=?",
                                   (task["dedupe_key"],)).fetchone()["id"]
 
-    def enqueue_task(self, kind, dedupe_key, payload, now=None, *, legacy_dedupe_key=None):
+    def enqueue_task(self, kind, dedupe_key, payload, now=None, *, legacy_dedupe_key=None,
+                     legacy_dedupe_keys=None):
         timestamp = iso(now)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             return self._insert_task(connection, {
                 "kind": kind, "dedupe_key": dedupe_key, "payload": payload,
-                "legacy_dedupe_key": legacy_dedupe_key}, timestamp)
+                "legacy_dedupe_key": legacy_dedupe_key,
+                "legacy_dedupe_keys": legacy_dedupe_keys}, timestamp)
 
     def sync_operational_tasks(self, kind, order, desired, resolved_reason):
         """Keep one current task per operational condition and archive cleared keys."""
@@ -1048,6 +1077,45 @@ class Storage:
                    last_error=?,updated_at=? WHERE id=?""",
                 (error[:500], iso(), task_id),
             )
+
+    def bind_notification_recipient(self, task_id, uid, *, claim=None):
+        """Reserve one order/event/UID before sending, including legacy name tasks."""
+        if isinstance(uid, bool) or not isinstance(uid, (str, int)) or not str(uid).strip():
+            raise ValueError("notification recipient is missing")
+        uid = uid.strip() if isinstance(uid, str) else uid
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._check_claim(connection, "tasks", task_id, claim, before_delivery=True)
+            row = connection.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not row or row["kind"] != "notify_dm":
+                raise ValueError("recipient binding requires a direct notification")
+            if row["status"] != "running":
+                raise TaskConflict("notification is not claimed for delivery")
+            payload = json.loads(row["payload"])
+            order, event_key = payload.get("order"), payload.get("event_key")
+            if not isinstance(order, str) or not order.strip() or not isinstance(event_key, str) or not event_key.strip():
+                raise ValueError("notification order or event is missing")
+            key = f"dm:{order}:{event_key}:uid:{uid}"
+            duplicate = self._recipient_task(connection, order, event_key, uid, exclude_id=task_id)
+            payload["uid"] = uid
+            timestamp = iso()
+            if duplicate:
+                payload["duplicate_of"] = duplicate["id"]
+                duplicate_key = f"{key}:deduplicated:{task_id}" if row["dedupe_key"] == key else row["dedupe_key"]
+                connection.execute(
+                    """UPDATE tasks SET status='succeeded',dedupe_key=?,payload=?,lease_owner=NULL,
+                       lease_until=NULL,last_error=NULL,updated_at=? WHERE id=?""",
+                    (duplicate_key, json.dumps(payload, ensure_ascii=False), timestamp, task_id))
+                connection.execute(
+                    """INSERT INTO audit_log
+                       (order_no,entity_type,entity_id,action,operator,reason,created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (order, "task", str(task_id), "deduplicated", "system",
+                     f"recipient already reserved by task {duplicate['id']}", timestamp))
+                return False
+            connection.execute("UPDATE tasks SET dedupe_key=?,payload=?,updated_at=? WHERE id=?",
+                               (key, json.dumps(payload, ensure_ascii=False), timestamp, task_id))
+            return True
 
     def mark_delivery_inflight(self, task_id, *, claim=None):
         with self.connect() as connection:
