@@ -120,8 +120,12 @@ def _sales_recipients_fresh(record):
         return False
 
 
-def _exact_sales_row(data, field, value):
-    rows = (data or {}).get("rows") or []
+def _exact_sales_row(data, field, value, *, strict=False):
+    if not isinstance(data, dict) or not isinstance(data.get("rows"), list) or data.get("ok") is False:
+        if strict:
+            raise ValueError("sales query returned an invalid response")
+        return {}
+    rows = data["rows"]
     pagination = (data or {}).get("pagination") or {}
     if pagination.get("has_more") or pagination.get("total_rows", len(rows)) > len(rows):
         return {}
@@ -135,10 +139,10 @@ def match_sales(order_no, domestic=None, *, force=False, cache=True):
     if not force and order_no in sm and sm[order_no].get("salesperson") and _sales_recipients_fresh(sm[order_no]):
         return sm[order_no]
     data = cli_json(["sales", "+orders", "--order-no", order_no, "--period", "this_year", "--limit", "100", "--no-json"])
-    row = _exact_sales_row(data, "订单号", order_no)
+    row = _exact_sales_row(data, "订单号", order_no, strict=force and not cache)
     if not row.get("销售人员") and domestic:
         d2 = cli_json(["sales", "+orders", "--logistics-no", domestic, "--period", "this_year", "--limit", "100", "--no-json"])
-        row = _exact_sales_row(d2, "物流单号", domestic)
+        row = _exact_sales_row(d2, "物流单号", domestic, strict=force and not cache)
     rec = _row_to_rec(row)
     if rec["salesperson"]:
         if not rec["sales_recipient_ids"]:
@@ -172,7 +176,7 @@ def sync_sales_recipients(orders=None, *, apply=False, replay_latest=False, reci
     with robust.FileLock(str(DATA / ".sales-recipients.lock")):
         shipments = STORE.get_shipments()
         selected = list(dict.fromkeys(orders if orders is not None else shipments))
-        summary = {"dry": not apply, "updated": 0, "failed": 0, "items": []}
+        summary = {"dry": not apply, "updated": 0, "failed": 0, "unmatched": 0, "items": []}
 
         def fetch(order):
             current = shipments.get(order)
@@ -204,6 +208,18 @@ def sync_sales_recipients(orders=None, *, apply=False, replay_latest=False, reci
                 summary["items"].append(item)
                 if sales is None:
                     summary["failed"] += int(reason in ("unknown order", "sales participants unavailable", "sales query failed"))
+                    if reason == "sales participants unavailable":
+                        summary["unmatched"] += 1
+                        if apply:
+                            task_id = STORE.enqueue_task("review", f"sales-recipients-review:{order}",
+                                                         {"order": order, "reason": reason})
+                            with STORE.connect() as connection:
+                                task = connection.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+                            if task["status"] == "succeeded":
+                                STORE.act_on_task(task_id, "retry", "system", "sales participants remain unavailable")
+                    elif apply and reason == "fresh":
+                        STORE.resolve_task_by_dedupe(f"sales-recipients-review:{order}", order,
+                                                    "sales participants synchronized")
                     continue
 
                 def update(current):
@@ -241,6 +257,9 @@ def sync_sales_recipients(orders=None, *, apply=False, replay_latest=False, reci
                         "entity_type": "shipment", "entity_id": order,
                         "action": "sync_sales_recipients", "operator": "system",
                         "reason": "refresh sales participant UIDs" + ("; replay latest DM" if replay_latest else "")})
+                    if not item["reason"]:
+                        STORE.resolve_task_by_dedupe(f"sales-recipients-review:{order}", order,
+                                                    "sales participants synchronized")
                 else:
                     update(copy.deepcopy(shipments[order]))
         return summary
@@ -1178,7 +1197,7 @@ def main():
         result = sync_sales_recipients(args.order, apply=args.apply,
                                       replay_latest=args.replay_latest, recipient_uid=args.recipient_uid)
         print(json.dumps(result, ensure_ascii=False))
-        rc = 1 if result["failed"] else 0
+        rc = int(bool(result["failed"] if args.order is not None else result["failed"] - result["unmatched"]))
     elif args.cmd == "add-package":
         result = add_package(args.order, args.tracking, args.carrier, args.operator, args.reason); rc = 0 if result.get("added") else 2
         print(json.dumps(result, ensure_ascii=False))
