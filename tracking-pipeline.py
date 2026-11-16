@@ -5,7 +5,8 @@
 台账 data/shipments.json；录单人缓存 data/sales_map.json；定人缓存 data/users_map.json
 """
 import argparse, copy, json, re, subprocess, sys, os
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import openpyxl
 from storage import Storage, TaskConflict, iso
@@ -93,28 +94,61 @@ def parse_forecast(xlsx):
     return items
 
 # ---------- 录单人 ----------
-def _row_to_rec(row):
-    return {"salesperson": row.get("销售人员", ""), "products": row.get("商品", ""),
-            "domestic": row.get("物流单号", ""), "shipDate": row.get("最新发货日期", ""),
-            "real_order": row.get("订单号", "")}
+def _sales_recipient_ids(value):
+    """The sales API returns participating user IDs, not parallel name/ID arrays."""
+    values = value if isinstance(value, list) else re.split(r"[、,，;；\s]+", str(value or ""))
+    return list(dict.fromkeys(int(str(item)) for item in values
+                             if re.fullmatch(r"[0-9]+", str(item)) and int(str(item)) > 0))
 
-def match_sales(order_no, domestic=None):
+
+def _row_to_rec(row):
+    rec = {"salesperson": row.get("销售人员", ""), "products": row.get("商品", ""),
+           "domestic": row.get("物流单号", ""), "shipDate": row.get("最新发货日期", ""),
+           "real_order": row.get("订单号", ""),
+           "sales_recipient_ids": _sales_recipient_ids(row.get("销售user_id"))}
+    if rec["sales_recipient_ids"]:
+        rec["sales_recipients_synced_at"] = iso()
+    return rec
+
+
+def _sales_recipients_fresh(record):
+    try:
+        stamp = datetime.fromisoformat(record.get("sales_recipients_synced_at", "").replace("Z", "+00:00"))
+        age = datetime.now(timezone.utc) - stamp
+        return bool(record.get("sales_recipient_ids")) and timedelta(0) <= age < timedelta(hours=24)
+    except (ValueError, TypeError):
+        return False
+
+
+def _exact_sales_row(data, field, value):
+    rows = (data or {}).get("rows") or []
+    pagination = (data or {}).get("pagination") or {}
+    if pagination.get("has_more") or pagination.get("total_rows", len(rows)) > len(rows):
+        return {}
+    matches = [row for row in rows if trim(row.get(field)) == value]
+    return matches[0] if len(matches) == 1 else {}
+
+
+def match_sales(order_no, domestic=None, *, force=False, cache=True):
     # 按订单号查不到时（预报里的 CKD 出库单号就是这种），用国内顺丰号反查真实销售订单号
     sm = load_json(SALES_MAP)
-    if order_no in sm and sm[order_no].get("salesperson"):
+    if not force and order_no in sm and sm[order_no].get("salesperson") and _sales_recipients_fresh(sm[order_no]):
         return sm[order_no]
-    data = cli_json(["sales", "+orders", "--order-no", order_no, "--period", "this_year", "--limit", "10", "--no-json"])
-    exact = [r for r in ((data or {}).get("rows") or []) if trim(r.get("订单号")) == order_no]
-    row = exact[0] if len(exact) == 1 else {}
+    data = cli_json(["sales", "+orders", "--order-no", order_no, "--period", "this_year", "--limit", "100", "--no-json"])
+    row = _exact_sales_row(data, "订单号", order_no)
     if not row.get("销售人员") and domestic:
-        d2 = cli_json(["sales", "+orders", "--logistics-no", domestic, "--period", "this_year", "--limit", "10", "--no-json"])
-        exact = [r for r in ((d2 or {}).get("rows") or []) if trim(r.get("物流单号")) == domestic]
-        row = exact[0] if len(exact) == 1 else {}
+        d2 = cli_json(["sales", "+orders", "--logistics-no", domestic, "--period", "this_year", "--limit", "100", "--no-json"])
+        row = _exact_sales_row(d2, "物流单号", domestic)
     rec = _row_to_rec(row)
     if rec["salesperson"]:
-        sm[order_no] = {**sm.get(order_no, {}), **rec}
-        save_json(SALES_MAP, sm)
-    return sm.get(order_no, rec)
+        if not rec["sales_recipient_ids"]:
+            # An incomplete response must not erase previously verified recipients.
+            rec.pop("sales_recipient_ids")
+        if cache:
+            sm[order_no] = {**sm.get(order_no, {}), **rec}
+            save_json(SALES_MAP, sm)
+        return rec
+    return sm.get(order_no, rec) if cache else {}
 
 
 def _set_salesperson(shipment, name):
@@ -122,6 +156,94 @@ def _set_salesperson(shipment, name):
     if name != trim(shipment.get("salesperson")):
         shipment.pop("salesperson_id", None)
     shipment["salesperson"] = name
+
+
+def _set_sales_recipients(shipment, sales):
+    if sales.get("sales_recipient_ids"):
+        shipment["sales_recipient_ids"] = _sales_recipient_ids(sales["sales_recipient_ids"])
+        if sales.get("sales_recipients_synced_at"):
+            shipment["sales_recipients_synced_at"] = sales["sales_recipients_synced_at"]
+        if sales.get("real_order"):
+            shipment["sales_order"] = sales["real_order"]
+
+
+def sync_sales_recipients(orders=None, *, apply=False, replay_latest=False, recipient_uid=None):
+    """Refresh existing orders only; historical DM replay must be requested explicitly."""
+    with robust.FileLock(str(DATA / ".sales-recipients.lock")):
+        shipments = STORE.get_shipments()
+        selected = list(dict.fromkeys(orders if orders is not None else shipments))
+        summary = {"dry": not apply, "updated": 0, "failed": 0, "items": []}
+
+        def fetch(order):
+            current = shipments.get(order)
+            if current is None:
+                return order, None, "unknown order"
+            pending = any(event.get("sales_recipients_pending") for event in current.get("history") or [])
+            if not replay_latest and _sales_recipients_fresh(current):
+                if pending:
+                    return order, {**current, "real_order": current.get("sales_order", order)}, ""
+                return order, None, "fresh"
+            if orders is None and not pending and current.get("status") in ("签收", "退回") and current.get("sales_recipient_ids"):
+                return order, None, "terminal already synchronized"
+            try:
+                sales = match_sales(order, domestic=current.get("domestic"), force=True, cache=False)
+                if not sales.get("sales_recipient_ids") and _family_key(order) != order:
+                    sales = match_sales(_family_key(order), force=True, cache=False)
+                if not _sales_recipient_ids(sales.get("sales_recipient_ids")):
+                    return order, None, "sales participants unavailable"
+                sales.setdefault("sales_recipients_synced_at", iso())
+                return order, sales, ""
+            except Exception:
+                return order, None, "sales query failed"
+
+        # Only read-only source queries run concurrently; all ledger mutations and
+        # outbox inserts stay in the existing per-shipment SQLite transaction.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for order, sales, reason in pool.map(fetch, selected):
+                item = {"order": order, "reason": reason, "recipients": [], "notification_keys": []}
+                summary["items"].append(item)
+                if sales is None:
+                    summary["failed"] += int(reason in ("unknown order", "sales participants unavailable", "sales query failed"))
+                    continue
+
+                def update(current):
+                    if current.get("domestic") != shipments[order].get("domestic"):
+                        item["reason"] = "domestic binding changed during lookup"
+                        summary["failed"] += 1
+                        return current, []
+                    _set_sales_recipients(current, sales)
+                    item["recipients"] = current.get("sales_recipient_ids", [])
+                    history = current.get("history") or []
+                    events = [event for event in history if event.get("sales_recipients_pending")]
+                    if replay_latest and history and history[-1] not in events:
+                        events.append(history[-1])
+                    tasks = []
+                    for event in events:
+                        if event.get("notification_suppressed") or not (event.get("at") or event.get("observed_at")):
+                            continue
+                        candidates = _event_notification_tasks(order, current, event)
+                        if replay_latest and event is history[-1]:
+                            for task in candidates:
+                                if task["kind"] == "notify_dm":
+                                    task["payload"]["replayed"] = True
+                                    task["payload"]["body"] = "【历史状态补发】" + task["payload"]["body"]
+                        tasks.extend(task for task in candidates if task["kind"] == "review" or
+                                     (task["kind"] == "notify_dm" and
+                                      (recipient_uid is None or str(task["payload"].get("uid")) == str(recipient_uid))))
+                        if recipient_uid is None and not any(task["kind"] == "review" for task in candidates):
+                            event.pop("sales_recipients_pending", None)
+                    item["notification_keys"] = [task["dedupe_key"] for task in tasks]
+                    summary["updated"] += 1
+                    return current, tasks
+
+                if apply:
+                    STORE.mutate_shipment(order, update, audit={
+                        "entity_type": "shipment", "entity_id": order,
+                        "action": "sync_sales_recipients", "operator": "system",
+                        "reason": "refresh sales participant UIDs" + ("; replay latest DM" if replay_latest else "")})
+                else:
+                    update(copy.deepcopy(shipments[order]))
+        return summary
 
 
 def rematch(order):
@@ -142,6 +264,7 @@ def _rematch(order):
     if sales.get("salesperson"):
         def update(current):
             _set_salesperson(current, sales["salesperson"])
+            _set_sales_recipients(current, sales)
             if sales.get("products"): current["products"] = [sales["products"]]
             if sales.get("domestic"): current["domestic"] = sales["domestic"]
             return current, []
@@ -176,6 +299,7 @@ def _ingest_forecast(xlsx):
                 prev["carrier"] = it["carrier"]
             prev["orderNo"] = order
             _set_salesperson(prev, sales.get("salesperson") or prev.get("salesperson") or "")
+            _set_sales_recipients(prev, sales)
             if sales.get("products"):
                 prev["products"] = [sales["products"]]
             prev["domestic"] = sales.get("domestic") or prev.get("domestic") or ""
@@ -195,7 +319,7 @@ def inherit_parent(it, db):
     if not m: return
     parent = db.get(m.group(1))
     if not parent: return
-    for k in ("salesperson", "domestic", "products", "note"):
+    for k in ("salesperson", "domestic", "products", "note", "sales_recipient_ids"):
         if parent.get(k) and not it.get(k):
             if k == "salesperson":
                 _set_salesperson(it, parent[k])
@@ -228,6 +352,7 @@ def _create_order_from_sales(order):
     payload = {"orderNo": order, "status": "已预报", "history": [], "products": [],
                "notified_status": None, "salesperson": sales["salesperson"],
                "source": "sales-backfill"}
+    _set_sales_recipients(payload, sales)
     if sales.get("domestic"):
         payload["domestic"] = sales["domestic"]
     if sales.get("products"):
@@ -275,11 +400,12 @@ def _ingest_pair(order, intl, force=False, silent=False):
             current["carrier"] = detected
         if sales.get("salesperson"):
             _set_salesperson(current, sales["salesperson"])
+        _set_sales_recipients(current, sales)
         if sales.get("domestic"):
             current["domestic"] = sales["domestic"]
         if sales.get("products"): current["products"] = [sales["products"]]
         if parent:
-            for field in ("salesperson", "domestic", "products", "note"):
+            for field in ("salesperson", "domestic", "products", "note", "sales_recipient_ids"):
                 if parent.get(field) and not current.get(field):
                     if field == "salesperson":
                         _set_salesperson(current, parent[field])
@@ -368,14 +494,70 @@ def _family_key(order):
 
 
 def _family_recipients(shipments):
-    """按分单家族汇总录单人（去重保序）：同一单的所有录单人都收私聊。"""
+    """Use authoritative participant UIDs; names are display/fallback only."""
+    org = STORE.get_document("org_people", {}) or {}
+    names_by_uid = {}
+    for name, values in org.items():
+        ids = list(dict.fromkeys(str(uid) for uid in (values if isinstance(values, list) else [values]) if uid))
+        if len(ids) == 1:
+            names_by_uid.setdefault(ids[0], []).append(name)
     families = {}
     for order, shipment in (shipments or {}).items():
-        bucket = families.setdefault(_family_key(order), [])
-        name = (shipment.get("salesperson") or "").strip()
-        if name and name not in bucket:
-            bucket.append(name)
-    return families
+        bucket = families.setdefault(_family_key(order), {})
+        name = trim(shipment.get("salesperson"))
+        uid = shipment.get("salesperson_id")
+        if name in org:
+            values = org[name] if isinstance(org[name], list) else [org[name]]
+            unique = list(dict.fromkeys(value for value in values if value))
+            uid = unique[0] if len(unique) == 1 else None
+        ids = _sales_recipient_ids(shipment.get("sales_recipient_ids"))
+        for participant in ids:
+            labels = names_by_uid.get(str(participant), [])
+            label = name if uid and str(uid) == str(participant) else labels[0] if len(labels) == 1 else ""
+            bucket.setdefault("uid:" + str(participant), {"uid": participant, "name": label})
+        # A complete sales UID list already includes the primary person. Never guess
+        # a name-to-UID pairing by list position or add a second unresolved name task.
+        if name and (uid or not ids):
+            key = "uid:" + str(uid) if uid else "name:" + name
+            bucket[key] = {"uid": uid, "name": name}
+    return {key: list(value.values()) for key, value in families.items()}
+
+
+def _hold_unresolved_legacy_recipients(order, shipment, event_key, tasks):
+    """An unidentified past delivery cannot be replayed safely under a new UID key."""
+    if not any(task["kind"] == "notify_dm" and task["payload"].get("uid") for task in tasks):
+        return tasks
+    with STORE.connect() as connection:
+        rows = connection.execute(
+            """SELECT id,payload FROM tasks WHERE kind='notify_dm'
+               AND json_extract(payload,'$.order')=? AND json_extract(payload,'$.event_key')=?""",
+            (order, event_key)).fetchall()
+    org = STORE.get_document("org_people", {}) or {}
+    unresolved = []
+    reserved = set()
+    for row in rows:
+        previous = json.loads(row["payload"])
+        if previous.get("uid"):
+            reserved.add(str(previous["uid"]))
+            continue
+        name = previous.get("name")
+        uid = shipment.get("salesperson_id") if name and name == shipment.get("salesperson") else None
+        if name in org:
+            values = org[name] if isinstance(org[name], list) else [org[name]]
+            ids = list(dict.fromkeys(str(value) for value in values if value))
+            uid = ids[0] if len(ids) == 1 else None
+        if not uid:
+            unresolved.append(row["id"])
+        else:
+            reserved.add(str(uid))
+    if not unresolved:
+        return [task for task in tasks if not (task["kind"] == "notify_dm" and
+                str(task["payload"].get("uid")) in reserved)]
+    kept = [task for task in tasks if not (task["kind"] == "notify_dm" and task["payload"].get("uid"))]
+    kept.append({"kind": "review", "dedupe_key": f"recipient-review:{order}:{event_key}",
+                 "payload": {"order": order, "event_key": event_key,
+                             "reason": "legacy recipient identity unresolved", "task_ids": unresolved}})
+    return kept
 
 
 def _event_notification_tasks(order, shipment, event, channel_id=None, bot_app_id=None,
@@ -384,6 +566,8 @@ def _event_notification_tasks(order, shipment, event, channel_id=None, bot_app_i
     event_key = event.get("at") or event.get("observed_at")
     if not event_key:
         return []
+    if not _sales_recipients_fresh(shipment):
+        event["sales_recipients_pending"] = True
     product = (shipment.get("products") or [""])[0]
     primary = (shipment.get("salesperson") or "").strip()
     prefix = "⚠️" if status in EXCEPTIONS else ""
@@ -402,25 +586,27 @@ def _event_notification_tasks(order, shipment, event, channel_id=None, bot_app_i
         shipments = STORE.get_shipments()
         shipments[order] = shipment
         recipients = _family_recipients(shipments).get(_family_key(order), [])
-    names = list(dict.fromkeys(name for name in recipients if name))
-    if primary and primary not in names:
-        names.insert(0, primary)
-    for name in names:
+    for recipient in recipients:
+        if isinstance(recipient, str):
+            recipient = {"name": recipient, "uid": shipment.get("salesperson_id") if recipient == primary else None}
+        name, uid = recipient.get("name", ""), recipient.get("uid")
         if name == primary:
             dm = "你的订单 %s 物流更新：%s｜%s（国际单 %s）" % (
                 order, status, node, shipment.get("intl") or "-")
         else:
             dm = "同单 %s 物流更新：%s｜%s（国际单 %s，录单人 %s）" % (
                 order, status, node, shipment.get("intl") or "-", primary or "未匹配")
-        tasks.append({"kind": "notify_dm", "dedupe_key": f"dm:{order}:{event_key}:{name}",
+        key = f"dm:{order}:{event_key}:uid:{uid}" if uid else f"dm:{order}:{event_key}:{name}"
+        tasks.append({"kind": "notify_dm", "dedupe_key": key,
                       "legacy_dedupe_key": f"dm:{order}:{event_key}" if name == primary else None,
+                      "legacy_dedupe_keys": [f"dm:{order}:{event_key}:{name}"] if uid and name else [],
                       "payload": {"order": order, "status": status,
                                   "name": name,
-                                  "uid": shipment.get("salesperson_id") if name == primary else None,
+                                  "uid": uid,
                                   "event_key": event_key,
                                   "bot_app_id": bot_app_id or os.environ.get("BOT_APP_ID"),
                                   "body": dm}})
-    return tasks
+    return _hold_unresolved_legacy_recipients(order, shipment, event_key, tasks)
 
 
 def _packages(shipment):
@@ -858,6 +1044,10 @@ def _drain_notification_kind(kind, worker, channel_id=None, bot_app_id=None):
             else:
                 uid = payload.get("uid") or resolve_user(payload["name"])
                 if not uid: raise RuntimeError("recipient is missing or ambiguous")
+                if not STORE.bind_notification_recipient(task["id"], uid, claim=task):
+                    results.append({"order": payload["order"], "kind": kind,
+                                    "ok": True, "deduplicated": True})
+                    continue
                 app_id = payload.get("bot_app_id") or bot_app_id
                 args = (["im", "+bot-send-user", "--app-id", app_id, "--user-id", str(uid), "--body", payload["body"]]
                         if app_id else ["im", "+send-user", "--user-id", str(uid), "--body", payload["body"]])
@@ -896,7 +1086,7 @@ def notify(channel_id, bot_app_id=None, dry=False):
     worker = f"notify:{os.getpid()}"
     results = _drain_notification_kind("notify_group", worker, channel_id, bot_app_id)
     results.extend(_drain_notification_kind("notify_dm", worker, channel_id, bot_app_id))
-    return {"notified": sum(1 for row in results if row["ok"]), "items": results,
+    return {"notified": sum(1 for row in results if row["ok"] and not row.get("deduplicated")), "items": results,
             "failed": sum(1 for row in results if not row["ok"]), "dry": False}
 
 def list_cmd(need_review=False):
@@ -963,6 +1153,11 @@ def main():
     d = sp.add_parser("list"); d.add_argument("--need-review", action="store_true")
     j = sp.add_parser("backfill-pairs"); j.add_argument("--limit", type=int, default=200)
     j.add_argument("--silent", action="store_true"); j.add_argument("--dry", action="store_true")
+    s = sp.add_parser("sync-sales-recipients")
+    s.add_argument("--order", action="append")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--replay-latest", action="store_true")
+    s.add_argument("--recipient-uid", type=int)
     e = sp.add_parser("notify"); e.add_argument("--channel-id", required=True); e.add_argument("--bot-app-id"); e.add_argument("--dry", action="store_true")
     args = p.parse_args()
     rc = 0
@@ -979,6 +1174,11 @@ def main():
     elif args.cmd == "rematch":
         result = rematch(args.order); rc = 0 if result.get("matched") else 2
         print(json.dumps(result, ensure_ascii=False))
+    elif args.cmd == "sync-sales-recipients":
+        result = sync_sales_recipients(args.order, apply=args.apply,
+                                      replay_latest=args.replay_latest, recipient_uid=args.recipient_uid)
+        print(json.dumps(result, ensure_ascii=False))
+        rc = 1 if result["failed"] else 0
     elif args.cmd == "add-package":
         result = add_package(args.order, args.tracking, args.carrier, args.operator, args.reason); rc = 0 if result.get("added") else 2
         print(json.dumps(result, ensure_ascii=False))
