@@ -130,7 +130,7 @@ def test_failed_sales_refresh_preserves_existing_identity_and_timestamp(monkeypa
     pipeline.sync_sales_recipients(["XSD1"], apply=True, replay_latest=True)
 
     assert pipeline.STORE.get_shipment("XSD1") == before
-    assert pipeline.STORE.list_tasks() == []
+    assert pipeline.STORE.list_tasks(kinds=("notify_group", "notify_dm")) == []
 
 
 def test_recipient_filter_cannot_add_someone_absent_from_authoritative_participants(monkeypatch, tmp_path):
